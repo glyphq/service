@@ -1,16 +1,16 @@
-# Glyph
+# Glyph API
 
-Glyph is a from-scratch Rust indexer and read API for the Qubic network. It talks directly
-to Qubic peers over TCP, verifies ticks and votes, stores normalized history in ClickHouse,
-and serves a resource-oriented HTTP API.
+Glyph API is the from-scratch Rust indexer and read API for the Glyph ecosystem. It talks
+directly to Qubic peers over TCP, verifies ticks and votes, stores normalized history in
+ClickHouse, and serves a resource-oriented HTTP API.
 
 The index starts at the epoch that is current on first run and moves forward. There is no
 backfill before that epoch and no compatibility layer for core-bob or the official RPC.
 
 ## The no-hosted-RPC promise
 
-**Glyph never calls `rpc.qubic.org`, `api.qubic.li`, or any other hosted RPC at runtime.**
-This is a design constraint, not a configuration default.
+**Glyph API never calls a hosted RPC at runtime.** This is a design constraint, not a
+configuration default.
 
 - Ingest connects only to configured seed peers and addresses learned through
   `ExchangePublicPeers`. Qubic core peers use TCP `21841`, Bob peers use `21842`.
@@ -50,14 +50,18 @@ Current limits are deliberate:
 
 Run `scripts/smoke.sh` to exercise the stack on your host.
 
-## Requirements
+## System requirements
 
-- Rust stable, 1.85 or newer. The exact channel is in `rust-toolchain.toml`.
-- A ClickHouse binary. The install script downloads one to `~/.local/bin/clickhouse`.
-- `curl` for scripts.
-- `jq` is optional. It improves the smoke output and is required for nested status checks.
-- No Docker is required. The scripts manage local processes directly.
-- Outbound TCP to a Qubic or Bob peer. The default seed is `157.180.10.49:21841`.
+| Component | Minimum | Notes |
+| --- | --- | --- |
+| OS | Linux x86_64/aarch64 or macOS | Dev scripts assume Bash. Windows is supported through WSL. |
+| Rust | 1.85 | The exact channel is pinned in `rust-toolchain.toml`. |
+| ClickHouse | 26.x | Tested with 26.11. A local binary is used, no Docker required. |
+| Memory | 2 GB RAM | 4 GB or more recommended when ClickHouse and the indexer share a host. |
+| Disk | 10 GB free | Development footprint. Production growth depends on retention. |
+| Network | Outbound TCP | Qubic core peers on `21841`, Bob peers on `21842`. |
+| Local ports | `8080`, `8123`, `9000` | API, ClickHouse HTTP, ClickHouse native. All are configurable. |
+| Tools | `cargo`, `bash`, `curl` | `jq` is optional and improves the smoke output. |
 
 ## Quick start
 

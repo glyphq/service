@@ -1,6 +1,6 @@
 # Protocol
 
-This document records the subset of the Qubic peer protocol that Glyph uses, the exact
+This document records the subset of the Qubic peer protocol that Glyph API uses, the exact
 on-wire layouts, the request sequence, and the traps that cost time. All integers are
 little-endian unless stated otherwise. The canonical decoders are in
 [`crates/qubic/src/wire.rs`](../crates/qubic/src/wire.rs),
@@ -14,7 +14,7 @@ little-endian unless stated otherwise. The canonical decoders are in
   `21842`. There is no HTTP, WebSocket, or hosted RPC hop.
 - One TCP connection is a stream of length-prefixed packets. There is no TLS and no
   authentication in the base protocol.
-- Glyph is a client only. It dials configured seeds and peers learned from
+- Glyph API is a client only. It dials configured seeds and peers learned from
   `ExchangePublicPeers`. It never accepts inbound peer connections.
 - A connection is single-writer and request/response is serialized per connection. Use
   one in-flight request per connection and a monotonically increasing `dejavu` value.
@@ -59,7 +59,7 @@ A stream reader must:
 The values are the `u8` on the wire. `MessageType::from_u8` in
 [`crates/qubic/src/wire.rs`](../crates/qubic/src/wire.rs) is authoritative.
 
-| Value | Name | Direction | Used by Glyph |
+| Value | Name | Direction | Used by Glyph API |
 | --- | --- | --- | --- |
 | 0 | `ExchangePublicPeers` | both | Yes, handshake and discovery |
 | 1 | `BroadcastMessage` | peer to peer | No |
@@ -125,7 +125,7 @@ a different peer. Do not treat it as an empty result.
 
 ```mermaid
 sequenceDiagram
-    participant G as Glyph node
+    participant G as Glyph API
     participant P as Qubic peer
 
     G->>P: TCP connect
@@ -373,7 +373,7 @@ data. Do not invent passcodes.
 
 ```mermaid
 sequenceDiagram
-    participant G as Glyph
+    participant G as Glyph API
     participant P as Peer
 
     G->>P: ExchangePublicPeers
@@ -407,7 +407,7 @@ sequenceDiagram
     Note over G: verify, persist, checkpoint
 ```
 
-The exact order is not mandated by the protocol. Glyph uses this order because it fails
+The exact order is not mandated by the protocol. Glyph API uses this order because it fails
 fast on the cheapest checks first and lets a tick be rejected before the expensive log
 fetch.
 
@@ -476,7 +476,7 @@ They are a hint for how long to wait. The verifier counts signatures itself.
   within a transaction's range are contiguous.
 - The log digest is over the body only, not over the header. The header is covered by the
   tick commitment and by the range mapping.
-- Private contract logs require a passcode. Glyph only indexes public data unless an
+- Private contract logs require a passcode. Glyph API only indexes public data unless an
   operator explicitly configures a passcode for a contract it is allowed to read.
 
 ## End-epoch virtual tick
@@ -580,7 +580,7 @@ canonical base-26 form in responses. The wire never uses hex.
 
 ## Compatibility
 
-The wire protocol is defined by the Qubic network, not by Glyph. If a peer returns a
+The wire protocol is defined by the Qubic network, not by Glyph API. If a peer returns a
 message whose fixed size does not match these layouts, mark the peer incompatible and move
 on. Do not guess, pad, or truncate. A wire change requires a new decoder and a new
 capability check, not a silent fallback.

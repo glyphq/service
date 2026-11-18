@@ -1,6 +1,6 @@
 # API
 
-Glyph exposes a read-only HTTP API over the local ClickHouse index. It never
+Glyph API exposes a read-only HTTP API over the local ClickHouse index. It never
 calls a hosted RPC at request time. If a resource is not indexed, the API
 returns a problem document instead of proxying upstream.
 

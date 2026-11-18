@@ -1,6 +1,6 @@
 # Architecture
 
-This document describes the target architecture of the Glyph Qubic indexer and API.
+This document describes the target architecture of Glyph API.
 It covers the boundaries of the system, the decisions that shape it, and the operational
 model. Some robustness features described here are still roadmap work; the implemented
 surface is tracked in [ROADMAP.md](./ROADMAP.md) and [README](../README.md). Protocol
@@ -26,7 +26,7 @@ details live in [PROTOCOL.md](./PROTOCOL.md), the HTTP contract lives in
 
 - Historical backfill before the epoch present at first start.
 - Wallet functionality, signing, or transaction submission.
-- Consensus participation. Glyph verifies votes, it does not vote.
+- Consensus participation. Glyph API verifies votes, it does not vote.
 - Serving as a general purpose Qubic core replacement.
 - Compatibility shims for the official RPC schema or core-bob endpoints.
 - Cross-chain indexing or price oracles beyond what Qubic logs contain.
