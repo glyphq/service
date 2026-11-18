@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use api::{AppState, router};
+use api::serve;
 use store::{ClickHouseStore, Store};
 
 #[tokio::main]
@@ -20,9 +20,6 @@ async fn main() -> anyhow::Result<()> {
     let store: Arc<dyn Store> = Arc::new(ClickHouseStore::new(&clickhouse_url, &clickhouse_db)?);
     store.init().await?;
 
-    let app = router(AppState { store });
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
-    tracing::info!(%bind, "glyph api listening");
-    axum::serve(listener, app).await?;
+    serve(store, &bind).await?;
     Ok(())
 }

@@ -1,5 +1,5 @@
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
@@ -34,6 +34,22 @@ impl ApiError {
             detail: detail.into(),
         }
     }
+
+    pub fn invalid_identity(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_identity",
+            detail: detail.into(),
+        }
+    }
+
+    pub fn invalid_hash(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_transaction_hash",
+            detail: detail.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -45,7 +61,15 @@ impl IntoResponse for ApiError {
             "code": self.code,
             "detail": self.detail,
         }));
-        (self.status, body).into_response()
+        (
+            self.status,
+            [
+                (header::CONTENT_TYPE, "application/problem+json"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            body,
+        )
+            .into_response()
     }
 }
 
