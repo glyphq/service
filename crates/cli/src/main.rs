@@ -40,6 +40,11 @@ enum Command {
         #[arg(long)]
         no_verify_signatures: bool,
     },
+    /// Read the current QUBIC/USDT price from a peer.
+    Price {
+        #[arg(long, default_value = "157.180.10.49:21841")]
+        peer: SocketAddr,
+    },
     /// Run the indexer from the current epoch initial tick.
     Sync {
         /// Peer addresses; repeat the flag to configure failover. QUBIC_PEERS
@@ -152,6 +157,34 @@ async fn main() -> anyhow::Result<()> {
                     "transaction_list": transactions,
                 }))?
             );
+        }
+        Command::Price { peer } => {
+            let pool = NodePool::new(vec![PeerConfig::new(peer)]);
+            match api::prices::read_price(&pool).await? {
+                Some(price) => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "pair": api::prices::PRICE_PAIR,
+                        "price_e8": price.price_e8,
+                        "price_usdt": api::prices::price_usdt(price.price_e8),
+                        "source": price.source,
+                        "source_name": api::prices::source_name(price.source),
+                        "source_tick": price.source_tick,
+                        "append_tick": price.append_tick,
+                        "epoch": price.epoch,
+                        "stale": price.stale,
+                        "series_digest": hex::encode(price.digest),
+                    }))?
+                ),
+                None => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "pair": api::prices::PRICE_PAIR,
+                        "available": false,
+                        "detail": "no active QUBIC/USDT oracle subscription and no usable QPayhub price",
+                    }))?
+                ),
+            }
         }
         Command::Sync {
             peers,

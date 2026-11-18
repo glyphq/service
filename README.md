@@ -255,6 +255,9 @@ cargo run -p cli --bin glyph -- peers --peer 157.180.10.49:21841
 # Fetch and summarize one tick bundle
 cargo run -p cli --bin glyph -- tick 91915000 --peer 157.180.10.49:21841
 
+# Read the on-chain QUBIC/USDT price, or report why it is unavailable
+cargo run -p cli --bin glyph -- price --peer 157.180.10.49:21841
+
 # Index from the current epoch initial tick
 cargo run -p cli --bin glyph -- sync --peer 157.180.10.49:21841
 
