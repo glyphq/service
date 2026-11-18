@@ -1,8 +1,10 @@
 # API
 
-Glyph API exposes a read-only HTTP API over the local ClickHouse index. It never
-calls a hosted RPC at request time. If a resource is not indexed, the API
-returns a problem document instead of proxying upstream.
+Glyph API exposes an HTTP API over the local ClickHouse index. Read routes never
+call a hosted RPC. A small set of optional network routes connect directly to a
+configured Qubic peer, and transaction broadcast is disabled unless
+`ALLOW_BROADCAST=true`. If a resource is not indexed, the API returns a problem
+document instead of proxying upstream.
 
 - Base URL in development: `http://127.0.0.1:8080`
 - Data routes are under `/v1`. `/healthz`, `/openapi.json`, and `/docs` are
@@ -529,6 +531,131 @@ Resolution order:
 `type` is `tick`, `transaction`, or `identity`. A missing or empty `q` returns
 `400 bad_request`.
 
+### `POST /v1/transactions/batch`
+
+Looks up up to 100 unique transaction hashes in one request. Duplicate hashes
+are collapsed. Unknown hashes do not fail the request; they are listed in
+`meta.missing`.
+
+```json
+{
+  "hashes": [
+    "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh"
+  ]
+}
+```
+
+```json
+{
+  "data": [ { "hash": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh", "...": "..." } ],
+  "meta": {
+    "requested": 1,
+    "found": 1,
+    "missing": []
+  }
+}
+```
+
+More than 100 unique hashes, or a malformed hash, returns `400 bad_request`.
+
+### Analytics
+
+Analytics routes read pre-aggregated projections in ClickHouse. They are
+eventually consistent with the index head and are cached for 30 seconds.
+
+| Route | Meaning |
+| --- | --- |
+| `GET /v1/analytics/activity?interval=3600&limit=24` | Transaction, event, and tick counts per `interval`-second bucket, newest first. `interval` is clamped to `1..86400`; `limit` is clamped to `1..500`. |
+| `GET /v1/analytics/top-identities?limit=25` | Identities ranked by observed transfer count, then amount. `limit` is clamped to `1..200`. |
+| `GET /v1/analytics/event-types?limit=50` | Decoded event type counts, highest first. |
+
+Each returns `data` plus a `meta` object describing the effective `interval` and
+`limit`. Analytics routes do not use cursors.
+
+### Streaming
+
+Streaming follows the local index head. It never opens a peer connection, so a
+stream stays available during peer outages and only emits ticks that have been
+verified and persisted.
+
+| Route | Meaning |
+| --- | --- |
+| `GET /v1/stream` | Server-sent events for all event kinds. |
+| `GET /v1/stream/ticks` | Tick events only. |
+| `GET /v1/stream/transactions` | Transaction events only. |
+| `GET /v1/stream/events` | Log events only. |
+| `GET /v1/ws` | WebSocket carrying the same JSON events. |
+
+`GET /v1/stream` accepts `?types=tick,event` to select a subset. Event names are
+`tick`, `transaction`, and `event`; each SSE frame has an `id` and a JSON `data`
+payload. The type-specific routes always filter to their own event regardless
+of `types`. The server sends a keep-alive comment every 15 seconds. If a client
+falls behind the internal 4096-event buffer, it receives a `lag` event with the
+number of dropped events and the stream continues from the current head. When
+the hub itself is catching up after an index jump, it emits a `catchup` event
+with `lastPublishedTick`, `headTick`, and `pending` before continuing.
+
+The polling cadence is controlled by `STREAM_POLL_MS`. A hub that is not running
+returns `503 unavailable`.
+
+### Peer-backed routes
+
+These routes connect directly to a configured peer for each request and are
+separate from the indexed read path. Configure peers with `QUBIC_PEERS`
+(comma-separated `host:port`) or `QUBIC_PEER`.
+
+| Route | Meaning |
+| --- | --- |
+| `GET /v1/identities/{identity}/entity` | Entity record (balance, incoming/outgoing amount, number of transfers) as reported by a peer. |
+| `GET /v1/transactions/{hash}/network` | Peer view of a transaction, including whether the peer knows it. |
+| `GET /v1/ticks/{tick}/tx-status` | Peer transaction confirmation status with money-flew flags. |
+| `POST /v1/contracts/{contract_index}/query` | Read-only contract function call. Body is `{"inputType": 0, "input": "hex"}`. Output is hex. |
+
+An unavailable peer returns `503 unavailable`. Invalid input returns
+`400 bad_request`. Peer responses are not persisted or merged into the index.
+
+### `POST /v1/transactions`
+
+Broadcasts a signed transaction through a direct peer. Disabled by default.
+
+```json
+{ "raw": "0x..." }
+```
+
+The body is the full signed transaction as hex. The API decodes it, checks the
+input size, and verifies the SchnorrQ signature locally before sending it with
+`dejavu=0`. A successful response echoes the transaction hash, the peer tick,
+and the peer that accepted it.
+
+- `403 forbidden` when `ALLOW_BROADCAST` is not `true`.
+- `400 bad_request` for malformed hex, an invalid transaction, or a peer
+  rejection.
+- `503 unavailable` when no peer is reachable.
+
+### `GET /v1/ticks/{tick}/raw`
+
+Returns the archived raw bundle for an indexed tick. Raw archiving is optional
+and is enabled on the indexer with `S3_BUCKET`/MinIO or `ARCHIVE_DIR`. The API
+must be pointed at the same archive to serve this route.
+
+Without `section`, the response is the zstd-compressed QBB1 container. With
+`?section=` it returns one uncompressed section:
+
+| `section` | Contents |
+| --- | --- |
+| `tick` | Tick header record. |
+| `tick_data` | Tick data record. |
+| `votes` | Concatenated 352-byte computor votes. |
+| `transactions` | Concatenated 144-byte transaction records. |
+| `log_ranges` | Log range record. |
+| `logs` | Concatenated encoded log events. |
+| `computors` | Computor list for the tick's epoch. |
+
+Responses are `application/octet-stream` with an immutable cache policy and a
+filename such as `tick-91916480-transactions.bin`. An unindexed tick or a
+missing bundle returns `404 not_found`. A missing archive configuration returns
+`503 unavailable`.
+
 ### `GET /openapi.json`
 
 OpenAPI 3.1 document covering the implemented routes. The document is generated
@@ -565,6 +692,8 @@ Errors are problem documents with exactly these fields:
 | `invalid_cursor` | 400 | Cursor is malformed or belongs to another route/filter set. |
 | `not_found` | 404 | The resource is valid but absent from the index. |
 | `rate_limited` | 429 | `RATE_LIMIT_PER_MINUTE` was exceeded. Includes `Retry-After`. |
+| `forbidden` | 403 | The operation is disabled, for example broadcast without `ALLOW_BROADCAST=true`. |
+| `unavailable` | 503 | A peer, the stream hub, or the raw archive is not available. |
 | `internal_error` | 500 | Storage or server failure. |
 
 `type` is currently always `about:blank`. `title` equals `code`. `detail` is for
@@ -616,6 +745,12 @@ current surface.
 | `CLICKHOUSE_DB` | `glyph` | Database name. |
 | `CORS_ALLOWED_ORIGINS` | unset (permissive) | Comma-separated browser origins. |
 | `RATE_LIMIT_PER_MINUTE` | unset (disabled) | Per-client-IP request budget. |
+| `QUBIC_PEERS` | unset | Comma-separated `host:port` peers for network routes and broadcast. |
+| `QUBIC_PEER` | unset | Single fallback peer when `QUBIC_PEERS` is unset. |
+| `ALLOW_BROADCAST` | `false` | Enable `POST /v1/transactions`. |
+| `STREAM_POLL_MS` | `1000` | Index-head poll interval for the stream hub. |
+| `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_REGION` | unset | Raw archive object storage. Presence of `S3_BUCKET` enables it. |
+| `ARCHIVE_DIR` | unset | Filesystem raw archive used when S3 is not configured. |
 | `RUST_LOG` | `info,tower_http=info` | Tracing filter. |
 
 The API never writes ticks. It applies schema initialization on startup and can
@@ -640,4 +775,13 @@ curl -sS localhost:8080/v1/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFF
 curl -sS 'localhost:8080/v1/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK/transactions?limit=10' | jq .
 curl -sS 'localhost:8080/v1/assets?limit=10' | jq .
 curl -sS 'localhost:8080/v1/search?q=91916480' | jq .
+curl -sS -X POST localhost:8080/v1/transactions/batch \
+  -H 'content-type: application/json' \
+  -d '{"hashes":["abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh"]}' | jq .
+curl -sS 'localhost:8080/v1/analytics/activity?interval=60&limit=10' | jq .
+curl -sS 'localhost:8080/v1/analytics/top-identities?limit=10' | jq .
+curl -sS -N 'localhost:8080/v1/stream?types=tick,event'
+curl -sS 'localhost:8080/v1/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK/entity' | jq .
+curl -sS 'localhost:8080/v1/ticks/91916480/tx-status' | jq .
+curl -sS -o tick.bin 'localhost:8080/v1/ticks/91916480/raw?section=transactions'
 ```

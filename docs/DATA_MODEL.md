@@ -47,10 +47,10 @@ epoch 1---* tick
 | Tick | `(epoch, tick)`, `tick` globally monotonic | Immutable once quorum reached | `Tick`, `TickData`, votes |
 | Transaction | `hash`, unique, and `(tick, txIndex)` | Immutable once quorum final | `RespondLog` transaction stream |
 | Event | `(epoch, logId)` | Immutable once digest verified | `RespondLog` |
-| Quorum evidence | `(epoch, tick)` | Planned, not stored | `Tick` vote set |
+| Quorum evidence | `(epoch, tick)` | Not stored in the hot tables; full vote sets are in the raw archive | `Tick` vote set |
 | Identity | 60-character identity | Derived, updated as activity arrives | Transfers and burns |
-| Asset | `(issuer, name)` | Planned, derived from events | Asset events |
-| Computor | `(epoch, index)` | Planned, cached in memory only | `Computors` |
+| Asset | `(issuer, name)` | Derived from events; dedicated table planned | Asset events |
+| Computor | `(epoch, index)` | Cached in memory and archived per tick | `Computors` |
 | Ingest checkpoint | key | Updated per batch | Indexer |
 
 ## `glyph.ticks`
@@ -141,7 +141,7 @@ Invariants:
 - `timestamp` equals the parent tick timestamp. It is denormalized for query speed and is
   not independently authoritative.
 
-Planned projections for the API filters:
+Projections for the API filters (created by `schema.rs`):
 
 ```sql
 ALTER TABLE glyph.transactions
@@ -202,7 +202,7 @@ Invariants:
   stores the JSON string. Unknown types keep a raw representation. The original raw bytes
   are not retained in the hot table.
 
-Planned projection for event type scans:
+Projection for event type scans:
 
 ```sql
 ALTER TABLE glyph.events
@@ -236,6 +236,12 @@ Derived aggregates per identity. This is a convenience table, not consensus stat
 ```sql
 ENGINE = ReplacingMergeTree(version)
 ORDER BY identity
+
+ALTER TABLE glyph.identities
+ADD PROJECTION IF NOT EXISTS by_activity
+(
+    SELECT * ORDER BY (last_seen_tick, identity)
+)
 ```
 
 Invariants:
@@ -430,13 +436,13 @@ in-flight duplicates omit `FINAL` and deduplicate with `argMax` or a subquery. N
 | Table | Partition | Order key | Projections | Serves |
 | --- | --- | --- | --- | --- |
 | `ticks` | `epoch` | `(epoch, tick)` | `by_tick` | Tick by number, head, epoch ranges |
-| `transactions` | `epoch` | `(tick, tx_index)` | `by_hash`, planned `by_source`, `by_destination` | Hash lookup, tick list, identity history |
-| `events` | `epoch` | `(epoch, log_id)` | `by_tick`, planned `by_type` | Event by ID, tick list, type scans |
-| `identities` | none | `identity` | none | Identity lookup |
+| `transactions` | `epoch` | `(tick, tx_index)` | `by_hash`, `by_source`, `by_destination` | Hash lookup, tick list, identity history |
+| `events` | `epoch` | `(epoch, log_id)` | `by_tick`, `by_recent`, `by_type` | Event by ID, tick list, type scans, activity buckets |
+| `identities` | none | `identity` | `by_activity` | Identity lookup, top identities |
 | `ingest_state` | none | `key` | none | Internal |
-| `quorum_evidence` | `epoch` | `(epoch, tick)` | none | Verification details |
-| `epochs` | none | `epoch` | none | Epoch list |
-| `computors` | none | `(epoch, computor_index)` | none | Computor list |
+| `quorum_evidence` (planned) | `epoch` | `(epoch, tick)` | none | Verification details |
+| `epochs` (planned) | none | `epoch` | none | Epoch list |
+| `computors` (planned) | none | `(epoch, computor_index)` | none | Computor list |
 
 `ticks` has a `by_tick` projection because the order key starts with `epoch`. Without it,
 `WHERE tick = ?` scans every epoch partition. It is created by
@@ -460,14 +466,16 @@ The default policy is deliberately simple and configurable.
 | --- | --- | --- | --- | --- |
 | Hot | ClickHouse | Current epoch forward | Canonical rows, current indexes | Fast queries |
 | Warm | ClickHouse with older partitions | Configurable | Same schema, older epochs | Disk |
-| Cold | Raw archive on local disk or S3 | Planned | Raw tick bundles, transactions, logs, vote headers | Object storage |
+| Cold | Raw archive on local disk or S3 | Optional, unbounded | Raw tick bundles, transactions, logs, vote headers | Object storage |
 
 Rules:
 
 - The current implementation keeps every indexed epoch in ClickHouse. There is no automatic
   drop.
-- The raw archive is not implemented. Until it exists, dropping a partition loses that
-  history unless it can be re-fetched from a peer that still retains it.
+- The raw archive is optional and off by default. When enabled, it preserves the verified
+  bundle for each tick before the ClickHouse write, so a dropped partition can be rebuilt.
+  Without it, dropping a partition loses that history unless it can be re-fetched from a
+  peer that still retains it.
 - `identities` is derived from indexed QU transfer events and spans epochs. Dropping an
   epoch without rebuilding the aggregate makes the balance partial; the API only labels the
   current limitation in its `meta.notice`.

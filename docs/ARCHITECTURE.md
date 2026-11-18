@@ -14,7 +14,7 @@ details live in [PROTOCOL.md](./PROTOCOL.md), the HTTP contract lives in
 2. Start at the epoch that is current on first run and move forward. No backfill before
    that epoch and no compatibility layer for core-bob or the official RPC.
 3. Produce a resource-oriented HTTP API that is easier to consume than peer responses:
-   stable identifiers, typed events, offset pagination, RFC 9457 errors, OpenAPI, and
+   stable identifiers, typed events, cursor pagination, RFC 9457 errors, OpenAPI, and
    identity and search lookups.
 4. Keep verification explicit. Every stored tick carries the evidence tier that was
    reached before it was published.
@@ -81,11 +81,13 @@ The system is two long-running processes plus ClickHouse:
 - **indexer** (`glyph sync` in `crates/cli`, library in `crates/indexer`) owns the peer
   pool and the write path. It fetches tick bundles, verifies them, writes canonical rows,
   and records the checkpoint.
-- **api** (`glyph-api` in `crates/api`) owns the read path. It only reads ClickHouse and
-  never talks to peers. It can be scaled horizontally behind a load balancer.
+- **api** (`glyph-api` in `crates/api`) owns the read path. Indexed reads use only
+  ClickHouse. A small set of opt-in network routes connect directly to peers and never
+  write to the index. The API can be scaled horizontally behind a load balancer.
 - **ClickHouse** is the shared analytical store. It is not exposed to the public internet.
-- **raw archive** is planned. A local file tree or S3 bucket will be written by the
-  indexer for replay. It is not implemented and not on the request path.
+- **raw archive** is an optional local filesystem or S3/MinIO bucket. The indexer writes
+  one compressed bundle per verified tick before persisting it. It is not on the indexed
+  read path; `GET /v1/ticks/{tick}/raw` reads it on demand.
 
 The read and write paths meet at the checkpoint row and the canonical tables. The API
 reports the indexed head and how far verification has progressed. It never invents a head
@@ -107,7 +109,7 @@ flowchart LR
 
     subgraph Storage["Storage"]
         CH[("ClickHouse<br/>glyph database")]
-        RAW[("raw archive<br/>planned")]
+        RAW[("raw archive<br/>local or S3")]
     end
 
     subgraph Read["api process"]
@@ -123,8 +125,8 @@ flowchart LR
     WIRE --- VER
     POOL --> VER
     VER --> BATCH
+    VER --> RAW
     BATCH --> CH
-    BATCH --> RAW
     STORE --> CH
     HTTP --> STORE
     CLIENT <-->|JSON| HTTP
@@ -132,8 +134,8 @@ flowchart LR
 
 The `cli` binary sits beside the two services for operator tasks: reading the peer head,
 fetching one tick bundle, initializing the schema, and running the sync loop. The
-`qubic` crate is shared by every component. The `node` crate is the only crate that owns
-sockets. The `store` crate is the only crate that owns SQL.
+`qubic` crate is shared by every component. The `node` crate owns peer sockets, the
+`archive` crate owns filesystem and object-store I/O, and the `store` crate owns SQL.
 
 ## Data flow
 
@@ -155,11 +157,14 @@ sockets. The `store` crate is the only crate that owns SQL.
    non-zero transaction digest must resolve to a transaction whose K12 hash matches.
    Every log digest must match `K12_8(body)`. When `verify_signatures` is enabled, vote,
    tick data, and transaction signatures are also checked.
-7. Encode one insert batch for the tick, its transactions, its events, and absolute
+7. If raw archiving is configured, encode the verified tick's header, tick data, votes,
+   transactions, log ranges, logs, and computors into a zstd-compressed QBB1 bundle and
+   write it before the ClickHouse batch. An archive failure is logged and indexing
+   continues unless `ARCHIVE_FAIL_CLOSED=true`.
+8. Encode one insert batch for the tick, its transactions, its events, and absolute
    identity snapshots. Write the batch and advance the ingest cursor. The cursor never
    moves backwards.
-8. Repeat. On an epoch change, move `next` forward to the new `initialTick`. Raw bundle
-   archiving and end-of-epoch synthesis are not implemented.
+9. Repeat. On an epoch change, move `next` forward to the new `initialTick`.
 
 ### Query
 
@@ -167,9 +172,12 @@ sockets. The `store` crate is the only crate that owns SQL.
 2. The API parses and validates identifiers before touching storage. Invalid identity
    checksums and malformed hashes return a stable 400 problem document.
 3. The store issues a bounded ClickHouse query. Point lookups use the sort key or a
-   projection. Per-tick lists use `LIMIT` and `OFFSET` with a maximum limit of 200.
+   projection. Per-tick lists use `LIMIT` and `OFFSET` internally, with opaque cursors
+   and a maximum page size of 200.
 4. The API returns the store row in `snake_case` inside a `data` envelope. Tick and
-   transaction reads set an immutable cache header. There is no streaming endpoint.
+   transaction reads set an immutable cache header.
+5. The stream hub polls the local index head and broadcasts new ticks, transactions, and
+   events over SSE and WebSocket. It never opens a peer connection.
 
 ## Rust workspace
 
@@ -179,23 +187,25 @@ sockets. The `store` crate is the only crate that owns SQL.
 | [`crates/node`](../crates/node) | none | Direct TCP peer connections, handshake, request and response correlation, peer pool, failover, bundle assembly | Sockets |
 | [`crates/indexer`](../crates/indexer) | none | Sync loop, verification tiers, checkpointing, batching | Ingest policy |
 | [`crates/store`](../crates/store) | none | ClickHouse client, schema SQL, row types, queries | SQL |
-| [`crates/api`](../crates/api) | `glyph-api` | Axum router, RFC 9457 errors, OpenAPI, offset pagination, search | HTTP |
+| [`crates/archive`](../crates/archive) | none | QBB1 raw bundle encoding, filesystem and S3 backends | Object storage |
+| [`crates/api`](../crates/api) | `glyph-api` | Axum router, RFC 9457 errors, OpenAPI, cursor pagination, streaming, search | HTTP |
 | [`crates/cli`](../crates/cli) | `glyph` | Operator commands: `head`, `peers`, `tick`, `sync`, `db-init`, `serve` | Process wiring |
 
 Dependency direction is acyclic:
 
 ```text
-cli -> api, indexer, node, store, qubic
-api -> store, qubic
-indexer -> node, store, qubic
+cli -> api, archive, indexer, node, store, qubic
+api -> archive, node, store, qubic
+indexer -> archive, node, store, qubic
 node -> qubic
 store -> qubic
 qubic -> (std only)
 ```
 
 `crates/qubic` has no async runtime and no sockets, so wire decoding and crypto can be
-tested with deterministic byte fixtures. `crates/node` has no SQL. `crates/store` has no
-HTTP. `crates/api` has no peer code. This keeps the trust boundary visible.
+tested with deterministic byte fixtures. `crates/node` has no SQL. `crates/archive` has
+no SQL or HTTP. `crates/store` has no HTTP. `crates/api` reaches peers only through
+`node` and the raw archive only through `archive`. This keeps the trust boundary visible.
 
 ## Verification tiers
 
@@ -252,7 +262,7 @@ tick is not written.
 | Duplicate tick delivery | Replayed request or retry | Idempotent insert with the same `version` and `ReplacingMergeTree` | One logical row after merge |
 | Clock skew | Local time differs from tick header | Rows use the tick header timestamp | None |
 | Disk full | Write error | Stop ingest, keep API on existing data, alert | Head stalls |
-| Archive upload failure | Not implemented | Not applicable | No archive exists yet |
+| Archive upload failure | Object store or filesystem error | Log and continue by default; fail the tick before persistence when `ARCHIVE_FAIL_CLOSED=true` | Indexed rows still match the verified tick, but the raw bundle may be missing |
 
 ## Capacity estimates
 
@@ -263,7 +273,7 @@ is 139,376 bytes. A tick header is 352 bytes. A full vote set is up to 676 heade
 | --- | --- | --- | --- |
 | Tick headers, winning only | 352 B | 203 MiB | Indexed store |
 | Full vote set, if retained | 237,952 B per tick | 134 GiB | Not retained in hot store |
-| `TickData`, raw | 139,376 B | 78.5 GiB | Not stored; archive planned |
+| `TickData`, raw | 139,376 B | 78.5 GiB | Not stored in ClickHouse; optional raw archive |
 | Transaction, base plus signature | 144 B plus input | Depends on input | Max input 1,024 B, max 4,096 tx per tick |
 | Max transaction payload per tick | 4,784,128 B | 2.63 TiB | Absolute worst case, not a planning number |
 | Event header | 26 B plus body | Depends on logs | Max log body is bounded by the 16 MiB packet size |
@@ -305,8 +315,8 @@ development values. Production needs separate tuning.
 - One indexer deployment with a stable identity and a persistent checkpoint.
 - Two or more API replicas behind a load balancer.
 - One ClickHouse node for development, replicated ClickHouse for production.
-- A raw archive on a dedicated volume or S3 bucket is planned. It is not part of the
-  current deployment.
+- A raw archive on a dedicated volume or S3 bucket is optional. It is written by the
+  indexer and read only by the raw bundle route.
 - The indexer should not be restarted for API deploys. The API should not be restarted
   for indexer deploys.
 
@@ -331,8 +341,9 @@ development values. Production needs separate tuning.
 ### Backups and recovery
 
 - ClickHouse backups per epoch partition.
-- There is no raw archive yet. A dropped partition can be rebuilt by re-indexing from
-  peers, subject to peer retention.
+- When the raw archive is enabled, a dropped partition can be rebuilt from archived
+  bundles. Otherwise it can be rebuilt by re-indexing from peers, subject to peer
+  retention.
 - The checkpoint lives in `glyph.ingest_state` under the `head` and `ingest` keys. Losing
   it is recoverable by taking the maximum indexed tick from `glyph.ticks` and resuming
   forward.
@@ -352,10 +363,11 @@ prefixes and tick numbers.
 
 ### Security
 
-- The API is read-only. It accepts no transaction submission.
+- The API is read-only by default. `POST /v1/transactions` requires
+  `ALLOW_BROADCAST=true` and verifies the signed transaction before sending it.
 - ClickHouse and peer ports are not exposed publicly.
-- Rate limiting, API keys, and streaming limits are planned. The current API has permissive
-  CORS and no request budget.
+- Rate limiting, API keys, and streaming limits are planned. The current API has
+  permissive CORS and no request budget unless `RATE_LIMIT_PER_MINUTE` is set.
 - Validate every identifier before it reaches SQL. Use typed parameters, never string
   interpolation.
 - Peer data is untrusted. Size limits are enforced before allocation. The 24-bit packet

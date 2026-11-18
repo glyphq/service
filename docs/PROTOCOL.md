@@ -69,13 +69,13 @@ The values are the `u8` on the wire. `MessageType::from_u8` in
 | 11 | `RequestComputors` | client to peer | Yes, per epoch |
 | 14 | `RequestQuorumTick` | client to peer | Yes, votes |
 | 16 | `RequestTickData` | client to peer | Yes |
-| 24 | `BroadcastTransaction` | both | No, read-only indexer |
-| 26 | `RequestTransactionInfo` | client to peer | Planned fallback |
+| 24 | `BroadcastTransaction` | both | Yes for opt-in broadcast; the indexer never broadcasts |
+| 26 | `RequestTransactionInfo` | client to peer | Yes, peer transaction lookup |
 | 27 | `RequestCurrentTickInfo` | client to peer | Yes |
 | 28 | `RespondCurrentTickInfo` | peer to client | Yes |
 | 29 | `RequestTickTransactions` | client to peer | Yes |
-| 31 | `RequestEntity` | client to peer | No |
-| 32 | `RespondEntity` | peer to client | No |
+| 31 | `RequestEntity` | client to peer | Yes, entity lookup |
+| 32 | `RespondEntity` | peer to client | Yes |
 | 33 | `RequestContractIpo` | client to peer | No |
 | 34 | `RespondContractIpo` | peer to client | No |
 | 35 | `EndResponse` | peer to client | Yes, terminates a multi-packet response |
@@ -85,8 +85,8 @@ The values are the `u8` on the wire. `MessageType::from_u8` in
 | 39 | `RespondOwnedAssets` | peer to client | No |
 | 40 | `RequestPossessedAssets` | client to peer | No |
 | 41 | `RespondPossessedAssets` | peer to client | No |
-| 42 | `RequestContractFunction` | client to peer | No |
-| 43 | `RespondContractFunction` | peer to client | No |
+| 42 | `RequestContractFunction` | client to peer | Yes, read-only contract queries |
+| 43 | `RespondContractFunction` | peer to client | Yes |
 | 44 | `RequestLog` | client to peer | Yes |
 | 45 | `RespondLog` | peer to client | Yes |
 | 46 | `RequestSystemInfo` | client to peer | No |

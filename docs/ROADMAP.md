@@ -3,11 +3,32 @@
 This roadmap is ordered by dependency, not by user-visible excitement. A phase is done
 only when its exit criteria pass on a live peer connection. "Code exists" is not done.
 
+## Current status
+
+Phases 0 through 5 are implemented and exercised against live peers, with the API and
+store also covered by ClickHouse integration tests. The remaining gaps are narrower than
+the original phase boundaries:
+
+- Implemented: direct peer transport, K12 and SchnorrQ, quorum and data verification,
+  ClickHouse persistence and checkpointing, the v1 resource API, typed events, cursor
+  pagination, asset and epoch reads derived from indexed rows, search, OpenAPI, batch
+  transaction lookup, analytics, SSE and WebSocket streaming, peer-backed entity,
+  transaction, status, and contract routes, opt-in broadcast, the raw bundle archive, and
+  the Docker Compose stack.
+- Partial: streaming has no `Last-Event-ID` replay, only a lag event and current-head
+  continuation. The batch route looks up transaction hashes, not arbitrary GET requests.
+  The archive writes and reads bundles but has no spool, manifest, or replay command yet.
+  Operations have health probes, request IDs, tracing, and graceful shutdown, but no
+  Prometheus metrics or fuzz targets.
+- Not started: dedicated quorum evidence, epoch, computor, asset, and participant tables;
+  a generic batch endpoint; Prometheus metrics; multi-peer quorum cross-checking; a
+  seven-day soak.
+
 ## Phase 0: Foundations
 
 **Scope**
 
-- Workspace crates: `qubic`, `node`, `indexer`, `store`, `api`, `cli`.
+- Workspace crates: `qubic`, `node`, `indexer`, `store`, `archive`, `api`, `cli`.
 - Wire framing, message types, identity encoding, log decoding, K12, SchnorrQ.
 - ClickHouse schema and local development configuration.
 - Architecture, protocol, API, data model, and roadmap documents.
@@ -115,7 +136,8 @@ only when its exit criteria pass on a live peer connection. "Code exists" is not
   `/v1/identities/{identity}`, `/v1/identities/{identity}/transactions`, `/v1/search`,
   `/openapi.json`, and `/docs`.
 - `snake_case` response fields, JSON integer amounts, RFC 3339 timestamps.
-- Offset pagination with `limit` (default 50, maximum 200) and `offset`.
+- Pagination with `limit` (default 50, maximum 200). The implemented surface uses opaque
+  cursors in `meta.nextCursor`; `offset` remains a deprecated fallback.
 - RFC 9457 problem documents with `bad_request`, `invalid_identity`,
   `invalid_transaction_hash`, `not_found`, and `internal_error`.
 - Immutable `Cache-Control` on tick and transaction reads.
@@ -163,7 +185,7 @@ only when its exit criteria pass on a live peer connection. "Code exists" is not
 
 - SSE `/v1/stream` with `Last-Event-ID` replay.
 - WebSocket `/v1/ws` with subscribe, unsubscribe, ping.
-- Batch `/v1/batch` for up to 50 GET requests.
+- Batch transaction lookup `/v1/transactions/batch` for up to 100 hashes.
 - Search `/v1/search` with typed classification.
 - OpenAPI 3.1 generation and `/docs`.
 - Rate limiting.
@@ -175,9 +197,9 @@ only when its exit criteria pass on a live peer connection. "Code exists" is not
 - SSE and WebSocket deliver the same payload for the same tick.
 - A slow stream consumer does not block ingest or other clients. Tick events are never
   dropped. The lag event is observed.
-- A 50-item batch returns per-item statuses, including a mix of 200 and 404, with a 200
-  envelope.
-- A 51-item batch returns `batch_too_large`.
+- A batch returns found rows plus `meta.missing`, including a mix of present and absent
+  hashes, with a 200 envelope.
+- More than 100 unique hashes returns `400 bad_request`.
 - Search classifies a tick, an identity, a transaction hash, an asset, and an event ID
   correctly, and rejects garbage with `invalid_query`.
 - The generated OpenAPI document validates against the OpenAPI 3.1 schema and covers every
@@ -188,9 +210,10 @@ only when its exit criteria pass on a live peer connection. "Code exists" is not
 
 **Scope**
 
-- Raw bundle writer for local filesystem and S3.
+- Raw bundle writer for local filesystem and S3. (Implemented.)
 - Manifest with content hashes.
-- Local spool and retry on archive failure.
+- Local spool and retry on archive failure. (Not implemented; failures are logged or fail
+  the tick under `ARCHIVE_FAIL_CLOSED`.)
 - Partition rebuild from the archive.
 - Checkpoint recovery.
 - Retention policy and partition drops.
@@ -249,7 +272,7 @@ These items are tracked in every phase, not deferred to the end.
 
 ## Explicit non-goals
 
-- Transaction submission or wallet features.
+- Wallet features. Transaction broadcast exists as an opt-in API route, not as a wallet.
 - Consensus participation or voting.
 - Hosted multi-tenant service with billing.
 - Full historical backfill before the epoch present at first start.
