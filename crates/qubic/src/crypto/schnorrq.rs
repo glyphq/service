@@ -672,6 +672,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn bench_verify_digest_throughput() {
+        let public_key =
+            hex_to_32("1f590d03e613bdded38b4c0820ac44615f91af12435980b3ede3c08c315a2544");
+        let signature = hex_to_64(
+            "c8e4a68a5aa3c3588959e994fb958c25697ffe1631b4caafec7ee090292077b56\
+             0c614d87ea660c0fcacf7522f533125e35eba9abd3c6fcf3b99ce66db9c1800",
+        );
+        let digest = super::k12::k12_32(&10u64.to_le_bytes());
+        let start = std::time::Instant::now();
+        let count = 20_000;
+        for _ in 0..count {
+            assert!(verify_digest(&public_key, &digest, &signature));
+        }
+        let elapsed = start.elapsed();
+        println!(
+            "{} verifies in {:?} = {:.1} us/verify, {:.0} verify/s/core",
+            count,
+            elapsed,
+            elapsed.as_secs_f64() * 1e6 / count as f64,
+            count as f64 / elapsed.as_secs_f64()
+        );
+    }
+
+    #[test]
     fn known_qubic_identity_signature_verifies() {
         // Qubic documentation vector: the well-known identity
         // BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK signs

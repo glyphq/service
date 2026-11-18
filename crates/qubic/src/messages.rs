@@ -1,6 +1,7 @@
 use crate::crypto::k12::k12_32;
 use crate::error::{Error, Result};
 use crate::wire::{MessageType, Reader};
+use serde::{Deserialize, Serialize};
 
 pub const COMPUTOR_COUNT: usize = 676;
 pub const QUORUM: usize = 451;
@@ -28,6 +29,9 @@ pub const RESPOND_ASSETS_SIZE: usize = 56;
 pub const RESPOND_ASSETS_WITH_SIBLINGS_SIZE: usize = 824;
 pub const SPECTRUM_DEPTH: usize = 24;
 pub const ASSETS_DEPTH: usize = 24;
+/// Default Qubic peer port. Wire peer-exchange payloads carry only an IPv4
+/// address, so this port is implied for every legacy entry.
+pub const DEFAULT_PEER_PORT: u16 = 21841;
 pub const ENTITY_RECORD_SIZE: usize = 64;
 pub const RESPOND_ENTITY_SIZE: usize = ENTITY_RECORD_SIZE + 8 + 32 * SPECTRUM_DEPTH;
 pub const RESPOND_SYSTEM_INFO_SIZE: usize = 128;
@@ -85,6 +89,53 @@ pub const PRICE_SERIES_SOURCE_SNAPSHOT: u32 = 4;
 
 /// `RespondPriceSeriesPoint.flags` bit marking an hour whose price was filled.
 pub const PRICE_POINT_FLAG_FILLED: u32 = 1;
+
+/// `price_points.flags` bit marking a point that came from a stale oracle
+/// source. It is independent of [`PRICE_POINT_FLAG_FILLED`], which keeps its
+/// original meaning.
+pub const PRICE_POINT_FLAG_STALE: u32 = 1 << 1;
+
+/// `RequestOracleData` is a fixed 16-byte request.
+pub const REQUEST_ORACLE_DATA_SIZE: usize = 16;
+/// `RespondOracleData` starts with a 4-byte `resType`.
+pub const RESPOND_ORACLE_DATA_HEADER_SIZE: usize = 4;
+/// `RespondOracleDataQueryMetadata` is 72 bytes on the wire.
+pub const RESPOND_ORACLE_DATA_QUERY_METADATA_SIZE: usize = 72;
+/// `RespondOracleDataSubscription` is 28 bytes of fields, padded to 32 in the
+/// core. Readers accept both sizes.
+pub const RESPOND_ORACLE_DATA_SUBSCRIPTION_MIN_SIZE: usize = 24;
+/// `OI::Price::OracleQuery`: `id oracle`, `u64 timestamp`, `id currency1`,
+/// `id currency2`.
+pub const PRICE_ORACLE_QUERY_SIZE: usize = 104;
+/// `OI::Price::OracleReply`: `i64 numerator`, `i64 denominator`.
+pub const PRICE_ORACLE_REPLY_SIZE: usize = 16;
+/// `OI::Price` is oracle interface index 0.
+pub const PRICE_ORACLE_INTERFACE_INDEX: u32 = 0;
+
+/// Oracle query/response types from `network_messages/oracles.h`.
+pub const ORACLE_REQUEST_ALL_QUERY_IDS_BY_TICK: u32 = 0;
+pub const ORACLE_REQUEST_USER_QUERY_IDS_BY_TICK: u32 = 1;
+pub const ORACLE_REQUEST_CONTRACT_DIRECT_QUERY_IDS_BY_TICK: u32 = 2;
+pub const ORACLE_REQUEST_CONTRACT_SUBSCRIPTION_QUERY_IDS_BY_TICK: u32 = 3;
+pub const ORACLE_REQUEST_PENDING_QUERY_IDS: u32 = 4;
+pub const ORACLE_REQUEST_QUERY_AND_RESPONSE: u32 = 5;
+pub const ORACLE_REQUEST_SUBSCRIPTION: u32 = 6;
+pub const ORACLE_REQUEST_QUERY_STATISTICS: u32 = 7;
+pub const ORACLE_REQUEST_REVENUE_POINTS: u32 = 8;
+pub const ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS: u32 = 9;
+pub const ORACLE_REQUEST_ACTIVE_CONTRACT_SUBSCRIPTIONS: u32 = 10;
+
+pub const ORACLE_RESPOND_QUERY_IDS: u32 = 0;
+pub const ORACLE_RESPOND_QUERY_METADATA: u32 = 1;
+pub const ORACLE_RESPOND_QUERY_DATA: u32 = 2;
+pub const ORACLE_RESPOND_REPLY_DATA: u32 = 3;
+pub const ORACLE_RESPOND_NOTIFIED_SUBSCRIBER_CONTRACTS: u32 = 4;
+pub const ORACLE_RESPOND_SUBSCRIPTION: u32 = 5;
+pub const ORACLE_RESPOND_SUBSCRIBER: u32 = 6;
+pub const ORACLE_RESPOND_QUERY_STATISTICS: u32 = 7;
+pub const ORACLE_RESPOND_REVENUE_POINTS: u32 = 8;
+pub const ORACLE_RESPOND_TICK_RANGE: u32 = 9;
+pub const ORACLE_RESPOND_SUBSCRIPTION_IDS: u32 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tick {
@@ -537,12 +588,22 @@ impl LogRanges {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PeerAddress {
     pub ip: [u8; 4],
+    /// TCP port. Legacy wire payloads carry only the IPv4 address, so decoding
+    /// fills this with [`DEFAULT_PEER_PORT`].
+    #[serde(default = "default_peer_port")]
+    pub port: u16,
 }
 
 impl PeerAddress {
+    pub fn new(ip: [u8; 4], port: u16) -> Self {
+        Self { ip, port }
+    }
+
+    /// Decodes the 4-byte-per-peer wire payload. The wire format has no port,
+    /// so every decoded peer uses [`DEFAULT_PEER_PORT`].
     pub fn decode(payload: &[u8]) -> Result<Vec<Self>> {
         if payload.len() % 4 != 0 {
             return Err(Error::InvalidPacket(
@@ -553,9 +614,29 @@ impl PeerAddress {
             .chunks_exact(4)
             .map(|chunk| Self {
                 ip: [chunk[0], chunk[1], chunk[2], chunk[3]],
+                port: DEFAULT_PEER_PORT,
             })
             .filter(|p| p.ip != [0, 0, 0, 0])
             .collect())
+    }
+}
+
+fn default_peer_port() -> u16 {
+    DEFAULT_PEER_PORT
+}
+
+impl Default for PeerAddress {
+    fn default() -> Self {
+        Self {
+            ip: [0, 0, 0, 0],
+            port: DEFAULT_PEER_PORT,
+        }
+    }
+}
+
+impl From<PeerAddress> for std::net::SocketAddr {
+    fn from(peer: PeerAddress) -> Self {
+        Self::from((peer.ip, peer.port))
     }
 }
 
@@ -563,8 +644,8 @@ impl std::fmt::Display for PeerAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{}.{}.{}.{}",
-            self.ip[0], self.ip[1], self.ip[2], self.ip[3]
+            "{}.{}.{}.{}:{}",
+            self.ip[0], self.ip[1], self.ip[2], self.ip[3], self.port
         )
     }
 }
@@ -1992,9 +2073,270 @@ impl RespondPriceSeries {
     }
 }
 
+/// `RequestOracleData` (`network_messages/oracles.h`, 16 bytes).
+///
+/// `req_type` selects what `tick_or_id` means: a tick, a query ID, a
+/// subscription ID, or a contract index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RequestOracleData {
+    pub req_type: u32,
+    pub padding: u32,
+    pub tick_or_id: i64,
+}
+
+impl RequestOracleData {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() != REQUEST_ORACLE_DATA_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "request oracle data needs {REQUEST_ORACLE_DATA_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let mut r = Reader::new(payload);
+        Ok(Self {
+            req_type: r.u32()?,
+            padding: r.u32()?,
+            tick_or_id: r.i64()?,
+        })
+    }
+
+    pub fn encode(&self) -> [u8; REQUEST_ORACLE_DATA_SIZE] {
+        let mut out = [0u8; REQUEST_ORACLE_DATA_SIZE];
+        out[0..4].copy_from_slice(&self.req_type.to_le_bytes());
+        out[4..8].copy_from_slice(&self.padding.to_le_bytes());
+        out[8..16].copy_from_slice(&self.tick_or_id.to_le_bytes());
+        out
+    }
+}
+
+/// The fixed 4-byte header of every `RespondOracleData` packet.
+///
+/// The payload following it is one of [`ORACLE_RESPOND_QUERY_METADATA`],
+/// [`ORACLE_RESPOND_QUERY_DATA`], [`ORACLE_RESPOND_REPLY_DATA`],
+/// [`ORACLE_RESPOND_SUBSCRIPTION`], [`ORACLE_RESPOND_SUBSCRIBER`], or
+/// [`ORACLE_RESPOND_SUBSCRIPTION_IDS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RespondOracleData {
+    pub res_type: u32,
+}
+
+impl RespondOracleData {
+    /// Decodes the header and returns it with the remaining payload.
+    pub fn decode(payload: &[u8]) -> Result<(Self, &[u8])> {
+        if payload.len() < RESPOND_ORACLE_DATA_HEADER_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "respond oracle data needs at least {RESPOND_ORACLE_DATA_HEADER_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let res_type = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes"));
+        Ok((
+            Self { res_type },
+            &payload[RESPOND_ORACLE_DATA_HEADER_SIZE..],
+        ))
+    }
+
+    pub fn encode(&self) -> [u8; RESPOND_ORACLE_DATA_HEADER_SIZE] {
+        self.res_type.to_le_bytes()
+    }
+}
+
+/// One active oracle subscription (`RespondOracleDataSubscription`).
+///
+/// The core writes 28 bytes of fields and pads the struct to 32 bytes. Older
+/// readers may only see the first 24 bytes, so `generated_queries_count`
+/// defaults to zero when that field is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OracleSubscription {
+    pub subscription_id: i32,
+    pub interface_index: u32,
+    pub last_pending_query_id: i64,
+    pub last_revealed_query_id: i64,
+    pub generated_queries_count: u32,
+}
+
+impl OracleSubscription {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() < RESPOND_ORACLE_DATA_SUBSCRIPTION_MIN_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "oracle subscription needs at least {RESPOND_ORACLE_DATA_SUBSCRIPTION_MIN_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let generated_queries_count = if payload.len() >= 28 {
+            u32::from_le_bytes(payload[24..28].try_into().expect("4 bytes"))
+        } else {
+            0
+        };
+        let mut r = Reader::new(payload);
+        Ok(Self {
+            subscription_id: r.u32()? as i32,
+            interface_index: r.u32()?,
+            last_pending_query_id: r.i64()?,
+            last_revealed_query_id: r.i64()?,
+            generated_queries_count,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(28);
+        out.extend_from_slice(&self.subscription_id.to_le_bytes());
+        out.extend_from_slice(&self.interface_index.to_le_bytes());
+        out.extend_from_slice(&self.last_pending_query_id.to_le_bytes());
+        out.extend_from_slice(&self.last_revealed_query_id.to_le_bytes());
+        out.extend_from_slice(&self.generated_queries_count.to_le_bytes());
+        out
+    }
+}
+
+/// Metadata sent before the query and reply data (`RespondOracleDataQueryMetadata`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OracleQueryMetadata {
+    pub query_id: i64,
+    pub query_type: u8,
+    pub status: u8,
+    pub status_flags: u16,
+    pub query_tick: u32,
+    pub querying_entity: [u8; 32],
+    pub timeout: u64,
+    pub interface_index: u32,
+    pub subscription_id: i32,
+    /// Tick of the reveal transaction when `status` is success, otherwise 0.
+    pub reveal_tick: u32,
+    pub total_commits: u16,
+    pub agreeing_commits: u16,
+}
+
+impl OracleQueryMetadata {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() != RESPOND_ORACLE_DATA_QUERY_METADATA_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "oracle query metadata needs {RESPOND_ORACLE_DATA_QUERY_METADATA_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let mut r = Reader::new(payload);
+        Ok(Self {
+            query_id: r.i64()?,
+            query_type: r.u8()?,
+            status: r.u8()?,
+            status_flags: r.u16()?,
+            query_tick: r.u32()?,
+            querying_entity: r.array()?,
+            timeout: r.u64()?,
+            interface_index: r.u32()?,
+            subscription_id: r.u32()? as i32,
+            reveal_tick: r.u32()?,
+            total_commits: r.u16()?,
+            agreeing_commits: r.u16()?,
+        })
+    }
+
+    pub fn encode(&self) -> [u8; RESPOND_ORACLE_DATA_QUERY_METADATA_SIZE] {
+        let mut out = [0u8; RESPOND_ORACLE_DATA_QUERY_METADATA_SIZE];
+        out[0..8].copy_from_slice(&self.query_id.to_le_bytes());
+        out[8] = self.query_type;
+        out[9] = self.status;
+        out[10..12].copy_from_slice(&self.status_flags.to_le_bytes());
+        out[12..16].copy_from_slice(&self.query_tick.to_le_bytes());
+        out[16..48].copy_from_slice(&self.querying_entity);
+        out[48..56].copy_from_slice(&self.timeout.to_le_bytes());
+        out[56..60].copy_from_slice(&self.interface_index.to_le_bytes());
+        out[60..64].copy_from_slice(&self.subscription_id.to_le_bytes());
+        out[64..68].copy_from_slice(&self.reveal_tick.to_le_bytes());
+        out[68..70].copy_from_slice(&self.total_commits.to_le_bytes());
+        out[70..72].copy_from_slice(&self.agreeing_commits.to_le_bytes());
+        out
+    }
+}
+
+/// `OI::Price::OracleQuery`: the 104-byte query payload of interface 0.
+///
+/// `currency1 = currency2 * numerator / denominator` for the reply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PriceOracleQuery {
+    pub oracle: [u8; 32],
+    pub timestamp: u64,
+    pub currency1: [u8; 32],
+    pub currency2: [u8; 32],
+}
+
+impl PriceOracleQuery {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() != PRICE_ORACLE_QUERY_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "price oracle query needs {PRICE_ORACLE_QUERY_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let mut r = Reader::new(payload);
+        Ok(Self {
+            oracle: r.array()?,
+            timestamp: r.u64()?,
+            currency1: r.array()?,
+            currency2: r.array()?,
+        })
+    }
+
+    pub fn encode(&self) -> [u8; PRICE_ORACLE_QUERY_SIZE] {
+        let mut out = [0u8; PRICE_ORACLE_QUERY_SIZE];
+        out[0..32].copy_from_slice(&self.oracle);
+        out[32..40].copy_from_slice(&self.timestamp.to_le_bytes());
+        out[40..72].copy_from_slice(&self.currency1);
+        out[72..104].copy_from_slice(&self.currency2);
+        out
+    }
+
+    /// True when the query is exactly `currency1/currency2`.
+    pub fn is_pair(&self, currency1: &[u8; 32], currency2: &[u8; 32]) -> bool {
+        &self.currency1 == currency1 && &self.currency2 == currency2
+    }
+}
+
+/// `OI::Price::OracleReply`: `currency1 = currency2 * numerator / denominator`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PriceOracleReply {
+    pub numerator: i64,
+    pub denominator: i64,
+}
+
+impl PriceOracleReply {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() != PRICE_ORACLE_REPLY_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "price oracle reply needs {PRICE_ORACLE_REPLY_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let mut r = Reader::new(payload);
+        Ok(Self {
+            numerator: r.i64()?,
+            denominator: r.i64()?,
+        })
+    }
+
+    pub fn encode(&self) -> [u8; PRICE_ORACLE_REPLY_SIZE] {
+        let mut out = [0u8; PRICE_ORACLE_REPLY_SIZE];
+        out[0..8].copy_from_slice(&self.numerator.to_le_bytes());
+        out[8..16].copy_from_slice(&self.denominator.to_le_bytes());
+        out
+    }
+}
+
+/// Encodes a currency or oracle name the way `id("...")` does: up to 32 ASCII
+/// bytes packed at the start, with the remaining bytes zero.
+pub fn currency_id(name: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let bytes = name.as_bytes();
+    let len = bytes.len().min(out.len());
+    out[..len].copy_from_slice(&bytes[..len]);
+    out
+}
+
 pub fn exchange_public_peers(peers: &[PeerAddress; 4]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
     for peer in peers {
+        // The wire format carries only the IPv4 address.
         out.extend_from_slice(&peer.ip);
     }
     out
@@ -2093,6 +2435,16 @@ pub fn request_assets(request: &RequestAssets) -> Vec<u8> {
 
 pub fn request_price_series(from_hour: u32, count: u32) -> Vec<u8> {
     RequestPriceSeries { from_hour, count }.encode().to_vec()
+}
+
+pub fn request_oracle_data(req_type: u32, tick_or_id: i64) -> Vec<u8> {
+    RequestOracleData {
+        req_type,
+        padding: 0,
+        tick_or_id,
+    }
+    .encode()
+    .to_vec()
 }
 
 pub fn request_contract_ipo(contract_index: u32) -> Vec<u8> {
@@ -2376,5 +2728,133 @@ mod tests {
             0,
         );
         assert!(RespondPriceSeries::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn oracle_request_round_trip_and_layout() {
+        let request = RequestOracleData {
+            req_type: ORACLE_REQUEST_SUBSCRIPTION,
+            padding: 0,
+            tick_or_id: 42,
+        };
+        let bytes = request.encode();
+        assert_eq!(bytes.len(), REQUEST_ORACLE_DATA_SIZE);
+        assert_eq!(&bytes[0..4], &6u32.to_le_bytes());
+        assert_eq!(&bytes[4..8], &0u32.to_le_bytes());
+        assert_eq!(&bytes[8..16], &42i64.to_le_bytes());
+        assert_eq!(RequestOracleData::decode(&bytes).unwrap(), request);
+        assert_eq!(
+            request_oracle_data(ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS, -1),
+            RequestOracleData {
+                req_type: 9,
+                padding: 0,
+                tick_or_id: -1,
+            }
+            .encode()
+            .to_vec()
+        );
+        assert!(RequestOracleData::decode(&bytes[..15]).is_err());
+        assert!(RequestOracleData::decode(&[bytes.as_slice(), &[0]].concat()).is_err());
+    }
+
+    #[test]
+    fn oracle_response_header_and_subscription_ids() {
+        let header = RespondOracleData {
+            res_type: ORACLE_RESPOND_SUBSCRIPTION_IDS,
+        }
+        .encode();
+        assert_eq!(header.len(), RESPOND_ORACLE_DATA_HEADER_SIZE);
+        let payload = [&header[..], &[1, 0, 0, 0, 2, 0, 0, 0]].concat();
+        let (decoded, data) = RespondOracleData::decode(&payload).unwrap();
+        assert_eq!(decoded.res_type, 10);
+        assert_eq!(data.len(), 8);
+        assert_eq!(i32::from_le_bytes(data[0..4].try_into().unwrap()), 1);
+        assert_eq!(i32::from_le_bytes(data[4..8].try_into().unwrap()), 2);
+        assert!(RespondOracleData::decode(&payload[..3]).is_err());
+    }
+
+    #[test]
+    fn oracle_subscription_accepts_padded_and_unpadded_payloads() {
+        let subscription = OracleSubscription {
+            subscription_id: 7,
+            interface_index: PRICE_ORACLE_INTERFACE_INDEX,
+            last_pending_query_id: 1000,
+            last_revealed_query_id: 999,
+            generated_queries_count: 12,
+        };
+        let bytes = subscription.encode();
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(OracleSubscription::decode(&bytes).unwrap(), subscription);
+
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(&[0; 4]);
+        assert_eq!(OracleSubscription::decode(&padded).unwrap(), subscription);
+
+        let truncated = &bytes[..24];
+        let decoded = OracleSubscription::decode(truncated).unwrap();
+        assert_eq!(decoded.subscription_id, 7);
+        assert_eq!(decoded.interface_index, 0);
+        assert_eq!(decoded.last_revealed_query_id, 999);
+        assert_eq!(decoded.generated_queries_count, 0);
+        assert!(OracleSubscription::decode(&bytes[..23]).is_err());
+    }
+
+    #[test]
+    fn oracle_query_metadata_layout() {
+        let metadata = OracleQueryMetadata {
+            query_id: 1_234_567_890,
+            query_type: 1,
+            status: 3,
+            status_flags: 0,
+            query_tick: 91_915_000,
+            querying_entity: [7; 32],
+            timeout: 0x1122_3344_5566_7788,
+            interface_index: PRICE_ORACLE_INTERFACE_INDEX,
+            subscription_id: 5,
+            reveal_tick: 91_915_004,
+            total_commits: 451,
+            agreeing_commits: 451,
+        };
+        let bytes = metadata.encode();
+        assert_eq!(bytes.len(), RESPOND_ORACLE_DATA_QUERY_METADATA_SIZE);
+        assert_eq!(OracleQueryMetadata::decode(&bytes).unwrap(), metadata);
+        assert!(OracleQueryMetadata::decode(&bytes[..71]).is_err());
+    }
+
+    #[test]
+    fn price_oracle_query_and_reply_layout() {
+        let query = PriceOracleQuery {
+            oracle: currency_id("binance_mexc"),
+            timestamp: 1_700_000_000_000_000,
+            currency1: currency_id("QUBIC"),
+            currency2: currency_id("USDT"),
+        };
+        let bytes = query.encode();
+        assert_eq!(bytes.len(), PRICE_ORACLE_QUERY_SIZE);
+        assert_eq!(&bytes[40..45], b"QUBIC");
+        assert_eq!(&bytes[72..76], b"USDT");
+        assert_eq!(PriceOracleQuery::decode(&bytes).unwrap(), query);
+        assert!(query.is_pair(&currency_id("QUBIC"), &currency_id("USDT")));
+        assert!(!query.is_pair(&currency_id("USDT"), &currency_id("QUBIC")));
+
+        let reply = PriceOracleReply {
+            numerator: 12_345,
+            denominator: 1_000_000,
+        };
+        let bytes = reply.encode();
+        assert_eq!(bytes.len(), PRICE_ORACLE_REPLY_SIZE);
+        assert_eq!(PriceOracleReply::decode(&bytes).unwrap(), reply);
+        assert!(PriceOracleReply::decode(&bytes[..15]).is_err());
+    }
+
+    #[test]
+    fn currency_ids_are_packed_at_the_start() {
+        let qubic = currency_id("QUBIC");
+        assert_eq!(&qubic[..5], b"QUBIC");
+        assert!(qubic[5..].iter().all(|byte| *byte == 0));
+        let usdt = currency_id("USDT");
+        assert_eq!(&usdt[..4], b"USDT");
+        assert!(usdt[4..].iter().all(|byte| *byte == 0));
+        assert_ne!(qubic, usdt);
     }
 }

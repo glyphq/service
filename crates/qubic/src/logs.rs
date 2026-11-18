@@ -378,6 +378,88 @@ impl EventBody {
             Self::Unknown { .. } => "unknown",
         }
     }
+
+    /// Every identity key that participates in this event, paired with a stable
+    /// role string.
+    ///
+    /// Duplicate `(key, role)` pairs are removed while preserving first-seen
+    /// order, and the all-zero key never appears.
+    pub fn participants(&self) -> Vec<([u8; 32], &'static str)> {
+        let mut out: Vec<([u8; 32], &'static str)> = Vec::new();
+        let mut push = |key: [u8; 32], role: &'static str| {
+            if is_zero_key(&key) {
+                return;
+            }
+            let entry = (key, role);
+            if !out.contains(&entry) {
+                out.push(entry);
+            }
+        };
+        match self {
+            Self::QuTransfer { from, to, .. } => {
+                push(*from, "from");
+                push(*to, "to");
+            }
+            Self::AssetIssuance { asset, .. } => push(asset.issuer, "issuer"),
+            Self::AssetOwnershipChange {
+                from, to, asset, ..
+            }
+            | Self::AssetPossessionChange {
+                from, to, asset, ..
+            } => {
+                push(*from, "from");
+                push(*to, "to");
+                push(asset.issuer, "issuer");
+            }
+            Self::AssetOwnershipManagingContractChange {
+                ownership, issuer, ..
+            } => {
+                push(*ownership, "owner");
+                push(*issuer, "issuer");
+            }
+            Self::AssetPossessionManagingContractChange {
+                possession,
+                ownership,
+                issuer,
+                ..
+            } => {
+                push(*possession, "possessor");
+                push(*ownership, "owner");
+                push(*issuer, "issuer");
+            }
+            Self::Burning { from, .. } => push(*from, "burner"),
+            Self::DustBurning { burns } => {
+                for (key, _) in burns {
+                    push(*key, "burner");
+                }
+            }
+            Self::OracleQueryStatusChange {
+                querying_entity, ..
+            } => push(*querying_entity, "querier"),
+            Self::AntSolution { source, .. } => push(*source, "solver"),
+            Self::SpectrumStats { .. }
+            | Self::ContractMessage { .. }
+            | Self::ContractReserveDeduction { .. }
+            | Self::OracleSubscriberMessage { .. }
+            | Self::OcInvocationStatusChange { .. }
+            | Self::Custom { .. }
+            | Self::Unknown { .. } => {}
+        }
+        out
+    }
+
+    /// Like [`Self::participants`], but renders each key as the uppercase
+    /// 60-character base-26 Qubic identity string.
+    pub fn participant_identities(&self) -> Vec<(String, &'static str)> {
+        self.participants()
+            .into_iter()
+            .map(|(key, role)| (crate::identity::encode_base26(&key, true, true), role))
+            .collect()
+    }
+}
+
+fn is_zero_key(key: &[u8; 32]) -> bool {
+    key.iter().all(|b| *b == 0)
 }
 
 fn decode_qu_transfer(body: &[u8]) -> Option<EventBody> {
@@ -684,5 +766,278 @@ mod tests {
             EventBody::decode(QU_TRANSFER, &body),
             EventBody::Unknown { raw: body.to_vec() }
         );
+    }
+
+    fn key(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    fn zero_key() -> [u8; 32] {
+        [0u8; 32]
+    }
+
+    fn asset(issuer: [u8; 32]) -> AssetRef {
+        AssetRef {
+            issuer,
+            name: "TEST".into(),
+            decimals: 0,
+            unit: "AAAAAAA".into(),
+            managing_contract: -1,
+        }
+    }
+
+    fn spectrum_stats() -> EventBody {
+        EventBody::SpectrumStats {
+            total_amount: 1,
+            dust_threshold_burn_all: 2,
+            dust_threshold_burn_half: 3,
+            number_of_entities: 4,
+            entity_category_populations: vec![0; SPECTRUM_ENTITY_CATEGORIES],
+        }
+    }
+
+    #[test]
+    fn participants_qu_transfer() {
+        let body = EventBody::QuTransfer {
+            from: key(1),
+            to: key(2),
+            amount: 5,
+        };
+        assert_eq!(body.participants(), vec![(key(1), "from"), (key(2), "to")]);
+    }
+
+    #[test]
+    fn participants_asset_issuance() {
+        let body = EventBody::AssetIssuance {
+            asset: asset(key(3)),
+            shares: 10,
+        };
+        assert_eq!(body.participants(), vec![(key(3), "issuer")]);
+    }
+
+    #[test]
+    fn participants_asset_ownership_change() {
+        let body = EventBody::AssetOwnershipChange {
+            from: key(1),
+            to: key(2),
+            asset: asset(key(3)),
+            shares: 1,
+        };
+        assert_eq!(
+            body.participants(),
+            vec![(key(1), "from"), (key(2), "to"), (key(3), "issuer")]
+        );
+    }
+
+    #[test]
+    fn participants_asset_possession_change() {
+        let body = EventBody::AssetPossessionChange {
+            from: key(1),
+            to: key(2),
+            asset: asset(key(3)),
+            shares: 1,
+        };
+        assert_eq!(
+            body.participants(),
+            vec![(key(1), "from"), (key(2), "to"), (key(3), "issuer")]
+        );
+    }
+
+    #[test]
+    fn participants_asset_ownership_managing_contract_change() {
+        let body = EventBody::AssetOwnershipManagingContractChange {
+            ownership: key(1),
+            issuer: key(2),
+            source_contract_index: 1,
+            destination_contract_index: 2,
+            shares: 3,
+            asset_name: "TEST".into(),
+        };
+        assert_eq!(
+            body.participants(),
+            vec![(key(1), "owner"), (key(2), "issuer")]
+        );
+    }
+
+    #[test]
+    fn participants_asset_possession_managing_contract_change() {
+        let body = EventBody::AssetPossessionManagingContractChange {
+            possession: key(1),
+            ownership: key(2),
+            issuer: key(3),
+            source_contract_index: 1,
+            destination_contract_index: 2,
+            shares: 3,
+            asset_name: "TEST".into(),
+        };
+        assert_eq!(
+            body.participants(),
+            vec![(key(1), "possessor"), (key(2), "owner"), (key(3), "issuer")]
+        );
+    }
+
+    #[test]
+    fn participants_burning() {
+        let body = EventBody::Burning {
+            from: key(1),
+            amount: 10,
+            contract_index: 0,
+        };
+        assert_eq!(body.participants(), vec![(key(1), "burner")]);
+    }
+
+    #[test]
+    fn participants_dust_burning_multiple_keys() {
+        let body = EventBody::DustBurning {
+            burns: vec![(key(1), 10), (key(2), 20), (key(3), 30)],
+        };
+        assert_eq!(
+            body.participants(),
+            vec![(key(1), "burner"), (key(2), "burner"), (key(3), "burner")]
+        );
+    }
+
+    #[test]
+    fn participants_dust_burning_dedupes_repeated_key() {
+        let body = EventBody::DustBurning {
+            burns: vec![(key(1), 10), (key(1), 20)],
+        };
+        assert_eq!(body.participants(), vec![(key(1), "burner")]);
+    }
+
+    #[test]
+    fn participants_oracle_query_status_change() {
+        let body = EventBody::OracleQueryStatusChange {
+            querying_entity: key(1),
+            query_id: 2,
+            interface_index: 3,
+            query_type: ORACLE_QUERY_TYPE_CONTRACT_QUERY,
+            status: ORACLE_QUERY_STATUS_SUCCESS,
+        };
+        assert_eq!(body.participants(), vec![(key(1), "querier")]);
+    }
+
+    #[test]
+    fn participants_ant_solution() {
+        let body = EventBody::AntSolution {
+            source: key(1),
+            nonce: key(9),
+            parent_tick: 2,
+            parent_solution_index: 3,
+            anchor_tick: 4,
+            score: 5,
+            result: 6,
+        };
+        assert_eq!(body.participants(), vec![(key(1), "solver")]);
+    }
+
+    #[test]
+    fn participants_variants_without_identities() {
+        let variants = [
+            spectrum_stats(),
+            EventBody::ContractMessage {
+                contract_index: 1,
+                message_type: 2,
+                data: vec![1, 2, 3],
+            },
+            EventBody::ContractReserveDeduction {
+                deducted_amount: 1,
+                remaining_amount: 2,
+                contract_index: 3,
+            },
+            EventBody::OracleSubscriberMessage {
+                subscription_id: 1,
+                interface_index: 2,
+                contract_index: 3,
+                period_in_milliseconds: 4,
+                first_query_date_and_time: 5,
+            },
+            EventBody::OcInvocationStatusChange {
+                invocation_id: 1,
+                contract_index: 2,
+                interface_index: 3,
+                status: OC_INVOCATION_STATUS_AUTHORIZED,
+            },
+            EventBody::Custom {
+                op_code: CUSTOM_OP_END_EPOCH,
+                data: vec![1, 2, 3],
+            },
+            EventBody::Unknown {
+                raw: vec![0xDE, 0xAD],
+            },
+        ];
+        for body in variants {
+            assert!(
+                body.participants().is_empty(),
+                "{} should not expose identity participants",
+                body.kind()
+            );
+            assert!(body.participant_identities().is_empty());
+        }
+    }
+
+    #[test]
+    fn participants_transfer_from_equals_to_dedupes_only_exact_pairs() {
+        let body = EventBody::QuTransfer {
+            from: key(7),
+            to: key(7),
+            amount: 1,
+        };
+        assert_eq!(body.participants(), vec![(key(7), "from"), (key(7), "to")]);
+    }
+
+    #[test]
+    fn participants_skips_zero_key() {
+        let transfer = EventBody::QuTransfer {
+            from: zero_key(),
+            to: key(2),
+            amount: 1,
+        };
+        assert_eq!(transfer.participants(), vec![(key(2), "to")]);
+
+        let issuance = EventBody::AssetIssuance {
+            asset: asset(zero_key()),
+            shares: 1,
+        };
+        assert!(issuance.participants().is_empty());
+
+        let dust = EventBody::DustBurning {
+            burns: vec![(zero_key(), 1), (key(3), 2)],
+        };
+        assert_eq!(dust.participants(), vec![(key(3), "burner")]);
+
+        let oracle = EventBody::OracleQueryStatusChange {
+            querying_entity: zero_key(),
+            query_id: 1,
+            interface_index: 2,
+            query_type: ORACLE_QUERY_TYPE_USER_QUERY,
+            status: ORACLE_QUERY_STATUS_PENDING,
+        };
+        assert!(oracle.participants().is_empty());
+    }
+
+    #[test]
+    fn participant_identities_round_trip_to_valid_base26() {
+        use crate::identity::{IDENTITY_LEN, PublicKey};
+
+        let body = EventBody::AssetPossessionChange {
+            from: key(1),
+            to: key(2),
+            asset: asset(key(3)),
+            shares: 7,
+        };
+        let participants = body.participants();
+        let identities = body.participant_identities();
+        assert_eq!(identities.len(), participants.len());
+        for ((identity, role), (key_bytes, expected_role)) in
+            identities.iter().zip(participants.iter())
+        {
+            assert_eq!(role, expected_role);
+            assert_eq!(identity.len(), IDENTITY_LEN);
+            assert!(identity.chars().all(|c| c.is_ascii_uppercase()));
+            let decoded = PublicKey::from_identity(identity).expect("valid identity");
+            assert_eq!(decoded.as_bytes(), key_bytes);
+            assert_eq!(&decoded.to_identity(), identity);
+        }
     }
 }

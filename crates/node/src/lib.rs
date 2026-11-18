@@ -6,20 +6,26 @@ use qubic::LogEvent;
 use qubic::crypto::schnorrq;
 use qubic::messages::{
     ASSET_REQUEST_GET_SIBLINGS, COMPUTOR_COUNT, Computors, CurrentTickInfo, LOG_TX_PER_TICK,
-    LogRanges, MAX_AMOUNT, MAX_INPUT_SIZE, PRICE_SERIES_MAX_POINTS, PeerAddress, RequestAssets,
-    RespondAssets, RespondAssetsWithSiblings, RespondContractFunction, RespondEntity,
-    RespondIssuedAssets, RespondOwnedAssets, RespondPossessedAssets, RespondPriceSeries,
-    RespondTxStatus, TX_PER_TICK, Tick, TickData, Transaction, request_all_log_ranges,
-    request_assets, request_computors, request_contract_function, request_current_tick_info,
-    request_entity, request_issued_assets, request_logs, request_owned_assets,
-    request_possessed_assets, request_price_series, request_quorum_tick, request_tick_data,
-    request_tick_transactions, request_transaction_info, request_tx_status,
+    LogRanges, MAX_AMOUNT, MAX_INPUT_SIZE, ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS,
+    ORACLE_REQUEST_QUERY_AND_RESPONSE, ORACLE_REQUEST_SUBSCRIPTION, ORACLE_RESPOND_QUERY_DATA,
+    ORACLE_RESPOND_QUERY_METADATA, ORACLE_RESPOND_REPLY_DATA, ORACLE_RESPOND_SUBSCRIPTION,
+    ORACLE_RESPOND_SUBSCRIPTION_IDS, OracleQueryMetadata, OracleSubscription,
+    PRICE_SERIES_MAX_POINTS, PeerAddress, RequestAssets, RespondAssets, RespondAssetsWithSiblings,
+    RespondContractFunction, RespondEntity, RespondIssuedAssets, RespondOracleData,
+    RespondOwnedAssets, RespondPossessedAssets, RespondPriceSeries, RespondTxStatus, TX_PER_TICK,
+    Tick, TickData, Transaction, request_all_log_ranges, request_assets, request_computors,
+    request_contract_function, request_current_tick_info, request_entity, request_issued_assets,
+    request_logs, request_oracle_data, request_owned_assets, request_possessed_assets,
+    request_price_series, request_quorum_tick, request_tick_data, request_tick_transactions,
+    request_transaction_info, request_tx_status,
 };
 use qubic::wire::{HEADER_SIZE, MessageType, Packet};
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+
+pub mod health;
 
 /// How long a peer may take to answer one packet of a request.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -29,15 +35,20 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_RETRIES: u32 = 2;
 /// Timeout for the all-ranges log request. Logs are optional, so this must not
 /// dominate a tick fetch on peers without logging.
-const LOG_RANGE_TIMEOUT: Duration = Duration::from_secs(4);
+pub const DEFAULT_LOG_RANGE_TIMEOUT: Duration = Duration::from_secs(1);
 /// Timeout for one per-transaction log range probe during fallback.
-const LOG_FALLBACK_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+pub const DEFAULT_LOG_FALLBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Guard against a peer that keeps returning a partial log page forever.
 const MAX_LOG_PAGES: u32 = 1024;
 
 /// Guard against a peer that streams an unbounded asset response.
 const MAX_ASSET_RECORDS: usize = 1_000_000;
+
+/// Guard against a peer that streams an unbounded oracle response.
+const MAX_ORACLE_PACKETS: usize = 1024;
+/// Largest active-subscription list accepted from one peer.
+const MAX_ORACLE_SUBSCRIPTIONS: usize = 4096;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -83,6 +94,10 @@ pub struct PeerConfig {
     pub connect_timeout: Duration,
     /// Extra attempts after the first one.
     pub retries: u32,
+    /// Probe timeout for the optional all-ranges log request.
+    pub log_range_timeout: Duration,
+    /// Per-probe timeout for the per-transaction log fallback.
+    pub log_fallback_probe_timeout: Duration,
 }
 
 impl PeerConfig {
@@ -94,6 +109,8 @@ impl PeerConfig {
             timeout: DEFAULT_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             retries: DEFAULT_RETRIES,
+            log_range_timeout: DEFAULT_LOG_RANGE_TIMEOUT,
+            log_fallback_probe_timeout: DEFAULT_LOG_FALLBACK_PROBE_TIMEOUT,
         }
     }
 
@@ -116,9 +133,21 @@ impl PeerConfig {
         self.retries = retries;
         self
     }
+
+    pub fn with_log_range_timeout(mut self, timeout: Duration) -> Self {
+        self.log_range_timeout = timeout;
+        self
+    }
+
+    pub fn with_log_fallback_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.log_fallback_probe_timeout = timeout;
+        self
+    }
 }
 
-#[derive(Debug, Clone, Serialize)]
+pub use health::{DEFAULT_DISCOVERY_LIMIT, PeerHealth, PeerManager, PeerPolicy};
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Head {
     pub epoch: u16,
     pub tick: u32,
@@ -237,6 +266,23 @@ impl AssetRecordResponse {
     }
 }
 
+/// Subscription info returned by `RequestOracleData` reqType 6.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleSubscriptionResponse {
+    pub subscription: OracleSubscription,
+    /// Initial query data sent by the core (`RespondOracleData.resType` 2).
+    pub query: Vec<u8>,
+}
+
+/// Query metadata, query data, and (when revealed) reply data returned by
+/// `RequestOracleData` reqType 5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleQueryResponse {
+    pub metadata: OracleQueryMetadata,
+    pub query: Option<Vec<u8>>,
+    pub reply: Option<Vec<u8>>,
+}
+
 /// A broadcast transaction that passed local validation and was written to the
 /// peer socket. Qubic core does not acknowledge broadcasts, so receipt means
 /// "sent", not "included".
@@ -259,6 +305,13 @@ pub struct Peer {
     public_peers: Vec<PeerAddress>,
     /// A timed-out read may have consumed part of a packet; reconnect first.
     desynced: bool,
+    /// Whether the peer answers `RequestAllLogIdRangesFromTx` (`None` until the
+    /// first probe). Once `Some(false)`, later ticks skip the probe and go
+    /// straight to the per-transaction fallback.
+    log_ranges_supported: Option<bool>,
+    /// Latest head this connection reported. Used to reject backwards ticks
+    /// and cached heads from before an epoch rollover.
+    observed_head: Option<Head>,
 }
 
 impl Peer {
@@ -274,6 +327,8 @@ impl Peer {
             pending: HashMap::new(),
             public_peers: Vec::new(),
             desynced: false,
+            log_ranges_supported: None,
+            observed_head: None,
         };
         peer.handshake().await?;
         Ok(peer)
@@ -291,7 +346,10 @@ impl Peer {
 
     /// Sends ExchangePublicPeers and waits for the peer's own exchange packet.
     pub async fn handshake(&mut self) -> Result<()> {
-        let peers = [PeerAddress { ip: [0, 0, 0, 0] }; 4];
+        let peers = [PeerAddress {
+            ip: [0, 0, 0, 0],
+            port: qubic::messages::DEFAULT_PEER_PORT,
+        }; 4];
         let dejavu = self.allocate_dejavu();
         self.writer
             .write_all(
@@ -348,12 +406,15 @@ impl Peer {
             )
             .await?;
         let info = CurrentTickInfo::decode(&packet.payload)?;
-        Ok(Head {
+        let head = Head {
             epoch: info.epoch,
             tick: info.tick,
             initial_tick: info.initial_tick,
             tick_duration: info.tick_duration,
-        })
+        };
+        health::check_head(self.observed_head.as_ref(), &head)?;
+        self.observed_head = Some(head.clone());
+        Ok(head)
     }
 
     /// Requests the computors for the peer's current epoch.
@@ -366,6 +427,17 @@ impl Peer {
             )
             .await?;
         decode_computors(&packet.payload)
+    }
+
+    /// Requests computors and returns them only when they belong to `epoch`.
+    ///
+    /// During an epoch rollover a peer may still answer with the previous set;
+    /// callers should treat that as [`Error::NotSynchronized`] and refresh
+    /// their head instead of verifying against the wrong computors.
+    pub async fn computors_for(&mut self, epoch: u16) -> Result<Computors> {
+        let computors = self.computors().await?;
+        health::check_computors_epoch(&computors, epoch)?;
+        Ok(computors)
     }
 
     /// Requests the tick data (transaction digests and contract fees).
@@ -548,6 +620,155 @@ impl Peer {
         Ok(RespondPriceSeries::decode(&packet.payload)?)
     }
 
+    /// Requests the IDs of all oracle subscriptions active in the current
+    /// epoch (`RequestOracleData` reqType 9).
+    ///
+    /// The core splits the list over multiple `RespondOracleData` packets, so
+    /// the stream is bounded by [`MAX_ORACLE_SUBSCRIPTIONS`] IDs and
+    /// [`MAX_ORACLE_PACKETS`] packets.
+    pub async fn oracle_subscription_ids(&mut self) -> Result<Vec<i32>> {
+        let packets = self
+            .request_stream_bounded(
+                MessageType::RequestOracleData,
+                request_oracle_data(ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS, 0),
+                MessageType::RespondOracleData,
+                MAX_ORACLE_PACKETS,
+            )
+            .await?;
+        let mut ids = Vec::new();
+        for packet in &packets {
+            let (header, data) = RespondOracleData::decode(&packet.payload)?;
+            if header.res_type != ORACLE_RESPOND_SUBSCRIPTION_IDS {
+                return Err(Error::Verification(format!(
+                    "unexpected oracle response type {} for active subscriptions",
+                    header.res_type
+                )));
+            }
+            if data.len() % 4 != 0 {
+                return Err(Error::Verification(format!(
+                    "oracle subscription ID list has {} trailing bytes",
+                    data.len() % 4
+                )));
+            }
+            if ids.len() + data.len() / 4 > MAX_ORACLE_SUBSCRIPTIONS {
+                return Err(Error::Verification(format!(
+                    "peer returned more than {MAX_ORACLE_SUBSCRIPTIONS} oracle subscriptions"
+                )));
+            }
+            for chunk in data.chunks_exact(4) {
+                ids.push(i32::from_le_bytes(
+                    chunk.try_into().expect("chunks_exact yields 4 bytes"),
+                ));
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Requests info and the initial query for one oracle subscription
+    /// (`RequestOracleData` reqType 6).
+    pub async fn oracle_subscription(
+        &mut self,
+        subscription_id: i32,
+    ) -> Result<OracleSubscriptionResponse> {
+        let packets = self
+            .request_stream_bounded(
+                MessageType::RequestOracleData,
+                request_oracle_data(ORACLE_REQUEST_SUBSCRIPTION, i64::from(subscription_id)),
+                MessageType::RespondOracleData,
+                MAX_ORACLE_PACKETS,
+            )
+            .await?;
+        let mut subscription = None;
+        let mut query = None;
+        for packet in &packets {
+            let (header, data) = RespondOracleData::decode(&packet.payload)?;
+            match header.res_type {
+                ORACLE_RESPOND_SUBSCRIPTION => {
+                    subscription = Some(OracleSubscription::decode(data)?);
+                }
+                ORACLE_RESPOND_QUERY_DATA => query = Some(data.to_vec()),
+                // Subscriber notifications use many packets; they are not part
+                // of the subscription query itself.
+                qubic::messages::ORACLE_RESPOND_SUBSCRIBER => {}
+                other => {
+                    return Err(Error::Verification(format!(
+                        "unexpected oracle response type {other} for subscription {subscription_id}"
+                    )));
+                }
+            }
+        }
+        let subscription = subscription.ok_or_else(|| {
+            Error::Verification(format!(
+                "peer did not return info for oracle subscription {subscription_id}"
+            ))
+        })?;
+        if subscription.subscription_id != subscription_id {
+            return Err(Error::Verification(format!(
+                "peer returned subscription {}, requested {subscription_id}",
+                subscription.subscription_id
+            )));
+        }
+        let query = query.ok_or_else(|| {
+            Error::Verification(format!(
+                "peer did not return query data for oracle subscription {subscription_id}"
+            ))
+        })?;
+        Ok(OracleSubscriptionResponse {
+            subscription,
+            query,
+        })
+    }
+
+    /// Requests metadata, query data, and reply data for one oracle query
+    /// (`RequestOracleData` reqType 5).
+    ///
+    /// `reply` is `None` until the query has been revealed successfully.
+    pub async fn oracle_query(&mut self, query_id: i64) -> Result<OracleQueryResponse> {
+        let packets = self
+            .request_stream_bounded(
+                MessageType::RequestOracleData,
+                request_oracle_data(ORACLE_REQUEST_QUERY_AND_RESPONSE, query_id),
+                MessageType::RespondOracleData,
+                MAX_ORACLE_PACKETS,
+            )
+            .await?;
+        let mut metadata = None;
+        let mut query = None;
+        let mut reply = None;
+        for packet in &packets {
+            let (header, data) = RespondOracleData::decode(&packet.payload)?;
+            match header.res_type {
+                ORACLE_RESPOND_QUERY_METADATA => {
+                    metadata = Some(OracleQueryMetadata::decode(data)?);
+                }
+                ORACLE_RESPOND_QUERY_DATA => query = Some(data.to_vec()),
+                ORACLE_RESPOND_REPLY_DATA => reply = Some(data.to_vec()),
+                qubic::messages::ORACLE_RESPOND_NOTIFIED_SUBSCRIBER_CONTRACTS => {}
+                other => {
+                    return Err(Error::Verification(format!(
+                        "unexpected oracle response type {other} for query {query_id}"
+                    )));
+                }
+            }
+        }
+        let metadata = metadata.ok_or_else(|| {
+            Error::Verification(format!(
+                "peer did not return metadata for oracle query {query_id}"
+            ))
+        })?;
+        if metadata.query_id != query_id {
+            return Err(Error::Verification(format!(
+                "peer returned metadata for query {}, requested {query_id}",
+                metadata.query_id
+            )));
+        }
+        Ok(OracleQueryResponse {
+            metadata,
+            query,
+            reply,
+        })
+    }
+
     /// Requests every asset issued by `public_key`, in peer order.
     ///
     /// A peer with no matches answers `EndResponse` directly, giving an empty
@@ -674,28 +895,78 @@ impl Peer {
     ///
     /// Peers without logging either answer `EndResponse` or time out. Both are
     /// reported as [`Error::LogsUnavailable`] so callers can continue.
+    ///
+    /// The answer is cached per peer: after the first rejection or timeout the
+    /// request is not sent again, so later ticks go straight to the
+    /// per-transaction fallback without paying the probe timeout.
     pub async fn log_ranges(&mut self, tick: u32) -> Result<LogRanges> {
+        if self.log_ranges_supported == Some(false) {
+            return Err(Error::LogsUnavailable(format!(
+                "peer {} previously rejected the all-ranges log request",
+                self.config.addr
+            )));
+        }
         let result = self
             .request_single_any_bounded(
                 MessageType::RequestAllLogIdRangesFromTx,
                 request_all_log_ranges(tick, self.config.passcode),
                 &[MessageType::RespondAllLogIdRangesFromTx],
-                LOG_RANGE_TIMEOUT,
+                self.config.log_range_timeout,
                 0,
             )
             .await;
         match result {
-            Ok(packet) => Ok(LogRanges::decode(&packet.payload)?),
-            Err(Error::EndResponse(_)) => Err(Error::LogsUnavailable(format!(
-                "peer {} does not expose log ranges for tick {tick} \
-                 (logging disabled or passcode mismatch)",
-                self.config.addr
-            ))),
-            Err(Error::Timeout(elapsed)) => Err(Error::LogsUnavailable(format!(
-                "peer {} did not answer log range request for tick {tick} after {elapsed:?}",
-                self.config.addr
-            ))),
+            Ok(packet) => {
+                let ranges = LogRanges::decode(&packet.payload)?;
+                self.set_log_ranges_supported(true, "all-ranges request succeeded");
+                Ok(ranges)
+            }
+            Err(Error::EndResponse(_)) => {
+                self.set_log_ranges_supported(
+                    false,
+                    "peer answered EndResponse to the all-ranges log request",
+                );
+                Err(Error::LogsUnavailable(format!(
+                    "peer {} does not expose log ranges for tick {tick} \
+                     (logging disabled or passcode mismatch)",
+                    self.config.addr
+                )))
+            }
+            Err(Error::Timeout(elapsed)) => {
+                self.set_log_ranges_supported(
+                    false,
+                    "peer timed out on the all-ranges log request",
+                );
+                Err(Error::LogsUnavailable(format!(
+                    "peer {} did not answer log range request for tick {tick} after {elapsed:?}",
+                    self.config.addr
+                )))
+            }
             Err(error) => Err(error),
+        }
+    }
+
+    /// Records all-ranges capability and logs only on a transition, so a peer
+    /// without logging does not warn once per tick.
+    fn set_log_ranges_supported(&mut self, supported: bool, reason: &str) {
+        let previous = self.log_ranges_supported;
+        self.log_ranges_supported = Some(supported);
+        match (previous, supported) {
+            (Some(value), next) if value == next => {}
+            (_, true) => {
+                tracing::debug!(
+                    peer = %self.config.addr,
+                    reason,
+                    "peer supports the all-ranges log request"
+                );
+            }
+            (_, false) => {
+                tracing::warn!(
+                    peer = %self.config.addr,
+                    reason,
+                    "peer does not support the all-ranges log request; using per-transaction fallback"
+                );
+            }
         }
     }
 
@@ -748,6 +1019,10 @@ impl Peer {
     }
 
     /// Assembles all data for one tick into a bundle.
+    ///
+    /// Fetches the head and computors first. Callers that already have a head
+    /// and computors for the same epoch should use [`Peer::bundle_with`] to
+    /// skip those round trips.
     pub async fn bundle(&mut self, tick: u32) -> Result<TickBundle> {
         tracing::debug!(tick, "bundle: head");
         let head = self.head().await?;
@@ -760,6 +1035,35 @@ impl Peer {
 
         tracing::debug!(tick, "bundle: computors");
         let computors = self.computors().await?;
+        self.bundle_with(tick, head, computors).await
+    }
+
+    /// Assembles a tick bundle from an already-known head and computors.
+    ///
+    /// This is the loop path for indexers: head and computors change on epoch
+    /// boundaries, not per tick. `head` must be at or after `tick`.
+    pub async fn bundle_with(
+        &mut self,
+        tick: u32,
+        head: Head,
+        computors: Computors,
+    ) -> Result<TickBundle> {
+        // A worker holding the previous epoch's head must not fetch a stale
+        // tick after rollover; the error carries the peer's current head tick.
+        health::check_cached_head(self.observed_head.as_ref(), &head)?;
+        let newer = self.observed_head.as_ref().is_none_or(|observed| {
+            observed.epoch < head.epoch
+                || (observed.epoch == head.epoch && observed.tick < head.tick)
+        });
+        if newer {
+            self.observed_head = Some(head.clone());
+        }
+        if tick > head.tick {
+            return Err(Error::NotSynchronized {
+                head: head.tick,
+                requested: tick,
+            });
+        }
         tracing::debug!(tick, "bundle: tick data");
         let tick_data = self.tick_data(tick).await?;
         if tick_data.tick != tick {
@@ -818,12 +1122,23 @@ impl Peer {
                 (ranges, logs)
             }
             Err(error) => {
-                tracing::warn!(
-                    peer = %self.config.addr,
-                    tick,
-                    %error,
-                    "log data unavailable; continuing without logs"
-                );
+                // A peer that already rejected all-ranges logged that once; do
+                // not repeat the warning for every tick.
+                if self.log_ranges_supported == Some(false) {
+                    tracing::debug!(
+                        peer = %self.config.addr,
+                        tick,
+                        %error,
+                        "log data unavailable; continuing without logs"
+                    );
+                } else {
+                    tracing::warn!(
+                        peer = %self.config.addr,
+                        tick,
+                        %error,
+                        "log data unavailable; continuing without logs"
+                    );
+                }
                 warnings.push(format!(
                     "log data unavailable from peer {}: {error}",
                     self.config.addr
@@ -858,6 +1173,10 @@ impl Peer {
 
     /// Probes `RequestLogIdRangeFromTx` (type 48) for every non-empty
     /// transaction plus the six special-event slots.
+    ///
+    /// All probes are sent before any response is read. The responses are
+    /// small and carry the request's dejavu, so a single round trip resolves
+    /// the whole set instead of paying one round trip per slot.
     async fn log_ranges_fallback(&mut self, tick: u32, tick_data: &TickData) -> Result<LogRanges> {
         let mut ranges = empty_log_ranges();
         let mut indices: Vec<usize> = tick_data
@@ -868,57 +1187,84 @@ impl Peer {
         indices.sort_unstable();
         indices.dedup();
 
-        let deadline = std::time::Instant::now() + self.config.timeout;
-        let passcode = self.config.passcode;
-        let mut answered = 0usize;
-        let mut last_error = None;
+        let answered = self
+            .request_log_range_batch(tick, &indices, self.config.log_fallback_probe_timeout)
+            .await?;
+        for (index, from, length) in &answered {
+            ranges.from_log_id[*index] = *from;
+            ranges.length[*index] = *length;
+        }
 
-        for index in indices {
+        if !answered.is_empty() {
+            Ok(ranges)
+        } else {
+            Err(Error::LogsUnavailable(format!(
+                "peer {} returned no log ranges for tick {tick} \
+                 (logging disabled or passcode mismatch)",
+                self.config.addr
+            )))
+        }
+    }
+
+    /// Sends every `RequestLogIdRangeFromTx` probe first, then reads responses
+    /// until all dejavus resolve or `budget` elapses.
+    async fn request_log_range_batch(
+        &mut self,
+        tick: u32,
+        indices: &[usize],
+        budget: Duration,
+    ) -> Result<Vec<(usize, i64, i64)>> {
+        let mut awaiting = HashMap::with_capacity(indices.len());
+        for &index in indices {
+            let dejavu = self
+                .send(
+                    MessageType::RequestLogIdRangeFromTx,
+                    request_log_id_range_from_tx(tick, index as u32, self.config.passcode),
+                )
+                .await?;
+            awaiting.insert(dejavu, index);
+        }
+
+        let deadline = std::time::Instant::now() + budget;
+        let mut answers = Vec::with_capacity(indices.len());
+        while !awaiting.is_empty() {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            let budget = remaining.min(LOG_FALLBACK_PROBE_TIMEOUT);
-            let result = self
-                .request_single_any_bounded(
-                    MessageType::RequestLogIdRangeFromTx,
-                    request_log_id_range_from_tx(tick, index as u32, passcode),
-                    &[MessageType::RespondLogIdRangeFromTx],
-                    budget,
-                    0,
-                )
-                .await;
-            match result {
-                Ok(packet) => {
-                    let (from, length) = decode_log_id_range(&packet.payload)?;
-                    ranges.from_log_id[index] = from;
-                    ranges.length[index] = length;
-                    answered += 1;
-                }
-                // This slot has no range on this peer.
-                Err(Error::EndResponse(_)) => {}
+            let packet = match self.read_packet_timeout(remaining).await {
+                Ok(packet) => packet,
+                Err(Error::Timeout(_)) => break,
                 Err(error) => {
-                    last_error = Some(error);
-                    break;
+                    for dejavu in awaiting.keys() {
+                        self.pending.remove(dejavu);
+                    }
+                    return Err(error);
                 }
+            };
+            if packet.kind == MessageType::ExchangePublicPeers {
+                self.record_peers(&packet);
+                continue;
+            }
+            let Some(index) = awaiting.remove(&packet.dejavu) else {
+                // Unsolicited gossip or a response to another request.
+                continue;
+            };
+            self.pending.remove(&packet.dejavu);
+            match packet.kind {
+                MessageType::RespondLogIdRangeFromTx => {
+                    let (from, length) = decode_log_id_range(&packet.payload)?;
+                    answers.push((index, from, length));
+                }
+                // This slot has no range on this peer, or asked us to retry.
+                MessageType::EndResponse | MessageType::TryAgain => {}
+                _ => {}
             }
         }
-
-        if answered > 0 {
-            Ok(ranges)
-        } else {
-            Err(Error::LogsUnavailable(match last_error {
-                Some(error) => format!(
-                    "peer {} rejects both all-ranges and per-transaction log range requests: {error}",
-                    self.config.addr
-                ),
-                None => format!(
-                    "peer {} returned no log ranges for tick {tick} \
-                     (logging disabled or passcode mismatch)",
-                    self.config.addr
-                ),
-            }))
+        for dejavu in awaiting.keys() {
+            self.pending.remove(dejavu);
         }
+        Ok(answers)
     }
 
     // ---- request machinery -------------------------------------------------
@@ -1192,33 +1538,92 @@ impl Peer {
     }
 }
 
-/// A pool of independent peer connections.
+/// A pool of independent peer connections with shared cross-peer health.
+///
+/// Cloning a pool shares the [`PeerManager`], so a long-lived API state keeps
+/// remembering failures and latency across requests.
+#[derive(Clone)]
 pub struct NodePool {
     peers: Vec<PeerConfig>,
+    manager: PeerManager,
 }
 
 impl NodePool {
     pub fn new(peers: Vec<PeerConfig>) -> Self {
-        Self { peers }
+        Self::with_policy(peers, PeerPolicy::default())
+    }
+
+    /// Builds a pool with explicit health policy, primarily for tests and
+    /// deployments that prefer a shorter quarantine.
+    pub fn with_policy(peers: Vec<PeerConfig>, policy: PeerPolicy) -> Self {
+        Self {
+            peers,
+            manager: PeerManager::new(policy),
+        }
     }
 
     pub fn peer_configs(&self) -> &[PeerConfig] {
         &self.peers
     }
 
-    /// Queries peers in order until one reports its head.
+    pub fn is_empty(&self) -> bool {
+        self.peers.is_empty()
+    }
+
+    /// Per-peer operator view: score, counters, latency, and quarantine.
+    pub fn health(&self) -> Vec<PeerHealth> {
+        self.manager.report(&self.peers)
+    }
+
+    /// Adds peers advertised by one reachable peer, up to
+    /// [`DEFAULT_DISCOVERY_LIMIT`] total. Discovery is opt-in; API request
+    /// paths must not call this.
+    pub async fn discover(&mut self) -> Result<Vec<PeerAddress>> {
+        self.discover_with_limit(DEFAULT_DISCOVERY_LIMIT).await
+    }
+
+    /// Discovery with an explicit total peer cap.
+    pub async fn discover_with_limit(&mut self, limit: usize) -> Result<Vec<PeerAddress>> {
+        let peer = self.connect_best().await?;
+        let advertised = peer.public_peers().to_vec();
+        let added = health::discovered_configs(&self.peers, &advertised, limit);
+        let addresses = added
+            .iter()
+            .filter_map(|config| match config.addr {
+                SocketAddr::V4(address) => {
+                    Some(PeerAddress::new(address.ip().octets(), address.port()))
+                }
+                SocketAddr::V6(_) => None,
+            })
+            .collect();
+        self.peers.extend(added);
+        Ok(addresses)
+    }
+
+    /// Queries peers in score order until one reports its head.
     pub async fn head(&self) -> Result<Head> {
-        if self.peers.is_empty() {
+        let candidates = self.manager.attempt_order(&self.peers);
+        if candidates.is_empty() {
             return Err(Error::NoPeers);
         }
         let mut last_error = None;
-        for config in &self.peers {
+        for config in candidates {
+            let started = std::time::Instant::now();
             match Peer::connect(config.clone()).await {
-                Ok(mut peer) => match peer.head().await {
-                    Ok(head) => return Ok(head),
-                    Err(error) => last_error = Some(error),
-                },
-                Err(error) => last_error = Some(error),
+                Ok(mut peer) => {
+                    self.manager.record_success(config.addr, started.elapsed());
+                    match peer.head().await {
+                        Ok(head) => return Ok(head),
+                        Err(error) => {
+                            self.manager.record_failure(config.addr);
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    self.manager.record_failure(config.addr);
+                    last_error = Some(error);
+                }
             }
         }
         Err(last_error.unwrap_or(Error::NoPeers))
@@ -1270,6 +1675,30 @@ impl NodePool {
             .await
     }
 
+    /// Requests active oracle subscription IDs from the best currently
+    /// reachable peer.
+    pub async fn oracle_subscription_ids(&self) -> Result<Vec<i32>> {
+        self.connect_best().await?.oracle_subscription_ids().await
+    }
+
+    /// Requests one oracle subscription and its initial query from the best
+    /// currently reachable peer.
+    pub async fn oracle_subscription(
+        &self,
+        subscription_id: i32,
+    ) -> Result<OracleSubscriptionResponse> {
+        self.connect_best()
+            .await?
+            .oracle_subscription(subscription_id)
+            .await
+    }
+
+    /// Requests one oracle query, its metadata, and any reply from the best
+    /// currently reachable peer.
+    pub async fn oracle_query(&self, query_id: i64) -> Result<OracleQueryResponse> {
+        self.connect_best().await?.oracle_query(query_id).await
+    }
+
     /// Requests every asset issued by `public_key` from the best currently
     /// reachable peer.
     pub async fn issued_assets(&self, public_key: [u8; 32]) -> Result<Vec<RespondIssuedAssets>> {
@@ -1312,32 +1741,28 @@ impl NodePool {
             .await
     }
 
-    /// Connects with failover and keeps the peer with the fastest handshake.
+    /// Connects to the best-scoring available peer, recording the handshake
+    /// latency or failure for future calls. Quarantined peers are skipped.
     pub async fn connect_best(&self) -> Result<Peer> {
-        if self.peers.is_empty() {
+        let candidates = self.manager.attempt_order(&self.peers);
+        if candidates.is_empty() {
             return Err(Error::NoPeers);
         }
-        let mut best: Option<(Duration, Peer)> = None;
         let mut last_error = None;
-        for config in &self.peers {
+        for config in candidates {
             let started = std::time::Instant::now();
             match Peer::connect(config.clone()).await {
                 Ok(peer) => {
-                    let latency = started.elapsed();
-                    if best
-                        .as_ref()
-                        .is_none_or(|(best_latency, _)| latency < *best_latency)
-                    {
-                        best = Some((latency, peer));
-                    }
+                    self.manager.record_success(config.addr, started.elapsed());
+                    return Ok(peer);
                 }
-                Err(error) => last_error = Some(error),
+                Err(error) => {
+                    self.manager.record_failure(config.addr);
+                    last_error = Some(error);
+                }
             }
         }
-        match best {
-            Some((_, peer)) => Ok(peer),
-            None => Err(last_error.unwrap_or(Error::NoPeers)),
-        }
+        Err(last_error.unwrap_or(Error::NoPeers))
     }
 }
 
@@ -1459,6 +1884,8 @@ mod tests {
         SPECTRUM_DEPTH, TX_PER_TICK,
     };
     use qubic::wire::{Header, MessageType, Packet};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1796,8 +2223,154 @@ mod tests {
                     .await;
                     send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
                 }
+                MessageType::RequestOracleData => {
+                    let request = qubic::messages::RequestOracleData::decode(&payload).unwrap();
+                    match request.req_type {
+                        qubic::messages::ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS => {
+                            let mut response = qubic::messages::RespondOracleData {
+                                res_type: qubic::messages::ORACLE_RESPOND_SUBSCRIPTION_IDS,
+                            }
+                            .encode()
+                            .to_vec();
+                            response.extend_from_slice(&5i32.to_le_bytes());
+                            response.extend_from_slice(&6i32.to_le_bytes());
+                            send(
+                                &mut stream,
+                                MessageType::RespondOracleData,
+                                dejavu,
+                                response,
+                            )
+                            .await;
+                        }
+                        qubic::messages::ORACLE_REQUEST_SUBSCRIPTION => {
+                            assert_eq!(request.tick_or_id, 5);
+                            let subscription = qubic::messages::OracleSubscription {
+                                subscription_id: 5,
+                                interface_index: qubic::messages::PRICE_ORACLE_INTERFACE_INDEX,
+                                last_pending_query_id: 800,
+                                last_revealed_query_id: 777,
+                                generated_queries_count: 3,
+                            };
+                            let mut response = qubic::messages::RespondOracleData {
+                                res_type: qubic::messages::ORACLE_RESPOND_SUBSCRIPTION,
+                            }
+                            .encode()
+                            .to_vec();
+                            response.extend_from_slice(&subscription.encode());
+                            send(
+                                &mut stream,
+                                MessageType::RespondOracleData,
+                                dejavu,
+                                response,
+                            )
+                            .await;
+
+                            let query = price_query();
+                            let mut response = qubic::messages::RespondOracleData {
+                                res_type: qubic::messages::ORACLE_RESPOND_QUERY_DATA,
+                            }
+                            .encode()
+                            .to_vec();
+                            response.extend_from_slice(&query.encode());
+                            send(
+                                &mut stream,
+                                MessageType::RespondOracleData,
+                                dejavu,
+                                response,
+                            )
+                            .await;
+
+                            let mut response = qubic::messages::RespondOracleData {
+                                res_type: qubic::messages::ORACLE_RESPOND_SUBSCRIBER,
+                            }
+                            .encode()
+                            .to_vec();
+                            response.extend_from_slice(&[0u8; 16]);
+                            send(
+                                &mut stream,
+                                MessageType::RespondOracleData,
+                                dejavu,
+                                response,
+                            )
+                            .await;
+                        }
+                        qubic::messages::ORACLE_REQUEST_QUERY_AND_RESPONSE => {
+                            assert_eq!(request.tick_or_id, 777);
+                            let metadata = qubic::messages::OracleQueryMetadata {
+                                query_id: 777,
+                                query_type: qubic::logs::ORACLE_QUERY_TYPE_CONTRACT_SUBSCRIPTION,
+                                status: qubic::logs::ORACLE_QUERY_STATUS_SUCCESS,
+                                status_flags: 0,
+                                query_tick: 91_915_000,
+                                querying_entity: [0; 32],
+                                timeout: 0,
+                                interface_index: qubic::messages::PRICE_ORACLE_INTERFACE_INDEX,
+                                subscription_id: 5,
+                                reveal_tick: 91_915_004,
+                                total_commits: 0,
+                                agreeing_commits: 0,
+                            };
+                            let mut response = qubic::messages::RespondOracleData {
+                                res_type: qubic::messages::ORACLE_RESPOND_QUERY_METADATA,
+                            }
+                            .encode()
+                            .to_vec();
+                            response.extend_from_slice(&metadata.encode());
+                            send(
+                                &mut stream,
+                                MessageType::RespondOracleData,
+                                dejavu,
+                                response,
+                            )
+                            .await;
+
+                            let mut response = qubic::messages::RespondOracleData {
+                                res_type: qubic::messages::ORACLE_RESPOND_QUERY_DATA,
+                            }
+                            .encode()
+                            .to_vec();
+                            response.extend_from_slice(&price_query().encode());
+                            send(
+                                &mut stream,
+                                MessageType::RespondOracleData,
+                                dejavu,
+                                response,
+                            )
+                            .await;
+
+                            let reply = qubic::messages::PriceOracleReply {
+                                numerator: 3,
+                                denominator: 2,
+                            };
+                            let mut response = qubic::messages::RespondOracleData {
+                                res_type: qubic::messages::ORACLE_RESPOND_REPLY_DATA,
+                            }
+                            .encode()
+                            .to_vec();
+                            response.extend_from_slice(&reply.encode());
+                            send(
+                                &mut stream,
+                                MessageType::RespondOracleData,
+                                dejavu,
+                                response,
+                            )
+                            .await;
+                        }
+                        other => panic!("unexpected oracle request type {other}"),
+                    }
+                    send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                }
                 _ => {}
             }
+        }
+    }
+
+    fn price_query() -> qubic::messages::PriceOracleQuery {
+        qubic::messages::PriceOracleQuery {
+            oracle: qubic::messages::currency_id("binance_mexc"),
+            timestamp: 1_700_000_000_000_000,
+            currency1: qubic::messages::currency_id("QUBIC"),
+            currency2: qubic::messages::currency_id("USDT"),
         }
     }
 
@@ -1814,6 +2387,239 @@ mod tests {
         .unwrap()
     }
 
+    /// Serves a handshake and one scripted head per accepted connection.
+    ///
+    /// Repeated `RequestCurrentTickInfo` calls walk `heads`, which lets tests
+    /// model a peer that reports a backwards or post-rollover head on the same
+    /// connection.
+    async fn spawn_scripted_peer(heads: Vec<(u16, u32)>, advertised: Vec<[u8; 4]>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let heads = Arc::new(heads);
+        let advertised = Arc::new(advertised);
+        let cursor = Arc::new(AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let heads = heads.clone();
+                let advertised = advertised.clone();
+                let cursor = cursor.clone();
+                tokio::spawn(async move {
+                    let mut payload = Vec::with_capacity(advertised.len() * 4);
+                    for ip in advertised.iter() {
+                        payload.extend_from_slice(ip);
+                    }
+                    send(&mut stream, MessageType::ExchangePublicPeers, 77, payload).await;
+                    while let Some((kind, dejavu, _)) = read_request(&mut stream).await {
+                        match kind {
+                            MessageType::RequestCurrentTickInfo => {
+                                let index = cursor
+                                    .fetch_add(1, Ordering::SeqCst)
+                                    .min(heads.len().saturating_sub(1));
+                                let (epoch, tick) =
+                                    heads.get(index).copied().unwrap_or((240, 1_000));
+                                let info = CurrentTickInfo {
+                                    tick_duration: 1_000,
+                                    epoch,
+                                    tick,
+                                    aligned_votes: 451,
+                                    misaligned_votes: 0,
+                                    initial_tick: tick.saturating_sub(100),
+                                };
+                                send(
+                                    &mut stream,
+                                    MessageType::RespondCurrentTickInfo,
+                                    dejavu,
+                                    info.encode().to_vec(),
+                                )
+                                .await;
+                            }
+                            MessageType::RequestComputors => {
+                                let computors = Computors {
+                                    epoch: 240,
+                                    public_keys: vec![[0u8; 32]; COMPUTOR_COUNT],
+                                    signature: [0; 64],
+                                };
+                                send(
+                                    &mut stream,
+                                    MessageType::BroadcastComputors,
+                                    dejavu,
+                                    computors.encode(),
+                                )
+                                .await;
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    /// Accepts TCP connections and drops them before the handshake completes.
+    async fn spawn_rejecting_peer() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counter = attempts.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        (addr, attempts)
+    }
+
+    fn fast_health_policy() -> PeerPolicy {
+        PeerPolicy {
+            quarantine_after: 3,
+            quarantine_base: Duration::from_millis(40),
+            quarantine_max: Duration::from_millis(160),
+            failure_penalty: Duration::from_millis(10),
+            exploration_bonus: Duration::from_millis(1),
+            exploration_window: Duration::from_millis(20),
+            unknown_latency: Duration::from_millis(100),
+            latency_alpha: 0.5,
+        }
+    }
+
+    fn quick_peer(addr: SocketAddr) -> PeerConfig {
+        PeerConfig::new(addr)
+            .with_timeout(Duration::from_secs(1))
+            .with_connect_timeout(Duration::from_secs(1))
+            .with_retries(0)
+    }
+
+    #[tokio::test]
+    async fn pool_quarantines_failing_peer_and_recovers_after_cooldown() {
+        let (bad, attempts) = spawn_rejecting_peer().await;
+        let good = spawn_scripted_peer(vec![(240, 1_000)], Vec::new()).await;
+        let mut pool = NodePool::with_policy(vec![quick_peer(bad)], fast_health_policy());
+
+        for _ in 0..3 {
+            assert!(pool.connect_best().await.is_err());
+        }
+        assert!(pool.manager.is_quarantined(bad));
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        // A healthy peer is now available, but the failing one must not be
+        // contacted while quarantined.
+        pool.peers.push(quick_peer(good));
+        let peer = pool.connect_best().await.unwrap();
+        assert_eq!(peer.config().addr, good);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!pool.manager.is_quarantined(bad));
+        assert!(
+            pool.manager
+                .attempt_order(&pool.peers)
+                .iter()
+                .any(|config| config.addr == bad)
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_orders_by_latency_and_shares_health_across_clones() {
+        let slow = spawn_scripted_peer(vec![(240, 1_000)], Vec::new()).await;
+        let fast = spawn_scripted_peer(vec![(240, 1_000)], Vec::new()).await;
+        let pool = NodePool::new(vec![quick_peer(slow), quick_peer(fast)]);
+        pool.manager.record_success(slow, Duration::from_millis(80));
+        pool.manager.record_success(fast, Duration::from_millis(5));
+
+        let peer = pool.connect_best().await.unwrap();
+        assert_eq!(peer.config().addr, fast);
+
+        let clone = pool.clone();
+        clone.manager.record_failure(slow);
+        let health = pool.health();
+        let slow_health = health
+            .iter()
+            .find(|entry| entry.addr == slow)
+            .expect("slow peer health");
+        assert_eq!(slow_health.failures, 1);
+        assert!(slow_health.last_latency_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn pool_discovery_dedups_and_caps() {
+        let seed = spawn_scripted_peer(
+            vec![(240, 1_000)],
+            vec![[127, 0, 0, 2], [127, 0, 0, 2], [127, 0, 0, 3]],
+        )
+        .await;
+        let mut pool = NodePool::new(vec![quick_peer(seed)]);
+
+        let added = pool.discover_with_limit(2).await.unwrap();
+        assert_eq!(added, [PeerAddress::new([127, 0, 0, 2], 21_841)]);
+        assert_eq!(pool.peer_configs().len(), 2);
+        assert_eq!(pool.health().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn peer_rejects_backwards_and_stale_heads() {
+        let addr = spawn_scripted_peer(vec![(240, 1_000), (240, 900)], Vec::new()).await;
+        let mut peer = Peer::connect(quick_peer(addr)).await.unwrap();
+        assert_eq!(peer.head().await.unwrap().tick, 1_000);
+        assert!(matches!(
+            peer.head().await,
+            Err(Error::NotSynchronized {
+                head: 900,
+                requested: 1_000
+            })
+        ));
+
+        // A new epoch may legitimately restart at a lower tick.
+        let rollover = spawn_scripted_peer(vec![(240, 1_000), (241, 10)], Vec::new()).await;
+        let mut peer = Peer::connect(quick_peer(rollover)).await.unwrap();
+        assert_eq!(peer.head().await.unwrap().epoch, 240);
+        let head = peer.head().await.unwrap();
+        assert_eq!((head.epoch, head.tick), (241, 10));
+
+        // A worker holding the previous epoch's head must refresh.
+        let addr = spawn_scripted_peer(vec![(241, 50)], Vec::new()).await;
+        let mut peer = Peer::connect(quick_peer(addr)).await.unwrap();
+        peer.head().await.unwrap();
+        let cached = Head {
+            epoch: 240,
+            tick: 9_000,
+            initial_tick: 0,
+            tick_duration: 1_000,
+        };
+        let computors = Computors {
+            epoch: 240,
+            public_keys: vec![[0u8; 32]; COMPUTOR_COUNT],
+            signature: [0; 64],
+        };
+        assert!(matches!(
+            peer.bundle_with(9_000, cached, computors).await,
+            Err(Error::NotSynchronized {
+                head: 50,
+                requested: 9_000
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn computors_for_rejects_wrong_epoch() {
+        let mut peer = peer_and_server().await;
+        assert_eq!(peer.computors_for(240).await.unwrap().epoch, 240);
+        assert!(matches!(
+            peer.computors_for(241).await,
+            Err(Error::NotSynchronized {
+                head: 240,
+                requested: 241
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn handshake_learns_public_peers() {
         let peer = peer_and_server().await;
@@ -1822,7 +2628,47 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert_eq!(peers, ["1.2.3.4", "5.6.7.8", "9.10.11.12", "13.14.15.16"]);
+        assert_eq!(
+            peers,
+            [
+                "1.2.3.4:21841",
+                "5.6.7.8:21841",
+                "9.10.11.12:21841",
+                "13.14.15.16:21841"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn oracle_requests_parse_streamed_packets() {
+        let mut peer = peer_and_server().await;
+        assert_eq!(peer.oracle_subscription_ids().await.unwrap(), vec![5, 6]);
+
+        let subscription = peer.oracle_subscription(5).await.unwrap();
+        assert_eq!(subscription.subscription.subscription_id, 5);
+        assert_eq!(
+            subscription.subscription.interface_index,
+            qubic::messages::PRICE_ORACLE_INTERFACE_INDEX
+        );
+        assert_eq!(subscription.subscription.last_revealed_query_id, 777);
+        let query = qubic::messages::PriceOracleQuery::decode(&subscription.query).unwrap();
+        assert!(query.is_pair(
+            &qubic::messages::currency_id("QUBIC"),
+            &qubic::messages::currency_id("USDT")
+        ));
+
+        let response = peer.oracle_query(777).await.unwrap();
+        assert_eq!(response.metadata.query_id, 777);
+        assert_eq!(
+            response.metadata.status,
+            qubic::logs::ORACLE_QUERY_STATUS_SUCCESS
+        );
+        assert_eq!(response.metadata.query_tick, 91_915_000);
+        assert_eq!(response.metadata.reveal_tick, 91_915_004);
+        let reply =
+            qubic::messages::PriceOracleReply::decode(response.reply.as_deref().unwrap()).unwrap();
+        assert_eq!(reply.numerator, 3);
+        assert_eq!(reply.denominator, 2);
     }
 
     #[tokio::test]
@@ -1925,7 +2771,11 @@ mod tests {
     /// Peer that rejects the all-ranges request (type 50). When `fallback` is
     /// set it answers per-transaction log ranges (type 48), otherwise it has no
     /// logging at all.
-    async fn fake_peer_optional_logs(listener: TcpListener, fallback: bool) {
+    async fn fake_peer_optional_logs(
+        listener: TcpListener,
+        fallback: bool,
+        requests: Option<tokio::sync::mpsc::UnboundedSender<MessageType>>,
+    ) {
         let (mut stream, _) = listener.accept().await.unwrap();
         send(
             &mut stream,
@@ -1936,6 +2786,9 @@ mod tests {
         .await;
 
         while let Some((kind, dejavu, payload)) = read_request(&mut stream).await {
+            if let Some(requests) = &requests {
+                let _ = requests.send(kind);
+            }
             match kind {
                 MessageType::ExchangePublicPeers => {}
                 MessageType::RequestCurrentTickInfo => {
@@ -2030,16 +2883,24 @@ mod tests {
     }
 
     async fn peer_with_optional_logs(fallback: bool) -> Peer {
+        peer_with_optional_logs_counted(fallback).await.0
+    }
+
+    async fn peer_with_optional_logs_counted(
+        fallback: bool,
+    ) -> (Peer, tokio::sync::mpsc::UnboundedReceiver<MessageType>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(fake_peer_optional_logs(listener, fallback));
-        Peer::connect(
+        let (requests, received) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(fake_peer_optional_logs(listener, fallback, Some(requests)));
+        let peer = Peer::connect(
             PeerConfig::new(addr)
                 .with_timeout(Duration::from_secs(2))
                 .with_connect_timeout(Duration::from_secs(2)),
         )
         .await
-        .unwrap()
+        .unwrap();
+        (peer, received)
     }
 
     #[tokio::test]
@@ -2091,6 +2952,73 @@ mod tests {
         }
     }
 
+    fn drain_requests(
+        requests: &mut tokio::sync::mpsc::UnboundedReceiver<MessageType>,
+    ) -> Vec<MessageType> {
+        let mut seen = Vec::new();
+        while let Ok(kind) = requests.try_recv() {
+            seen.push(kind);
+        }
+        seen
+    }
+
+    #[tokio::test]
+    async fn all_ranges_capability_is_cached_per_peer() {
+        let (mut peer, mut requests) = peer_with_optional_logs_counted(true).await;
+
+        let bundle = peer.bundle(TICK).await.unwrap();
+        assert_eq!(bundle.log_ranges.range(), Some((5, 6)));
+        let first = drain_requests(&mut requests);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|kind| **kind == MessageType::RequestAllLogIdRangesFromTx)
+                .count(),
+            1,
+            "the first probe should hit all-ranges once: {first:?}"
+        );
+        assert_eq!(peer.log_ranges_supported, Some(false));
+
+        let bundle = peer.bundle(TICK).await.unwrap();
+        assert_eq!(bundle.log_ranges.range(), Some((5, 6)));
+        let second = drain_requests(&mut requests);
+        assert!(
+            !second.contains(&MessageType::RequestAllLogIdRangesFromTx),
+            "cached rejection must skip the all-ranges probe: {second:?}"
+        );
+        assert!(
+            second.contains(&MessageType::RequestLogIdRangeFromTx),
+            "the fallback probes should still run: {second:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_with_skips_head_and_computors() {
+        let (mut peer, mut requests) = peer_with_optional_logs_counted(true).await;
+
+        let bundle = peer.bundle(TICK).await.unwrap();
+        let first = drain_requests(&mut requests);
+        assert!(first.contains(&MessageType::RequestCurrentTickInfo));
+        assert!(first.contains(&MessageType::RequestComputors));
+
+        let head = bundle.head.clone();
+        let computors = bundle.computors.clone();
+        let reused = peer.bundle_with(TICK, head, computors).await.unwrap();
+        assert_eq!(reused.tick.tick, TICK);
+        assert_eq!(reused.log_ranges.range(), Some((5, 6)));
+
+        let second = drain_requests(&mut requests);
+        assert!(
+            !second.contains(&MessageType::RequestCurrentTickInfo),
+            "bundle_with must not fetch the head again: {second:?}"
+        );
+        assert!(
+            !second.contains(&MessageType::RequestComputors),
+            "bundle_with must not fetch computors again: {second:?}"
+        );
+        assert!(second.contains(&MessageType::RequestTickData));
+    }
+
     #[tokio::test]
     #[ignore = "requires a reachable Qubic peer; run with --ignored"]
     async fn live_head_smoke() {
@@ -2132,6 +3060,43 @@ mod tests {
             bundle.transactions.len(),
             bundle.logs.len(),
             bundle.warnings
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a reachable Qubic peer; run with --ignored --nocapture"]
+    async fn live_bundle_with_cached_logs_smoke() {
+        let mut peer = live_peer().await;
+        let head = peer.head().await.expect("live head");
+        let computors = peer.computors().await.expect("live computors");
+        let tick = head.tick.saturating_sub(4);
+
+        let started = std::time::Instant::now();
+        let first = peer
+            .bundle_with(tick, head.clone(), computors.clone())
+            .await
+            .expect("first bundle_with");
+        let first_elapsed = started.elapsed();
+
+        let started = std::time::Instant::now();
+        let second = peer
+            .bundle_with(tick + 1, head, computors)
+            .await
+            .expect("second bundle_with");
+        let second_elapsed = started.elapsed();
+
+        eprintln!(
+            "bundle_with tick {tick}: {:?} (logs={}, warnings={:?})",
+            first_elapsed,
+            first.logs.len(),
+            first.warnings
+        );
+        eprintln!(
+            "bundle_with tick {}: {:?} (logs={}, warnings={:?})",
+            tick + 1,
+            second_elapsed,
+            second.logs.len(),
+            second.warnings
         );
     }
 
