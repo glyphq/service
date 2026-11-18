@@ -1317,7 +1317,7 @@ pub fn spec() -> Value {
                         "filled": { "type": "boolean", "description": "True when the core filled a missing hour from the previous price; on-chain rows only" },
                         "stale": { "type": "boolean", "description": "True when the source marked the value stale" },
                         "source": { "type": "integer", "description": "0 Price oracle interface, 29 QPayhub fallback, 1000 external exchange consensus" },
-                        "source_name": { "type": "string", "description": "price_oracle, qpayhub, or unknown" },
+                        "source_name": { "type": "string", "description": "price_oracle, qpayhub, external_market, or unknown" },
                         "synced": { "type": "boolean", "description": "On-chain rows only" },
                         "bound": { "type": "boolean", "description": "On-chain rows only" },
                         "series_digest": { "type": "string", "description": "Hex K12 digest of the series state; on-chain rows only" },
