@@ -17,6 +17,8 @@ pub const LOG_RANGES_SIZE: usize = LOG_TX_PER_TICK * 16;
 pub const REQUEST_QUORUM_TICK_SIZE: usize = 92;
 pub const REQUEST_TICK_TRANSACTIONS_SIZE: usize = 516;
 pub const MAX_INPUT_SIZE: usize = 1024;
+/// Largest amount a transaction may carry (`ISSUANCE_RATE * 1000`).
+pub const MAX_AMOUNT: i64 = 1_000_000_000_000_000;
 pub const ASSET_RECORD_SIZE: usize = 48;
 pub const ISSUANCE_RECORD_SIZE: usize = 48;
 pub const OWNERSHIP_RECORD_SIZE: usize = 48;
@@ -36,6 +38,9 @@ pub const RESPOND_OWNED_ASSETS_SIZE: usize = 2 * ASSET_RECORD_SIZE + 8 + 32 * AS
 pub const RESPOND_POSSESSED_ASSETS_SIZE: usize = 3 * ASSET_RECORD_SIZE + 8 + 32 * ASSETS_DEPTH;
 pub const REQUEST_ENTITY_SIZE: usize = 32;
 pub const REQUEST_TRANSACTION_INFO_SIZE: usize = 32;
+pub const REQUEST_TX_STATUS_SIZE: usize = 4;
+/// Fixed part of `RespondTxStatus`: three `u32` fields and the money-flew bitmap.
+pub const RESPOND_TX_STATUS_HEADER_SIZE: usize = 4 + 4 + 4 + TX_PER_TICK.div_ceil(8);
 pub const REQUEST_LOG_SIZE: usize = 48;
 pub const REQUEST_ALL_LOG_RANGES_SIZE: usize = 36;
 pub const REQUEST_LOG_ID_RANGE_FROM_TX_SIZE: usize = 40;
@@ -1141,6 +1146,103 @@ impl RequestTransactionInfo {
     }
 }
 
+/// `RequestTxStatus` from the qli tx-status add-on (`addons/tx_status_request.h`, 4 bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestTxStatus {
+    pub tick: u32,
+}
+
+impl RequestTxStatus {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() != REQUEST_TX_STATUS_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "request tx status needs {REQUEST_TX_STATUS_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        Ok(Self {
+            tick: u32::from_le_bytes(payload.try_into().expect("4 bytes")),
+        })
+    }
+
+    pub fn encode(&self) -> [u8; REQUEST_TX_STATUS_SIZE] {
+        self.tick.to_le_bytes()
+    }
+}
+
+/// `RespondTxStatus` from the qli tx-status add-on: confirmed digests for one
+/// tick plus a `moneyFlew` bit per transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RespondTxStatus {
+    pub current_tick: u32,
+    pub tick: u32,
+    pub digests: Vec<[u8; 32]>,
+    /// One flag per transaction, in the same order as [`Self::digests`].
+    pub money_flew: Vec<bool>,
+}
+
+impl RespondTxStatus {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() < RESPOND_TX_STATUS_HEADER_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "respond tx status needs at least {RESPOND_TX_STATUS_HEADER_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let current_tick = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes"));
+        let tick = u32::from_le_bytes(payload[4..8].try_into().expect("4 bytes"));
+        let tx_count = u32::from_le_bytes(payload[8..12].try_into().expect("4 bytes")) as usize;
+        if tx_count > TX_PER_TICK {
+            return Err(Error::InvalidPacket(format!(
+                "respond tx status count {tx_count} exceeds {TX_PER_TICK}"
+            )));
+        }
+        let bitmap_len = TX_PER_TICK.div_ceil(8);
+        let expected = RESPOND_TX_STATUS_HEADER_SIZE + tx_count * 32;
+        if payload.len() != expected {
+            return Err(Error::InvalidPacket(format!(
+                "respond tx status needs {expected} bytes for {tx_count} transactions, got {}",
+                payload.len()
+            )));
+        }
+        let bitmap = &payload[12..12 + bitmap_len];
+        let money_flew = (0..tx_count)
+            .map(|index| bitmap[index / 8] & (1 << (index % 8)) != 0)
+            .collect();
+        let digest_bytes = &payload[12 + bitmap_len..];
+        let digests = digest_bytes
+            .chunks_exact(32)
+            .map(|chunk| chunk.try_into().expect("32 bytes"))
+            .collect();
+        Ok(Self {
+            current_tick,
+            tick,
+            digests,
+            money_flew,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let digests = &self.digests[..self.digests.len().min(TX_PER_TICK)];
+        let tx_count = digests.len();
+        let mut out = Vec::with_capacity(RESPOND_TX_STATUS_HEADER_SIZE + tx_count * 32);
+        out.extend_from_slice(&self.current_tick.to_le_bytes());
+        out.extend_from_slice(&self.tick.to_le_bytes());
+        out.extend_from_slice(&(tx_count as u32).to_le_bytes());
+        let mut bitmap = vec![0u8; TX_PER_TICK.div_ceil(8)];
+        for (index, flew) in self.money_flew.iter().take(tx_count).enumerate() {
+            if *flew {
+                bitmap[index / 8] |= 1 << (index % 8);
+            }
+        }
+        out.extend_from_slice(&bitmap);
+        for digest in digests {
+            out.extend_from_slice(digest);
+        }
+        out
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestLog {
     pub passcode: [u64; 4],
@@ -1788,6 +1890,10 @@ pub fn request_transaction_info(digest: [u8; 32]) -> Vec<u8> {
     digest.to_vec()
 }
 
+pub fn request_tx_status(tick: u32) -> Vec<u8> {
+    RequestTxStatus { tick }.encode().to_vec()
+}
+
 pub fn request_log_id_range_from_tx(tick: u32, tx_id: u32, passcode: [u64; 4]) -> Vec<u8> {
     RequestLogIdRangeFromTx {
         passcode,
@@ -1896,5 +2002,40 @@ mod tests {
         let bytes = tx.encode();
         assert_eq!(bytes.len(), tx.total_size());
         assert_eq!(Transaction::decode(&bytes).unwrap(), tx);
+    }
+
+    #[test]
+    fn tx_status_round_trip() {
+        let status = RespondTxStatus {
+            current_tick: 10,
+            tick: 9,
+            digests: vec![[1; 32], [2; 32], [3; 32]],
+            money_flew: vec![true, false, true],
+        };
+        let bytes = status.encode();
+        assert_eq!(bytes.len(), RESPOND_TX_STATUS_HEADER_SIZE + 3 * 32);
+        assert_eq!(RespondTxStatus::decode(&bytes).unwrap(), status);
+        assert_eq!(request_tx_status(9), 9u32.to_le_bytes());
+        assert_eq!(
+            RequestTxStatus::decode(&request_tx_status(9)).unwrap().tick,
+            9
+        );
+    }
+
+    #[test]
+    fn tx_status_rejects_inconsistent_lengths() {
+        let status = RespondTxStatus {
+            current_tick: 10,
+            tick: 9,
+            digests: vec![[1; 32]],
+            money_flew: vec![true],
+        };
+        let mut bytes = status.encode();
+        bytes.pop();
+        assert!(RespondTxStatus::decode(&bytes).is_err());
+
+        let mut too_many = status.encode();
+        too_many[8..12].copy_from_slice(&(TX_PER_TICK as u32 + 1).to_le_bytes());
+        assert!(RespondTxStatus::decode(&too_many).is_err());
     }
 }
