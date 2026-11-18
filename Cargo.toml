@@ -7,6 +7,7 @@ members = [
     "crates/store",
     "crates/api",
     "crates/cli",
+    "crates/archive",
 ]
 
 [workspace.package]
@@ -17,13 +18,17 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1"
+async-stream = "0.3"
 async-trait = "0.1"
-axum = { version = "0.8", features = ["macros"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 base64 = "0.22"
+bytes = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clickhouse = { version = "0.13", features = ["chrono"] }
+futures-util = "0.3"
 hex = "0.4"
+object_store = { version = "0.13", features = ["aws"] }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,6 +40,7 @@ tower-http = { version = "0.6", features = ["cors", "compression-zstd", "compres
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+zstd = "0.13"
 
 [profile.release]
 lto = "thin"
