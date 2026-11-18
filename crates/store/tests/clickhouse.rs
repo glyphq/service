@@ -11,8 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use store::{
-    CURSOR_HEAD, ClickHouseStore, Error, EventRow, IdentityRow, Store, TickBatch, TickRow,
-    TransactionRow,
+    CURSOR_HEAD, CURSOR_INGEST, ClickHouseStore, Error, EventRow, IdentityRow, IngestCursor, Store,
+    TickBatch, TickRow, TransactionRow,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -198,6 +198,13 @@ async fn round_trip_is_idempotent_and_cursor_never_regresses() {
     assert_eq!(stats["counts"]["identities"], 2);
     assert_eq!(stats["cursor"]["tick"], 100);
 
+    let ingest = store.ingest_cursor().await.unwrap();
+    assert_eq!(ingest.last_indexed_tick, Some(100));
+    assert_eq!(ingest.epoch, Some(1));
+    assert_eq!(ingest.verification.as_deref(), Some("quorum"));
+    assert!(ingest.updated_at.is_some());
+    assert_eq!(stats["ingest"]["last_indexed_tick"], 100);
+
     // Replaying the exact same batch must not duplicate reads or counts.
     store.write_tick(&first).await.expect("replay first tick");
     assert_eq!(
@@ -246,11 +253,65 @@ async fn round_trip_is_idempotent_and_cursor_never_regresses() {
     let cursor: serde_json::Value =
         serde_json::from_str(&store.cursor(CURSOR_HEAD).await.unwrap().unwrap()).unwrap();
     assert_eq!(cursor["tick"], 101);
+    let ingest = store.ingest_cursor().await.unwrap();
+    assert_eq!(ingest.last_indexed_tick, Some(101));
+    assert_eq!(ingest.verification.as_deref(), Some("quorum"));
 
     // Pagination walks the deduplicated rows.
     let page = store.transactions_for_tick(100, 1, 1).await.unwrap();
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].tx_index, 1);
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn ingest_cursor_round_trips_through_clickhouse() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    assert_eq!(
+        store.ingest_cursor().await.unwrap(),
+        IngestCursor::default()
+    );
+
+    let cursor = IngestCursor {
+        last_indexed_tick: Some(4242),
+        epoch: Some(7),
+        verification: Some("state".into()),
+        updated_at: None,
+    };
+    store.set_ingest_cursor(&cursor).await.expect("set cursor");
+
+    let loaded = store.ingest_cursor().await.unwrap();
+    assert_eq!(loaded.last_indexed_tick, Some(4242));
+    assert_eq!(loaded.epoch, Some(7));
+    assert_eq!(loaded.verification.as_deref(), Some("state"));
+    assert!(loaded.updated_at.is_some());
+
+    let raw = store
+        .cursor(CURSOR_INGEST)
+        .await
+        .unwrap()
+        .expect("raw cursor");
+    assert!(raw.contains("\"last_indexed_tick\":4242"), "{raw}");
+
+    // A later write with a lower tick still wins for explicit cursor sets;
+    // only the tick writer applies the no-regression rule.
+    store
+        .set_ingest_cursor(&IngestCursor {
+            last_indexed_tick: Some(1),
+            epoch: Some(1),
+            verification: Some("quorum".into()),
+            updated_at: None,
+        })
+        .await
+        .expect("overwrite cursor");
+    assert_eq!(
+        store.ingest_cursor().await.unwrap().last_indexed_tick,
+        Some(1)
+    );
 
     store.drop_database().await.expect("drop test database");
 }
@@ -319,6 +380,49 @@ async fn rejecting_mismatched_rows_writes_nothing() {
     assert!(store.head().await.unwrap().is_none());
 
     store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn initializes_the_real_glyph_database() {
+    let store =
+        ClickHouseStore::new(&clickhouse_url(), "glyph").expect("valid store configuration");
+    if let Err(err) = store.init().await {
+        eprintln!(
+            "skipping ClickHouse integration test at {}: {err}",
+            clickhouse_url()
+        );
+        return;
+    }
+    // `init` must be replayable against the already-created database.
+    store.init().await.expect("re-init glyph");
+
+    let tables: Vec<String> = store
+        .client
+        .query("SELECT name FROM system.tables WHERE database = ? ORDER BY name")
+        .bind("glyph")
+        .fetch_all()
+        .await
+        .expect("system.tables");
+    assert_eq!(
+        tables,
+        vec![
+            "events",
+            "identities",
+            "ingest_state",
+            "ticks",
+            "transactions"
+        ]
+    );
+
+    let projections: Vec<String> = store
+        .client
+        .query("SELECT name FROM system.projections WHERE database = ? ORDER BY name")
+        .bind("glyph")
+        .fetch_all()
+        .await
+        .expect("system.projections");
+    assert!(projections.contains(&"by_hash".to_string()));
+    assert!(projections.contains(&"by_tick".to_string()));
 }
 
 #[tokio::test]

@@ -350,6 +350,7 @@ impl Store for ClickHouseStore {
             Some(value) => serde_json::from_str(&value).unwrap_or_else(|_| json!(value)),
             None => Value::Null,
         };
+        let ingest = self.ingest_cursor().await?;
         Ok(json!({
             "head": head,
             "counts": {
@@ -359,6 +360,7 @@ impl Store for ClickHouseStore {
                 "identities": identities,
             },
             "cursor": cursor,
+            "ingest": ingest,
         }))
     }
 
