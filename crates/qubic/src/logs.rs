@@ -1,5 +1,6 @@
 use crate::crypto::k12::k12_8;
 use crate::error::{Error, Result};
+use crate::wire::Reader;
 
 pub const LOG_HEADER_SIZE: usize = 26;
 
@@ -26,6 +27,25 @@ pub const CUSTOM_OP_START_DISTRIBUTE_DIVIDENDS: u64 = 6_217_575_821_008_262_227;
 pub const CUSTOM_OP_END_DISTRIBUTE_DIVIDENDS: u64 = 6_217_575_821_008_457_285;
 pub const CUSTOM_OP_START_EPOCH: u64 = 4_850_183_582_582_395_987;
 pub const CUSTOM_OP_END_EPOCH: u64 = 4_850_183_582_582_591_045;
+pub const CUSTOM_OP_ANT_SOLUTION: u64 = 6_146_374_810_954_124_865;
+
+pub const ORACLE_QUERY_TYPE_CONTRACT_QUERY: u8 = 0;
+pub const ORACLE_QUERY_TYPE_CONTRACT_SUBSCRIPTION: u8 = 1;
+pub const ORACLE_QUERY_TYPE_USER_QUERY: u8 = 2;
+
+pub const ORACLE_QUERY_STATUS_UNKNOWN: u8 = 0;
+pub const ORACLE_QUERY_STATUS_PENDING: u8 = 1;
+pub const ORACLE_QUERY_STATUS_COMMITTED: u8 = 2;
+pub const ORACLE_QUERY_STATUS_SUCCESS: u8 = 3;
+pub const ORACLE_QUERY_STATUS_TIMEOUT: u8 = 4;
+pub const ORACLE_QUERY_STATUS_UNRESOLVABLE: u8 = 5;
+
+pub const OC_INVOCATION_STATUS_UNKNOWN: u8 = 0;
+pub const OC_INVOCATION_STATUS_PENDING_AUTH: u8 = 1;
+pub const OC_INVOCATION_STATUS_AUTHORIZED: u8 = 2;
+pub const OC_INVOCATION_STATUS_TIMEOUT: u8 = 3;
+
+pub const SPECTRUM_ENTITY_CATEGORIES: usize = 48;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEvent {
@@ -39,10 +59,9 @@ pub struct LogEvent {
 
 impl LogEvent {
     pub fn decode(payload: &[u8]) -> Result<Self> {
-        if payload.len() < LOG_HEADER_SIZE + 8 {
+        if payload.len() < LOG_HEADER_SIZE {
             return Err(Error::InvalidLog(format!(
-                "log record needs at least {} bytes, got {}",
-                LOG_HEADER_SIZE + 8,
+                "log record needs at least {LOG_HEADER_SIZE} bytes, got {}",
                 payload.len()
             )));
         }
@@ -71,6 +90,21 @@ impl LogEvent {
 
     pub fn encoded_len(&self) -> usize {
         LOG_HEADER_SIZE + self.body.len()
+    }
+
+    /// Encodes the 26-byte core log header followed by the raw body.
+    pub fn encode(&self) -> Vec<u8> {
+        let size = self.body.len();
+        debug_assert!(size <= 0x00FF_FFFF, "log body exceeds 24-bit size field");
+        let combo = (self.log_type as u32) << 24 | size as u32;
+        let mut out = Vec::with_capacity(LOG_HEADER_SIZE + size);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.extend_from_slice(&self.tick.to_le_bytes());
+        out.extend_from_slice(&combo.to_le_bytes());
+        out.extend_from_slice(&self.log_id.to_le_bytes());
+        out.extend_from_slice(&self.log_digest.to_le_bytes());
+        out.extend_from_slice(&self.body);
+        out
     }
 
     pub fn verify_digest(&self) -> bool {
@@ -111,7 +145,9 @@ impl LogEvent {
 
     pub fn custom_op_code(&self) -> Option<u64> {
         if self.log_type == CUSTOM_MESSAGE && self.body.len() >= 8 {
-            Some(u64::from_le_bytes(self.body[..8].try_into().expect("8 bytes")))
+            Some(u64::from_le_bytes(
+                self.body[..8].try_into().expect("8 bytes"),
+            ))
         } else {
             None
         }
@@ -138,6 +174,37 @@ pub fn type_name(log_type: u8) -> &'static str {
         ORACLE_SUBSCRIBER_MESSAGE => "oracle_subscriber_message",
         OC_INVOCATION_STATUS_CHANGE => "oc_invocation_status_change",
         CUSTOM_MESSAGE => "custom_message",
+        _ => "unknown",
+    }
+}
+
+pub fn oracle_query_status_name(status: u8) -> &'static str {
+    match status {
+        ORACLE_QUERY_STATUS_UNKNOWN => "unknown",
+        ORACLE_QUERY_STATUS_PENDING => "pending",
+        ORACLE_QUERY_STATUS_COMMITTED => "committed",
+        ORACLE_QUERY_STATUS_SUCCESS => "success",
+        ORACLE_QUERY_STATUS_TIMEOUT => "timeout",
+        ORACLE_QUERY_STATUS_UNRESOLVABLE => "unresolvable",
+        _ => "unknown",
+    }
+}
+
+pub fn oracle_query_type_name(query_type: u8) -> &'static str {
+    match query_type {
+        ORACLE_QUERY_TYPE_CONTRACT_QUERY => "contract_query",
+        ORACLE_QUERY_TYPE_CONTRACT_SUBSCRIPTION => "contract_subscription",
+        ORACLE_QUERY_TYPE_USER_QUERY => "user_query",
+        _ => "unknown",
+    }
+}
+
+pub fn oc_invocation_status_name(status: u8) -> &'static str {
+    match status {
+        OC_INVOCATION_STATUS_UNKNOWN => "unknown",
+        OC_INVOCATION_STATUS_PENDING_AUTH => "pending_authorization",
+        OC_INVOCATION_STATUS_AUTHORIZED => "authorized",
+        OC_INVOCATION_STATUS_TIMEOUT => "timeout",
         _ => "unknown",
     }
 }
@@ -174,6 +241,23 @@ pub enum EventBody {
         asset: AssetRef,
         shares: i64,
     },
+    AssetOwnershipManagingContractChange {
+        ownership: [u8; 32],
+        issuer: [u8; 32],
+        source_contract_index: u32,
+        destination_contract_index: u32,
+        shares: i64,
+        asset_name: String,
+    },
+    AssetPossessionManagingContractChange {
+        possession: [u8; 32],
+        ownership: [u8; 32],
+        issuer: [u8; 32],
+        source_contract_index: u32,
+        destination_contract_index: u32,
+        shares: i64,
+        asset_name: String,
+    },
     Burning {
         from: [u8; 32],
         amount: i64,
@@ -182,15 +266,58 @@ pub enum EventBody {
     DustBurning {
         burns: Vec<([u8; 32], i64)>,
     },
+    SpectrumStats {
+        total_amount: u64,
+        dust_threshold_burn_all: u64,
+        dust_threshold_burn_half: u64,
+        number_of_entities: u32,
+        entity_category_populations: Vec<u32>,
+    },
     ContractMessage {
         contract_index: u32,
         message_type: u32,
         data: Vec<u8>,
     },
+    ContractReserveDeduction {
+        deducted_amount: u64,
+        remaining_amount: i64,
+        contract_index: u32,
+    },
+    OracleQueryStatusChange {
+        querying_entity: [u8; 32],
+        query_id: i64,
+        interface_index: u32,
+        query_type: u8,
+        status: u8,
+    },
+    OracleSubscriberMessage {
+        subscription_id: i32,
+        interface_index: u32,
+        contract_index: u32,
+        period_in_milliseconds: u32,
+        first_query_date_and_time: u64,
+    },
+    OcInvocationStatusChange {
+        invocation_id: i64,
+        contract_index: u32,
+        interface_index: u32,
+        status: u8,
+    },
     Custom {
         op_code: u64,
         data: Vec<u8>,
     },
+    AntSolution {
+        source: [u8; 32],
+        nonce: [u8; 32],
+        parent_tick: u32,
+        parent_solution_index: u32,
+        anchor_tick: u32,
+        score: u32,
+        result: u32,
+    },
+    /// Preserved verbatim for unknown event types and for known types whose
+    /// body is too short to decode safely.
     Unknown {
         raw: Vec<u8>,
     },
@@ -198,79 +325,32 @@ pub enum EventBody {
 
 impl EventBody {
     pub fn decode(log_type: u8, body: &[u8]) -> Self {
-        match log_type {
-            QU_TRANSFER if body.len() >= 72 => Self::QuTransfer {
-                from: key(body, 0),
-                to: key(body, 32),
-                amount: i64::from_le_bytes(body[64..72].try_into().expect("8 bytes")),
-            },
-            ASSET_ISSUANCE if body.len() >= 63 => Self::AssetIssuance {
-                asset: AssetRef {
-                    issuer: key(body, 0),
-                    name: asset_name(&body[48..55]),
-                    decimals: body[55],
-                    unit: unit_name(&body[56..63]),
-                    managing_contract: i64::from_le_bytes(body[40..48].try_into().expect("8 bytes")),
-                },
-                shares: i64::from_le_bytes(body[32..40].try_into().expect("8 bytes")),
-            },
-            ASSET_OWNERSHIP_CHANGE if body.len() >= 119 => Self::AssetOwnershipChange {
-                from: key(body, 0),
-                to: key(body, 32),
-                asset: AssetRef {
-                    issuer: key(body, 64),
-                    name: asset_name(&body[104..111]),
-                    decimals: body[111],
-                    unit: unit_name(&body[112..119]),
-                    managing_contract: i64::from_le_bytes(body[96..104].try_into().expect("8 bytes")),
-                },
-                shares: i64::from_le_bytes(body[88..96].try_into().expect("8 bytes")),
-            },
-            ASSET_POSSESSION_CHANGE if body.len() >= 119 => Self::AssetPossessionChange {
-                from: key(body, 0),
-                to: key(body, 32),
-                asset: AssetRef {
-                    issuer: key(body, 64),
-                    name: asset_name(&body[104..111]),
-                    decimals: body[111],
-                    unit: unit_name(&body[112..119]),
-                    managing_contract: i64::from_le_bytes(body[96..104].try_into().expect("8 bytes")),
-                },
-                shares: i64::from_le_bytes(body[88..96].try_into().expect("8 bytes")),
-            },
-            BURNING if body.len() >= 44 => Self::Burning {
-                from: key(body, 0),
-                amount: i64::from_le_bytes(body[32..40].try_into().expect("8 bytes")),
-                contract_index: u32::from_le_bytes(body[40..44].try_into().expect("4 bytes")),
-            },
-            DUST_BURNING if body.len() >= 2 => {
-                let count = u16::from_le_bytes([body[0], body[1]]) as usize;
-                let mut burns = Vec::with_capacity(count);
-                let mut offset = 2;
-                for _ in 0..count {
-                    if offset + 40 > body.len() {
-                        break;
-                    }
-                    burns.push((
-                        key(body, offset),
-                        i64::from_le_bytes(body[offset + 32..offset + 40].try_into().expect("8 bytes")),
-                    ));
-                    offset += 40;
-                }
-                Self::DustBurning { burns }
+        let decoded = match log_type {
+            QU_TRANSFER => decode_qu_transfer(body),
+            ASSET_ISSUANCE => decode_asset_issuance(body),
+            ASSET_OWNERSHIP_CHANGE => decode_asset_change(body, false),
+            ASSET_POSSESSION_CHANGE => decode_asset_change(body, true),
+            ASSET_OWNERSHIP_MANAGING_CONTRACT_CHANGE => {
+                decode_asset_ownership_managing_contract_change(body)
             }
-            CONTRACT_ERROR_MESSAGE | CONTRACT_WARNING_MESSAGE | CONTRACT_INFORMATION_MESSAGE
-            | CONTRACT_DEBUG_MESSAGE if body.len() >= 8 => Self::ContractMessage {
-                contract_index: u32::from_le_bytes(body[0..4].try_into().expect("4 bytes")),
-                message_type: u32::from_le_bytes(body[4..8].try_into().expect("4 bytes")),
-                data: body[8..].to_vec(),
-            },
-            CUSTOM_MESSAGE if body.len() >= 8 => Self::Custom {
-                op_code: u64::from_le_bytes(body[..8].try_into().expect("8 bytes")),
-                data: body[8..].to_vec(),
-            },
-            _ => Self::Unknown { raw: body.to_vec() },
-        }
+            ASSET_POSSESSION_MANAGING_CONTRACT_CHANGE => {
+                decode_asset_possession_managing_contract_change(body)
+            }
+            BURNING => decode_burning(body),
+            DUST_BURNING => decode_dust_burning(body),
+            SPECTRUM_STATS => decode_spectrum_stats(body),
+            CONTRACT_ERROR_MESSAGE
+            | CONTRACT_WARNING_MESSAGE
+            | CONTRACT_INFORMATION_MESSAGE
+            | CONTRACT_DEBUG_MESSAGE => decode_contract_message(body),
+            CONTRACT_RESERVE_DEDUCTION => decode_contract_reserve_deduction(body),
+            ORACLE_QUERY_STATUS_CHANGE => decode_oracle_query_status_change(body),
+            ORACLE_SUBSCRIBER_MESSAGE => decode_oracle_subscriber_message(body),
+            OC_INVOCATION_STATUS_CHANGE => decode_oc_invocation_status_change(body),
+            CUSTOM_MESSAGE => decode_custom_message(body),
+            _ => None,
+        };
+        decoded.unwrap_or_else(|| Self::Unknown { raw: body.to_vec() })
     }
 
     pub fn kind(&self) -> &'static str {
@@ -279,13 +359,254 @@ impl EventBody {
             Self::AssetIssuance { .. } => "asset_issuance",
             Self::AssetOwnershipChange { .. } => "asset_ownership_change",
             Self::AssetPossessionChange { .. } => "asset_possession_change",
+            Self::AssetOwnershipManagingContractChange { .. } => {
+                "asset_ownership_managing_contract_change"
+            }
+            Self::AssetPossessionManagingContractChange { .. } => {
+                "asset_possession_managing_contract_change"
+            }
             Self::Burning { .. } => "burning",
             Self::DustBurning { .. } => "dust_burning",
+            Self::SpectrumStats { .. } => "spectrum_stats",
             Self::ContractMessage { .. } => "contract_message",
+            Self::ContractReserveDeduction { .. } => "contract_reserve_deduction",
+            Self::OracleQueryStatusChange { .. } => "oracle_query_status_change",
+            Self::OracleSubscriberMessage { .. } => "oracle_subscriber_message",
+            Self::OcInvocationStatusChange { .. } => "oc_invocation_status_change",
             Self::Custom { .. } => "custom",
+            Self::AntSolution { .. } => "ant_solution",
             Self::Unknown { .. } => "unknown",
         }
     }
+}
+
+fn decode_qu_transfer(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 72 {
+        return None;
+    }
+    Some(EventBody::QuTransfer {
+        from: key(body, 0),
+        to: key(body, 32),
+        amount: i64::from_le_bytes(body[64..72].try_into().expect("8 bytes")),
+    })
+}
+
+fn decode_asset_issuance(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 63 {
+        return None;
+    }
+    Some(EventBody::AssetIssuance {
+        asset: AssetRef {
+            issuer: key(body, 0),
+            managing_contract: i64::from_le_bytes(body[40..48].try_into().expect("8 bytes")),
+            name: asset_name(&body[48..55]),
+            decimals: body[55],
+            unit: unit_name(&body[56..63]),
+        },
+        shares: i64::from_le_bytes(body[32..40].try_into().expect("8 bytes")),
+    })
+}
+
+/// ASSET_OWNERSHIP_CHANGE and ASSET_POSSESSION_CHANGE share this layout:
+/// source(32) destination(32) issuer(32) shares(8) managingContract(8)
+/// name(7) decimals(1) unit(7).
+fn decode_asset_change(body: &[u8], possession: bool) -> Option<EventBody> {
+    if body.len() < 127 {
+        return None;
+    }
+    let from = key(body, 0);
+    let to = key(body, 32);
+    let shares = i64::from_le_bytes(body[96..104].try_into().expect("8 bytes"));
+    let asset = AssetRef {
+        issuer: key(body, 64),
+        managing_contract: i64::from_le_bytes(body[104..112].try_into().expect("8 bytes")),
+        name: asset_name(&body[112..119]),
+        decimals: body[119],
+        unit: unit_name(&body[120..127]),
+    };
+    Some(if possession {
+        EventBody::AssetPossessionChange {
+            from,
+            to,
+            asset,
+            shares,
+        }
+    } else {
+        EventBody::AssetOwnershipChange {
+            from,
+            to,
+            asset,
+            shares,
+        }
+    })
+}
+
+fn decode_asset_ownership_managing_contract_change(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 87 {
+        return None;
+    }
+    Some(EventBody::AssetOwnershipManagingContractChange {
+        ownership: key(body, 0),
+        issuer: key(body, 32),
+        source_contract_index: u32::from_le_bytes(body[64..68].try_into().expect("4 bytes")),
+        destination_contract_index: u32::from_le_bytes(body[68..72].try_into().expect("4 bytes")),
+        shares: i64::from_le_bytes(body[72..80].try_into().expect("8 bytes")),
+        asset_name: asset_name(&body[80..87]),
+    })
+}
+
+fn decode_asset_possession_managing_contract_change(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 119 {
+        return None;
+    }
+    Some(EventBody::AssetPossessionManagingContractChange {
+        possession: key(body, 0),
+        ownership: key(body, 32),
+        issuer: key(body, 64),
+        source_contract_index: u32::from_le_bytes(body[96..100].try_into().expect("4 bytes")),
+        destination_contract_index: u32::from_le_bytes(body[100..104].try_into().expect("4 bytes")),
+        shares: i64::from_le_bytes(body[104..112].try_into().expect("8 bytes")),
+        asset_name: asset_name(&body[112..119]),
+    })
+}
+
+fn decode_burning(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 44 {
+        return None;
+    }
+    Some(EventBody::Burning {
+        from: key(body, 0),
+        amount: i64::from_le_bytes(body[32..40].try_into().expect("8 bytes")),
+        contract_index: u32::from_le_bytes(body[40..44].try_into().expect("4 bytes")),
+    })
+}
+
+fn decode_dust_burning(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 2 {
+        return None;
+    }
+    let count = u16::from_le_bytes([body[0], body[1]]) as usize;
+    let required = 2 + count * 40;
+    if body.len() < required {
+        return None;
+    }
+    let mut burns = Vec::with_capacity(count);
+    let mut offset = 2;
+    for _ in 0..count {
+        burns.push((
+            key(body, offset),
+            i64::from_le_bytes(body[offset + 32..offset + 40].try_into().expect("8 bytes")),
+        ));
+        offset += 40;
+    }
+    Some(EventBody::DustBurning { burns })
+}
+
+fn decode_spectrum_stats(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 224 {
+        return None;
+    }
+    let mut r = Reader::new(body);
+    let total_amount = r.u64().ok()?;
+    let dust_threshold_burn_all = r.u64().ok()?;
+    let dust_threshold_burn_half = r.u64().ok()?;
+    let number_of_entities = r.u32().ok()?;
+    let mut entity_category_populations = Vec::with_capacity(SPECTRUM_ENTITY_CATEGORIES);
+    for _ in 0..SPECTRUM_ENTITY_CATEGORIES {
+        entity_category_populations.push(r.u32().ok()?);
+    }
+    Some(EventBody::SpectrumStats {
+        total_amount,
+        dust_threshold_burn_all,
+        dust_threshold_burn_half,
+        number_of_entities,
+        entity_category_populations,
+    })
+}
+
+fn decode_contract_message(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 8 {
+        return None;
+    }
+    Some(EventBody::ContractMessage {
+        contract_index: u32::from_le_bytes(body[0..4].try_into().expect("4 bytes")),
+        message_type: u32::from_le_bytes(body[4..8].try_into().expect("4 bytes")),
+        data: body[8..].to_vec(),
+    })
+}
+
+fn decode_contract_reserve_deduction(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 24 {
+        return None;
+    }
+    Some(EventBody::ContractReserveDeduction {
+        deducted_amount: u64::from_le_bytes(body[0..8].try_into().expect("8 bytes")),
+        remaining_amount: i64::from_le_bytes(body[8..16].try_into().expect("8 bytes")),
+        contract_index: u32::from_le_bytes(body[16..20].try_into().expect("4 bytes")),
+    })
+}
+
+fn decode_oracle_query_status_change(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 46 {
+        return None;
+    }
+    Some(EventBody::OracleQueryStatusChange {
+        querying_entity: key(body, 0),
+        query_id: i64::from_le_bytes(body[32..40].try_into().expect("8 bytes")),
+        interface_index: u32::from_le_bytes(body[40..44].try_into().expect("4 bytes")),
+        query_type: body[44],
+        status: body[45],
+    })
+}
+
+fn decode_oracle_subscriber_message(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 24 {
+        return None;
+    }
+    Some(EventBody::OracleSubscriberMessage {
+        subscription_id: i32::from_le_bytes(body[0..4].try_into().expect("4 bytes")),
+        interface_index: u32::from_le_bytes(body[4..8].try_into().expect("4 bytes")),
+        contract_index: u32::from_le_bytes(body[8..12].try_into().expect("4 bytes")),
+        period_in_milliseconds: u32::from_le_bytes(body[12..16].try_into().expect("4 bytes")),
+        first_query_date_and_time: u64::from_le_bytes(body[16..24].try_into().expect("8 bytes")),
+    })
+}
+
+fn decode_oc_invocation_status_change(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 17 {
+        return None;
+    }
+    Some(EventBody::OcInvocationStatusChange {
+        invocation_id: i64::from_le_bytes(body[0..8].try_into().expect("8 bytes")),
+        contract_index: u32::from_le_bytes(body[8..12].try_into().expect("4 bytes")),
+        interface_index: u32::from_le_bytes(body[12..16].try_into().expect("4 bytes")),
+        status: body[16],
+    })
+}
+
+fn decode_custom_message(body: &[u8]) -> Option<EventBody> {
+    if body.len() < 8 {
+        return None;
+    }
+    let op_code = u64::from_le_bytes(body[..8].try_into().expect("8 bytes"));
+    if op_code == CUSTOM_OP_ANT_SOLUTION {
+        if body.len() < 92 {
+            return None;
+        }
+        return Some(EventBody::AntSolution {
+            source: key(body, 8),
+            nonce: key(body, 40),
+            parent_tick: u32::from_le_bytes(body[72..76].try_into().expect("4 bytes")),
+            parent_solution_index: u32::from_le_bytes(body[76..80].try_into().expect("4 bytes")),
+            anchor_tick: u32::from_le_bytes(body[80..84].try_into().expect("4 bytes")),
+            score: u32::from_le_bytes(body[84..88].try_into().expect("4 bytes")),
+            result: u32::from_le_bytes(body[88..92].try_into().expect("4 bytes")),
+        });
+    }
+    Some(EventBody::Custom {
+        op_code,
+        data: body[8..].to_vec(),
+    })
 }
 
 fn key(body: &[u8], offset: usize) -> [u8; 32] {
@@ -307,8 +628,7 @@ fn unit_name(bytes: &[u8]) -> String {
     bytes
         .iter()
         .copied()
-        .take_while(|b| *b != 0)
-        .map(|b| (b + 48) as char)
+        .map(|b| char::from(b.wrapping_add(48)))
         .collect()
 }
 
@@ -355,5 +675,14 @@ mod tests {
         let bytes = encode_log(CUSTOM_MESSAGE, &body);
         let event = LogEvent::decode(&bytes).unwrap();
         assert_eq!(event.custom_op_code(), Some(CUSTOM_OP_END_EPOCH));
+    }
+
+    #[test]
+    fn short_known_body_stays_raw() {
+        let body = [0xAB, 0xCD, 0xEF];
+        assert_eq!(
+            EventBody::decode(QU_TRANSFER, &body),
+            EventBody::Unknown { raw: body.to_vec() }
+        );
     }
 }

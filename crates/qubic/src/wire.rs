@@ -52,10 +52,25 @@ pub enum MessageType {
     RespondActiveIpo = 65,
     RequestOracleData = 66,
     RespondOracleData = 67,
+    BroadcastCustomMiningTask = 68,
+    BroadcastCustomMiningSolution = 69,
     RequestRevenueData = 70,
     RespondRevenueData = 71,
+    RequestAntIdentityTree = 72,
+    RespondAntIdentityTree = 73,
+    RequestAntParentAnn = 74,
+    RespondAntParentAnn = 75,
+    RequestAntEpochContext = 76,
+    RespondAntEpochContext = 77,
     RequestPriceSeries = 78,
     RespondPriceSeries = 79,
+    RequestBpp9000TaskData = 80,
+    RespondBpp9000TaskData = 81,
+    OracleMachineQuery = 190,
+    OracleMachineReply = 191,
+    OcMachineInvocation = 192,
+    RequestTxStatus = 201,
+    RespondTxStatus = 202,
     SpecialCommand = 255,
 }
 
@@ -107,10 +122,25 @@ impl MessageType {
             65 => Self::RespondActiveIpo,
             66 => Self::RequestOracleData,
             67 => Self::RespondOracleData,
+            68 => Self::BroadcastCustomMiningTask,
+            69 => Self::BroadcastCustomMiningSolution,
             70 => Self::RequestRevenueData,
             71 => Self::RespondRevenueData,
+            72 => Self::RequestAntIdentityTree,
+            73 => Self::RespondAntIdentityTree,
+            74 => Self::RequestAntParentAnn,
+            75 => Self::RespondAntParentAnn,
+            76 => Self::RequestAntEpochContext,
+            77 => Self::RespondAntEpochContext,
             78 => Self::RequestPriceSeries,
             79 => Self::RespondPriceSeries,
+            80 => Self::RequestBpp9000TaskData,
+            81 => Self::RespondBpp9000TaskData,
+            190 => Self::OracleMachineQuery,
+            191 => Self::OracleMachineReply,
+            192 => Self::OcMachineInvocation,
+            201 => Self::RequestTxStatus,
+            202 => Self::RespondTxStatus,
             255 => Self::SpecialCommand,
             other => return Err(Error::InvalidMessageType(other)),
         })
@@ -134,7 +164,9 @@ impl Header {
         }
         let size = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0]);
         if (size as usize) < HEADER_SIZE {
-            return Err(Error::InvalidPacket(format!("packet size {size} is too small")));
+            return Err(Error::InvalidPacket(format!(
+                "packet size {size} is too small"
+            )));
         }
         Ok(Self {
             size,
@@ -146,7 +178,16 @@ impl Header {
     pub fn encode(&self) -> [u8; HEADER_SIZE] {
         let size = self.size.to_le_bytes();
         let dejavu = self.dejavu.to_le_bytes();
-        [size[0], size[1], size[2], self.kind as u8, dejavu[0], dejavu[1], dejavu[2], dejavu[3]]
+        [
+            size[0],
+            size[1],
+            size[2],
+            self.kind as u8,
+            dejavu[0],
+            dejavu[1],
+            dejavu[2],
+            dejavu[3],
+        ]
     }
 }
 
@@ -169,11 +210,14 @@ impl Packet {
     pub fn encode(&self) -> Vec<u8> {
         let size = HEADER_SIZE + self.payload.len();
         let mut out = Vec::with_capacity(size);
-        out.extend_from_slice(&Header {
-            size: size as u32,
-            kind: self.kind,
-            dejavu: self.dejavu,
-        }.encode());
+        out.extend_from_slice(
+            &Header {
+                size: size as u32,
+                kind: self.kind,
+                dejavu: self.dejavu,
+            }
+            .encode(),
+        );
         out.extend_from_slice(&self.payload);
         out
     }
@@ -251,16 +295,10 @@ impl<'a> Reader<'a> {
             .offset
             .checked_add(len)
             .ok_or_else(|| Error::InvalidPacket("offset overflow".into()))?;
-        let bytes = self
-            .data
-            .get(self.offset..end)
-            .ok_or_else(|| Error::InvalidPacket(format!("need {len} bytes, have {}", self.remaining())))?;
+        let bytes = self.data.get(self.offset..end).ok_or_else(|| {
+            Error::InvalidPacket(format!("need {len} bytes, have {}", self.remaining()))
+        })?;
         self.offset = end;
         Ok(bytes)
-    }
-
-    pub(crate) fn skip(&mut self, len: usize) -> Result<()> {
-        self.bytes(len)?;
-        Ok(())
     }
 }

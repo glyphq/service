@@ -82,7 +82,7 @@ pub fn encode_base26(bytes: &[u8; PUBLIC_KEY_LEN], uppercase: bool, with_checksu
 
 /// Decodes the first 56 characters of a Qubic identity or transaction hash.
 pub fn decode_base26(value: &str, lowercase: bool) -> Result<[u8; PUBLIC_KEY_LEN]> {
-    let expected_len = if lowercase { IDENTITY_LEN } else { IDENTITY_LEN };
+    let expected_len = IDENTITY_LEN;
     if value.len() != expected_len {
         return Err(Error::InvalidIdentity(format!(
             "expected {expected_len} characters, got {}",

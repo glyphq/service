@@ -22,7 +22,11 @@ mod wire_tests {
 
     #[test]
     fn packet_round_trip() {
-        let packet = Packet::new(MessageType::RequestTickData, 77, 42u32.to_le_bytes().to_vec());
+        let packet = Packet::new(
+            MessageType::RequestTickData,
+            77,
+            42u32.to_le_bytes().to_vec(),
+        );
         let bytes = packet.encode();
         assert_eq!(bytes.len(), 12);
         assert_eq!(bytes[0..3], [12, 0, 0]);
