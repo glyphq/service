@@ -1,0 +1,6 @@
+/target
+/data
+/.data
+*.log
+.env
+.DS_Store
