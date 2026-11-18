@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -7,28 +9,49 @@ use axum::extract::{Request, State as AxumState};
 use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use node::PeerConfig;
 use store::Store;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 
+pub mod advanced;
 pub mod dto;
 pub mod error;
 pub mod openapi;
 pub mod routes;
+pub mod stream;
 
 pub use error::ApiError;
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn Store>,
+    pub hub: Option<Arc<stream::StreamHub>>,
+    pub peers: Vec<PeerConfig>,
+    pub allow_broadcast: bool,
+    pub archive: Option<archive::SharedArchive>,
+}
+
+impl AppState {
+    pub fn new(store: Arc<dyn Store>) -> Self {
+        Self {
+            store,
+            hub: None,
+            peers: Vec::new(),
+            allow_broadcast: false,
+            archive: None,
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {
     let request_id = axum::http::HeaderName::from_static("x-request-id");
     let mut app = Router::new()
         .merge(routes::router())
+        .merge(advanced::router())
+        .merge(stream::router())
         .route(
             "/openapi.json",
             axum::routing::get(|| async { axum::Json(openapi::spec()) }),
@@ -153,13 +176,53 @@ async fn enforce_rate_limit(
 
 /// Binds and serves the API until SIGINT or SIGTERM.
 pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
-    let app = router(AppState { store });
+    let hub = Arc::new(stream::StreamHub::new());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let poll = std::env::var("STREAM_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_millis(1000));
+    let hub_task = tokio::spawn(hub.clone().run(store.clone(), poll, cancel.clone()));
+    let peers = std::env::var("QUBIC_PEERS")
+        .or_else(|_| std::env::var("QUBIC_PEER"))
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|item| item.trim().parse().ok())
+                .map(PeerConfig::new)
+                .collect()
+        })
+        .unwrap_or_default();
+    let allow_broadcast = std::env::var("ALLOW_BROADCAST").is_ok_and(|value| value == "true");
+    let archive = archive_from_env();
+    let app = router(AppState {
+        store,
+        hub: Some(hub),
+        peers,
+        allow_broadcast,
+        archive,
+    });
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "glyph api listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    cancel.cancel();
+    let _ = hub_task.await;
     Ok(())
+}
+
+fn archive_from_env() -> Option<archive::SharedArchive> {
+    match archive::S3Archive::from_env() {
+        Ok(Some(s3)) => return Some(Arc::new(s3)),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(%error, "S3 raw archive is misconfigured"),
+    }
+    std::env::var("ARCHIVE_DIR")
+        .ok()
+        .filter(|dir| !dir.trim().is_empty())
+        .map(|dir| Arc::new(archive::FileArchive::new(dir)) as archive::SharedArchive)
 }
 
 async fn shutdown_signal() {

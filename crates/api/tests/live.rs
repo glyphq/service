@@ -18,7 +18,6 @@ use tower::ServiceExt;
 
 const IDENTITY: &str = "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK";
 const OTHER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const HASH: &str = "yqcvscbbnhotdgqfpvcaniwcppcenlphwdxqqrewmbsfvvbpojfsnvwazgvb";
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -46,6 +45,13 @@ fn timestamp() -> chrono::DateTime<Utc> {
         .expect("valid timestamp")
 }
 
+fn hash_for(tick: u32, index: u8) -> String {
+    let mut key = [0u8; 32];
+    key[..4].copy_from_slice(&tick.to_le_bytes());
+    key[4] = index;
+    qubic::encode_tx_hash(&key)
+}
+
 fn batch(tick: u32) -> TickBatch {
     let mut batch = TickBatch::new(240, tick, timestamp(), 7, "data");
     batch.transactions = vec![
@@ -53,7 +59,7 @@ fn batch(tick: u32) -> TickBatch {
             epoch: 240,
             tick,
             tx_index: 0,
-            hash: format!("{HASH}{tick}"),
+            hash: hash_for(tick, 0),
             source: IDENTITY.into(),
             destination: OTHER.into(),
             amount: 1000,
@@ -66,7 +72,7 @@ fn batch(tick: u32) -> TickBatch {
             epoch: 240,
             tick,
             tx_index: 1,
-            hash: format!("{HASH}{tick}1"),
+            hash: hash_for(tick, 1),
             source: OTHER.into(),
             destination: IDENTITY.into(),
             amount: 250,
@@ -82,7 +88,7 @@ fn batch(tick: u32) -> TickBatch {
         log_id: u64::from(tick),
         log_type: 1,
         type_name: "asset_issuance".into(),
-        tx_hash: format!("{HASH}{tick}"),
+        tx_hash: hash_for(tick, 0),
         tx_index: 0,
         body: format!(
             r#"{{"issuer":"{IDENTITY}","name":"QX","decimals":0,"unit":"","managingContract":1,"shares":"1000"}}"#
@@ -117,6 +123,29 @@ async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
     (status, value)
 }
 
+async fn post(app: &axum::Router, uri: &str, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 #[tokio::test]
 async fn live_clickhouse_serves_every_collection() {
     let database = unique_database();
@@ -131,9 +160,7 @@ async fn live_clickhouse_serves_every_collection() {
     store.write_tick(&batch(100)).await.expect("write 100");
     store.write_tick(&batch(101)).await.expect("write 101");
 
-    let app = router(AppState {
-        store: store.clone(),
-    });
+    let app = router(AppState::new(store.clone()));
 
     let (status, body) = get(&app, "/v1/status").await;
     assert_eq!(status, StatusCode::OK);
@@ -204,6 +231,31 @@ async fn live_clickhouse_serves_every_collection() {
     let (status, body) = get(&app, &format!("/v1/assets/{IDENTITY}/QX")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["issued_tick"], 101);
+
+    let (status, body) = get(&app, "/v1/analytics/activity?interval=3600&limit=10").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["meta"]["intervalSeconds"], 3600);
+    assert_eq!(body["data"][0]["transactions"], 4);
+
+    let (status, body) = get(&app, "/v1/analytics/top-identities?limit=10").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["identity"], IDENTITY);
+
+    let (status, body) = get(&app, "/v1/analytics/event-types?limit=10").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["type_name"], "asset_issuance");
+
+    let (found, missing) = (hash_for(101, 0), hash_for(999, 9));
+    let (status, body) = post(
+        &app,
+        "/v1/transactions/batch",
+        serde_json::json!({ "hashes": [found.clone(), missing.clone()] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["meta"]["found"], 1);
+    assert_eq!(body["meta"]["missing"], serde_json::json!([missing]));
+    assert_eq!(body["data"][0]["hash"], found);
 
     let (status, body) = get(&app, "/openapi.json").await;
     assert_eq!(status, StatusCode::OK);

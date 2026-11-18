@@ -57,6 +57,11 @@ pub fn spec() -> Value {
             { "name": "events" },
             { "name": "identities" },
             { "name": "assets" },
+            { "name": "analytics" },
+            { "name": "stream" },
+            { "name": "network" },
+            { "name": "contracts" },
+            { "name": "archive" },
             { "name": "search" }
         ],
         "paths": {
@@ -155,6 +160,21 @@ pub fn spec() -> Value {
                         limit_param(), cursor_param(), offset_param()
                     ],
                     "responses": { "200": { "description": "Paginated transactions" }, "400": { "description": "Invalid identity or cursor" } }
+                },
+                "post": {
+                    "tags": ["transactions"],
+                    "summary": "Broadcast a signed transaction to a direct peer",
+                    "description": "Requires ALLOW_BROADCAST=true. The transaction is decoded and locally verified with SchnorrQ before it is sent with dejavu=0.",
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BroadcastRequest" } } }
+                    },
+                    "responses": {
+                        "200": { "description": "Peer accepted the transaction" },
+                        "400": { "description": "Invalid transaction or broadcast rejected" },
+                        "403": { "description": "Broadcast disabled" },
+                        "503": { "description": "No peer available" }
+                    }
                 }
             },
             "/v1/transactions/{hash}": {
@@ -243,6 +263,160 @@ pub fn spec() -> Value {
                     "parameters": [{ "name": "q", "in": "query", "required": true, "schema": { "type": "string" } }],
                     "responses": { "200": { "description": "Typed matches" }, "400": { "description": "Missing query" } }
                 }
+            },
+            "/v1/transactions/batch": {
+                "post": {
+                    "tags": ["transactions"],
+                    "summary": "Look up many transaction hashes in one request",
+                    "description": "At most 100 unique hashes. Unknown hashes are reported in meta.missing instead of failing the request.",
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchRequest" } } }
+                    },
+                    "responses": {
+                        "200": { "description": "Transactions found" },
+                        "400": { "description": "Too many hashes or invalid input" }
+                    }
+                }
+            },
+            "/v1/analytics/activity": {
+                "get": {
+                    "tags": ["analytics"],
+                    "summary": "Transaction and event counts per time bucket",
+                    "parameters": [
+                        { "name": "interval", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 86400, "default": 3600 }, "description": "Bucket width in seconds" },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 24 } }
+                    ],
+                    "responses": { "200": { "description": "Activity buckets, newest first" } }
+                }
+            },
+            "/v1/analytics/top-identities": {
+                "get": {
+                    "tags": ["analytics"],
+                    "summary": "Identities with the most observed activity",
+                    "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 25 } }],
+                    "responses": { "200": { "description": "Ranked identities" } }
+                }
+            },
+            "/v1/analytics/event-types": {
+                "get": {
+                    "tags": ["analytics"],
+                    "summary": "Event counts grouped by decoded type",
+                    "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } }],
+                    "responses": { "200": { "description": "Event type counts" } }
+                }
+            },
+            "/v1/stream": {
+                "get": {
+                    "tags": ["stream"],
+                    "summary": "Server-sent events for ticks, transactions, and events",
+                    "description": "Polls the local index head only; never opens a peer connection. Sends keep-alive comments every 15 seconds and lag events when a subscriber falls behind.",
+                    "parameters": [
+                        { "name": "types", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated subset of tick,transaction,event. The poll interval is set on the server with STREAM_POLL_MS." }
+                    ],
+                    "responses": {
+                        "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+                        "503": { "description": "Streaming is not enabled" }
+                    }
+                }
+            },
+            "/v1/stream/ticks": {
+                "get": {
+                    "tags": ["stream"],
+                    "summary": "Tick events only",
+                    "responses": { "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "503": { "description": "Streaming is not enabled" } }
+                }
+            },
+            "/v1/stream/transactions": {
+                "get": {
+                    "tags": ["stream"],
+                    "summary": "Transaction events only",
+                    "responses": { "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "503": { "description": "Streaming is not enabled" } }
+                }
+            },
+            "/v1/stream/events": {
+                "get": {
+                    "tags": ["stream"],
+                    "summary": "Log event events only",
+                    "responses": { "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "503": { "description": "Streaming is not enabled" } }
+                }
+            },
+            "/v1/ws": {
+                "get": {
+                    "tags": ["stream"],
+                    "summary": "WebSocket feed with the same event stream",
+                    "responses": { "200": { "description": "WebSocket upgrade" }, "503": { "description": "Streaming is not enabled" } }
+                }
+            },
+            "/v1/identities/{identity}/entity": {
+                "get": {
+                    "tags": ["identities", "network"],
+                    "summary": "Entity record from a direct peer",
+                    "parameters": [path_param("identity", "Uppercase base-26 identity")],
+                    "responses": {
+                        "200": { "description": "Entity record from the peer" },
+                        "400": { "description": "Invalid identity" },
+                        "404": { "description": "Peer has no entity record" },
+                        "503": { "description": "No peer available" }
+                    }
+                }
+            },
+            "/v1/transactions/{hash}/network": {
+                "get": {
+                    "tags": ["transactions", "network"],
+                    "summary": "Transaction as reported by a direct peer",
+                    "parameters": [path_param("hash", "60-character transaction hash")],
+                    "responses": {
+                        "200": { "description": "Peer transaction record" },
+                        "400": { "description": "Invalid hash" },
+                        "404": { "description": "Peer has no transaction" },
+                        "503": { "description": "No peer available" }
+                    }
+                }
+            },
+            "/v1/ticks/{tick}/tx-status": {
+                "get": {
+                    "tags": ["ticks", "network"],
+                    "summary": "Transaction confirmation status from a direct peer",
+                    "parameters": [path_param("tick", "Global tick number")],
+                    "responses": {
+                        "200": { "description": "Peer transaction status" },
+                        "503": { "description": "No peer available" }
+                    }
+                }
+            },
+            "/v1/ticks/{tick}/raw": {
+                "get": {
+                    "tags": ["ticks", "archive"],
+                    "summary": "Archived raw QBB1 tick bundle or one section",
+                    "description": "Requires S3_BUCKET or ARCHIVE_DIR to be configured for the API. Without section, returns the zstd-compressed QBB1 container.",
+                    "parameters": [
+                        path_param("tick", "Global tick number"),
+                        { "name": "section", "in": "query", "schema": { "type": "string", "enum": ["tick", "tick_data", "votes", "transactions", "log_ranges", "logs", "computors"] } }
+                    ],
+                    "responses": {
+                        "200": { "description": "application/octet-stream", "content": { "application/octet-stream": { "schema": { "type": "string", "format": "binary" } } } },
+                        "400": { "description": "Unknown section" },
+                        "404": { "description": "Tick not indexed or bundle not archived" },
+                        "503": { "description": "Archive not configured or unreadable" }
+                    }
+                }
+            },
+            "/v1/contracts/{contract_index}/query": {
+                "post": {
+                    "tags": ["contracts", "network"],
+                    "summary": "Call a read-only contract function on a direct peer",
+                    "parameters": [path_param("contract_index", "Contract index")],
+                    "requestBody": {
+                        "required": false,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ContractQueryRequest" } } }
+                    },
+                    "responses": {
+                        "200": { "description": "Hex-encoded contract output" },
+                        "400": { "description": "Invalid hex or input exceeds MAX_INPUT_SIZE" },
+                        "503": { "description": "No peer available or contract call failed" }
+                    }
+                }
             }
         },
         "components": {
@@ -254,8 +428,29 @@ pub fn spec() -> Value {
                         "type": { "type": "string", "default": "about:blank" },
                         "title": { "type": "string" },
                         "status": { "type": "integer" },
-                        "code": { "type": "string", "enum": ["bad_request", "invalid_identity", "invalid_transaction_hash", "invalid_cursor", "not_found", "internal_error", "rate_limited"] },
+                        "code": { "type": "string", "enum": ["bad_request", "invalid_identity", "invalid_transaction_hash", "invalid_cursor", "not_found", "forbidden", "unavailable", "internal_error", "rate_limited"] },
                         "detail": { "type": "string" }
+                    }
+                },
+                "BatchRequest": {
+                    "type": "object",
+                    "required": ["hashes"],
+                    "properties": {
+                        "hashes": { "type": "array", "maxItems": 100, "items": { "type": "string" } }
+                    }
+                },
+                "BroadcastRequest": {
+                    "type": "object",
+                    "required": ["raw"],
+                    "properties": {
+                        "raw": { "type": "string", "description": "Signed transaction bytes as hex" }
+                    }
+                },
+                "ContractQueryRequest": {
+                    "type": "object",
+                    "properties": {
+                        "inputType": { "type": "integer", "minimum": 0, "default": 0 },
+                        "input": { "type": "string", "description": "Hex-encoded input, at most MAX_INPUT_SIZE bytes" }
                     }
                 },
                 "PageMeta": {
@@ -380,6 +575,20 @@ mod tests {
             "/v1/identities/{identity}/transactions",
             "/v1/assets",
             "/v1/assets/{issuer}/{name}",
+            "/v1/transactions/batch",
+            "/v1/analytics/activity",
+            "/v1/analytics/top-identities",
+            "/v1/analytics/event-types",
+            "/v1/stream",
+            "/v1/stream/ticks",
+            "/v1/stream/transactions",
+            "/v1/stream/events",
+            "/v1/ws",
+            "/v1/identities/{identity}/entity",
+            "/v1/transactions/{hash}/network",
+            "/v1/ticks/{tick}/tx-status",
+            "/v1/ticks/{tick}/raw",
+            "/v1/contracts/{contract_index}/query",
             "/v1/search",
         ] {
             assert!(paths.contains_key(path), "missing {path}");

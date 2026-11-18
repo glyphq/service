@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{Html, IntoResponse};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -27,7 +27,11 @@ pub fn router() -> Router<AppState> {
         .route("/v1/ticks/{tick}", get(tick))
         .route("/v1/ticks/{tick}/transactions", get(tick_transactions))
         .route("/v1/ticks/{tick}/events", get(tick_events))
-        .route("/v1/transactions", get(transactions))
+        .route(
+            "/v1/transactions",
+            get(transactions).post(crate::advanced::broadcast_transaction),
+        )
+        .route("/v1/transactions/batch", post(transactions_batch))
         .route("/v1/transactions/{hash}", get(transaction))
         .route("/v1/events", get(events))
         .route("/v1/identities", get(identities))
@@ -38,7 +42,26 @@ pub fn router() -> Router<AppState> {
         .route("/v1/identities/{identity}", get(identity))
         .route("/v1/assets", get(assets))
         .route("/v1/assets/{issuer}/{name}", get(asset))
+        .route("/v1/analytics/activity", get(analytics_activity))
+        .route(
+            "/v1/analytics/top-identities",
+            get(analytics_top_identities),
+        )
+        .route("/v1/analytics/event-types", get(analytics_event_types))
         .route("/v1/search", get(search))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AnalyticsQuery {
+    #[serde(default)]
+    interval: Option<u32>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchTransactions {
+    hashes: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -307,6 +330,51 @@ async fn transaction(
     ))
 }
 
+async fn transactions_batch(
+    State(state): State<AppState>,
+    Json(body): Json<BatchTransactions>,
+) -> Result<impl IntoResponse, ApiError> {
+    if body.hashes.is_empty() {
+        return Err(ApiError::bad_request("hashes must not be empty"));
+    }
+    if body.hashes.len() > 100 {
+        return Err(ApiError::bad_request("at most 100 hashes per request"));
+    }
+    let mut hashes = Vec::with_capacity(body.hashes.len());
+    let mut seen = HashSet::new();
+    for value in body.hashes {
+        let hash = value.trim().to_ascii_lowercase();
+        qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
+        if seen.insert(hash.clone()) {
+            hashes.push(hash);
+        }
+    }
+    let rows = state.store.transactions_by_hashes(&hashes).await?;
+    let found: HashMap<String, store::TransactionRow> = rows
+        .into_iter()
+        .map(|row| (row.hash.clone(), row))
+        .collect();
+    let data: Vec<Value> = hashes
+        .iter()
+        .filter_map(|hash| {
+            found
+                .get(hash)
+                .map(|row| serde_json::to_value(row).unwrap_or(Value::Null))
+        })
+        .collect();
+    let missing: Vec<&String> = hashes
+        .iter()
+        .filter(|hash| !found.contains_key(*hash))
+        .collect();
+    Ok((
+        [(header::CACHE_CONTROL, IMMUTABLE)],
+        Json(json!({
+            "data": data,
+            "meta": { "requested": hashes.len(), "found": data.len(), "missing": missing },
+        })),
+    ))
+}
+
 async fn transactions(
     State(state): State<AppState>,
     Query(params): Query<TransactionQuery>,
@@ -531,6 +599,46 @@ async fn search(
     Ok(Json(json!({ "data": [] })))
 }
 
+async fn analytics_activity(
+    State(state): State<AppState>,
+    Query(params): Query<AnalyticsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let interval = params.interval.unwrap_or(3600).clamp(1, 86_400);
+    let limit = params.limit.unwrap_or(24).clamp(1, 500);
+    let rows = state.store.activity_analytics(interval, limit).await?;
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({
+            "data": rows,
+            "meta": { "intervalSeconds": interval, "limit": limit },
+        })),
+    ))
+}
+
+async fn analytics_top_identities(
+    State(state): State<AppState>,
+    Query(params): Query<AnalyticsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let limit = params.limit.unwrap_or(25).clamp(1, 200);
+    let rows = state.store.top_identities(limit).await?;
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({ "data": rows, "meta": { "limit": limit } })),
+    ))
+}
+
+async fn analytics_event_types(
+    State(state): State<AppState>,
+    Query(params): Query<AnalyticsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let limit = params.limit.unwrap_or(50).clamp(1, 200);
+    let rows = state.store.event_type_counts(limit).await?;
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({ "data": rows, "meta": { "limit": limit } })),
+    ))
+}
+
 pub async fn docs() -> Html<&'static str> {
     Html(
         r#"<!doctype html>
@@ -556,6 +664,19 @@ pub async fn docs() -> Html<&'static str> {
 <li><code>GET /v1/identities/{identity}/transactions?limit=&amp;cursor=</code></li>
 <li><code>GET /v1/assets?issuer=&amp;limit=&amp;cursor=</code></li>
 <li><code>GET /v1/assets/{issuer}/{name}</code></li>
+<li><code>POST /v1/transactions/batch</code></li>
+<li><code>POST /v1/transactions</code> (requires <code>ALLOW_BROADCAST=true</code>)</li>
+<li><code>GET /v1/analytics/activity?interval=&amp;limit=</code></li>
+<li><code>GET /v1/analytics/top-identities?limit=</code></li>
+<li><code>GET /v1/analytics/event-types?limit=</code></li>
+<li><code>GET /v1/stream?types=</code></li>
+<li><code>GET /v1/stream/{ticks|transactions|events}</code></li>
+<li><code>GET /v1/ws</code></li>
+<li><code>GET /v1/identities/{identity}/entity</code></li>
+<li><code>GET /v1/transactions/{hash}/network</code></li>
+<li><code>GET /v1/ticks/{tick}/tx-status</code></li>
+<li><code>GET /v1/ticks/{tick}/raw?section=</code></li>
+<li><code>POST /v1/contracts/{contract_index}/query</code></li>
 <li><code>GET /v1/search?q=</code></li>
 </ul>
 </body></html>"#,

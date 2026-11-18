@@ -66,6 +66,22 @@ impl ApiError {
             detail: detail.into(),
         }
     }
+
+    pub fn unavailable(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "unavailable",
+            detail: detail.into(),
+        }
+    }
+
+    pub fn forbidden(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+            detail: detail.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

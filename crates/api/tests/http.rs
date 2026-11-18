@@ -8,15 +8,20 @@ use axum::response::IntoResponse;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 use store::{
-    AssetRow, EpochRow, EventFilter, EventRow, IdentityRow, IngestCursor, NetworkStats,
-    Result as StoreResult, Store, TickBatch, TickRow, TransactionFilter, TransactionRow,
-    WriteOutcome,
+    ActivityBucket, AssetRow, EpochRow, EventFilter, EventRow, EventTypeCount, IdentityRow,
+    IngestCursor, NetworkStats, Result as StoreResult, Store, TickBatch, TickRow,
+    TransactionFilter, TransactionRow, WriteOutcome,
 };
 use tower::ServiceExt;
 
 const IDENTITY: &str = "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK";
 const OTHER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-const HASH: &str = "yqcvscbbnhotdgqfpvcaniwcppcenlphwdxqqrewmbsfvvbpojfsnvwazgvb";
+fn hash_for(tick: u32, index: u16) -> String {
+    let mut key = [0u8; 32];
+    key[..4].copy_from_slice(&tick.to_le_bytes());
+    key[4] = index as u8;
+    qubic::encode_tx_hash(&key)
+}
 
 fn timestamp() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 11, 18, 12, 0, 0)
@@ -53,7 +58,7 @@ impl MockStore {
                     epoch: if tick == 5 { 2 } else { 1 },
                     tick,
                     tx_index: index,
-                    hash: format!("{HASH}{tick}{index}"),
+                    hash: hash_for(tick, index),
                     source: if index == 0 { IDENTITY } else { OTHER }.into(),
                     destination: if index == 0 { OTHER } else { IDENTITY }.into(),
                     amount: 42 + i64::from(tick),
@@ -72,7 +77,7 @@ impl MockStore {
                 log_id: u64::from(tick) * 10,
                 log_type: 1,
                 type_name: "asset_issuance".into(),
-                tx_hash: format!("{HASH}{tick}0"),
+                tx_hash: hash_for(tick, 0),
                 tx_index: 0,
                 body: r#"{"issuer":"BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK","name":"QX","decimals":0,"unit":"","managingContract":1,"shares":"1000"}"#.into(),
                 log_digest: u64::from(tick),
@@ -171,6 +176,15 @@ impl Store for MockStore {
             .cloned())
     }
 
+    async fn transactions_by_hashes(&self, hashes: &[String]) -> StoreResult<Vec<TransactionRow>> {
+        Ok(self
+            .transactions
+            .iter()
+            .filter(|row| hashes.contains(&row.hash))
+            .cloned()
+            .collect())
+    }
+
     async fn events_for_tick(
         &self,
         tick: u32,
@@ -194,6 +208,10 @@ impl Store for MockStore {
             .cloned())
     }
 
+    async fn top_identities(&self, limit: u32) -> StoreResult<Vec<IdentityRow>> {
+        Ok(page(&self.identities, limit, 0))
+    }
+
     async fn stats(&self) -> StoreResult<Value> {
         Ok(serde_json::json!({ "counts": { "ticks": self.ticks.len() }, "ingest": {} }))
     }
@@ -211,6 +229,16 @@ impl Store for MockStore {
             .cloned()
             .collect();
         Ok(page(&rows, limit, offset))
+    }
+
+    async fn ticks_after(&self, tick: u32, limit: u32) -> StoreResult<Vec<TickRow>> {
+        let rows: Vec<_> = self
+            .ticks
+            .iter()
+            .filter(|row| row.tick > tick)
+            .cloned()
+            .collect();
+        Ok(page(&rows, limit, 0))
     }
 
     async fn epochs(&self, limit: u32, offset: u64) -> StoreResult<Vec<EpochRow>> {
@@ -319,6 +347,33 @@ impl Store for MockStore {
         Ok(page(&rows, limit, offset))
     }
 
+    async fn event_type_counts(&self, limit: u32) -> StoreResult<Vec<EventTypeCount>> {
+        Ok(vec![EventTypeCount {
+            type_name: "asset_issuance".into(),
+            count: self.events.len() as u64,
+        }]
+        .into_iter()
+        .take(limit as usize)
+        .collect())
+    }
+
+    async fn activity_analytics(
+        &self,
+        _interval_seconds: u32,
+        limit: u32,
+    ) -> StoreResult<Vec<ActivityBucket>> {
+        Ok(vec![ActivityBucket {
+            bucket: timestamp(),
+            ticks: self.ticks.len() as u64,
+            transactions: self.transactions.len() as u64,
+            events: self.events.len() as u64,
+            volume: 42,
+        }]
+        .into_iter()
+        .take(limit as usize)
+        .collect())
+    }
+
     async fn network_stats(&self) -> StoreResult<NetworkStats> {
         Ok(NetworkStats {
             head: self.head().await?,
@@ -390,9 +445,7 @@ async fn request(
     uri: &str,
     headers: &[(header::HeaderName, &str)],
 ) -> (StatusCode, Value, axum::http::HeaderMap) {
-    let app = router(AppState {
-        store: Arc::new(MockStore::new()),
-    });
+    let app = router(AppState::new(Arc::new(MockStore::new())));
     let mut builder = Request::builder().uri(uri);
     for (name, value) in headers {
         builder = builder.header(name, *value);
@@ -413,6 +466,29 @@ async fn request(
 async fn get(uri: &str) -> (StatusCode, Value) {
     let (status, body, _) = request(uri, &[]).await;
     (status, body)
+}
+
+async fn post(uri: &str, body: Value) -> (StatusCode, Value) {
+    let app = router(AppState::new(Arc::new(MockStore::new())));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 #[tokio::test]
@@ -573,9 +649,7 @@ async fn openapi_and_docs_are_served() {
     assert!(body["paths"]["/v1/epochs"].is_object());
     assert!(body["paths"]["/v1/assets/{issuer}/{name}"].is_object());
 
-    let app = router(AppState {
-        store: Arc::new(MockStore::new()),
-    });
+    let app = router(AppState::new(Arc::new(MockStore::new())));
     let response = app
         .oneshot(Request::builder().uri("/docs").body(Body::empty()).unwrap())
         .await
@@ -585,9 +659,7 @@ async fn openapi_and_docs_are_served() {
 
 #[tokio::test]
 async fn large_responses_are_compressed_when_requested() {
-    let app = router(AppState {
-        store: Arc::new(MockStore::new()),
-    });
+    let app = router(AppState::new(Arc::new(MockStore::new())));
     let response = app
         .oneshot(
             Request::builder()
@@ -610,4 +682,129 @@ async fn large_responses_are_compressed_when_requested() {
 async fn rate_limit_problem_uses_429_and_retry_after() {
     let response = api::ApiError::too_many_requests("slow down").into_response();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn batch_lookup_reports_found_and_missing() {
+    let found = hash_for(7, 0);
+    let missing = hash_for(99, 9);
+    let (status, body) = post(
+        "/v1/transactions/batch",
+        serde_json::json!({ "hashes": [found.clone(), missing.clone()] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"][0]["hash"], found);
+    assert_eq!(body["meta"]["requested"], 2);
+    assert_eq!(body["meta"]["found"], 1);
+    assert_eq!(body["meta"]["missing"], serde_json::json!([missing]));
+
+    let (status, body) = post(
+        "/v1/transactions/batch",
+        serde_json::json!({ "hashes": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn analytics_routes_have_effective_defaults() {
+    let (status, body) = get("/v1/analytics/activity").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["meta"]["intervalSeconds"], 3600);
+    assert_eq!(body["meta"]["limit"], 24);
+    assert_eq!(body["data"][0]["ticks"], 3);
+
+    let (status, body) = get("/v1/analytics/top-identities").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["meta"]["limit"], 25);
+
+    let (status, body) = get("/v1/analytics/event-types").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["type_name"], "asset_issuance");
+}
+
+#[tokio::test]
+async fn optional_network_features_report_unavailable_or_forbidden() {
+    let (status, body) = get("/v1/stream").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "unavailable");
+
+    let (status, body) = get("/v1/ticks/7/raw").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "unavailable");
+
+    let (status, body) = post("/v1/transactions", serde_json::json!({ "raw": "00" })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "forbidden");
+
+    let (status, body) = get("/v1/identities/NOT-AN-IDENTITY/entity").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_identity");
+
+    let (status, body) = post(
+        "/v1/contracts/1/query",
+        serde_json::json!({ "input": "not hex" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn raw_archive_serves_a_section() {
+    let dir = std::env::temp_dir().join(format!("glyph-api-raw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let archive = archive::FileArchive::new(&dir);
+    let mut bundle = archive::RawBundle::new(1, 7);
+    bundle.set_section(archive::Section::Transactions, vec![1, 2, 3, 4]);
+    archive::put_bundle(&archive, &bundle).await.unwrap();
+
+    let state = AppState {
+        store: Arc::new(MockStore::new()),
+        hub: None,
+        peers: Vec::new(),
+        allow_broadcast: false,
+        archive: Some(Arc::new(archive)),
+    };
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/ticks/7/raw?section=transactions")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/octet-stream"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
+
+    let app = router(AppState {
+        store: Arc::new(MockStore::new()),
+        hub: None,
+        peers: Vec::new(),
+        allow_broadcast: false,
+        archive: Some(Arc::new(archive::FileArchive::new(&dir))),
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/ticks/7/raw?section=bogus")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let _ = std::fs::remove_dir_all(&dir);
 }
