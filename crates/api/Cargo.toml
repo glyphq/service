@@ -10,6 +10,7 @@ qubic = { path = "../qubic" }
 store = { path = "../store" }
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true

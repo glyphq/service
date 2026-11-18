@@ -19,6 +19,7 @@ license = "MIT OR Apache-2.0"
 anyhow = "1"
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 clickhouse = { version = "0.13", features = ["chrono"] }

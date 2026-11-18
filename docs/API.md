@@ -8,8 +8,9 @@ returns a problem document instead of proxying upstream.
 - Data routes are under `/v1`. `/healthz`, `/openapi.json`, and `/docs` are
   unversioned.
 - Requests and responses are UTF-8 JSON. Errors use `application/problem+json`.
-- The server is axum with gzip and zstd response compression, permissive CORS,
-  an `x-request-id` header, and request tracing.
+- The server is axum with gzip and zstd response compression, CORS (permissive
+  by default or restricted with `CORS_ALLOWED_ORIGINS`), an `x-request-id`
+  header, optional `RATE_LIMIT_PER_MINUTE` throttling, and request tracing.
 - The OpenAPI 3.1 document is at `GET /openapi.json`. A small HTML index is at
   `GET /docs`.
 
@@ -38,6 +39,7 @@ Collections use `data` plus `meta`:
     "offset": 0,
     "count": 0,
     "nextOffset": null,
+    "nextCursor": null,
     "hasMore": false
   }
 }
@@ -66,25 +68,33 @@ documented below. Clients must ignore unknown fields.
 
 ## Pagination
 
-The per-tick list endpoints, the recent feeds, and identity transaction history
-paginate.
+Every collection uses opaque cursor pagination.
 
 | Parameter | Default | Bounds |
 | --- | --- | --- |
 | `limit` | `50` | `1..200` |
-| `offset` | `0` | `>= 0` |
+| `cursor` | none | Opaque token from `meta.nextCursor`. |
+| `offset` | `0` | Legacy, deprecated. Ignored when `cursor` is present. |
 
 The response `meta` contains:
 
 | Field | Meaning |
 | --- | --- |
 | `limit` | Effective limit after clamping. |
-| `offset` | Requested offset. |
+| `offset` | Effective offset used for this page. |
 | `count` | Rows returned in this page. |
-| `nextOffset` | `offset + count` when `hasMore`, otherwise `null`. |
+| `nextOffset` | Legacy next offset when `hasMore`, otherwise `null`. |
+| `nextCursor` | Cursor for the next page when `hasMore`, otherwise `null`. |
 | `hasMore` | Whether another page exists. |
 
-There is no cursor pagination in the current surface.
+A cursor is bound to the route and its normalized filters. Reusing a cursor
+with a different filter set, or sending a malformed token, returns
+`400 invalid_cursor`. Clients must treat cursors as opaque and follow
+`nextCursor` until it is `null`.
+
+Collections are ordered newest first unless the endpoint says otherwise. Tick
+and transaction point reads are immutable and cacheable; list feeds are
+short-lived.
 
 ## Endpoints
 
@@ -142,6 +152,75 @@ Indexed head, progress, and counts.
 
 `head` is `null` before the first tick is written. `data.ingest` is the typed
 ingest cursor. `data.stats` contains `head`, `counts`, `cursor`, and `ingest`.
+
+### `GET /v1/network/stats`
+
+Typed index-wide counts and progress. This is the stable shape for dashboards
+and does not require parsing the free-form `stats` object in `/v1/status`.
+
+```json
+{
+  "data": {
+    "head": { "epoch": 240, "tick": 91916480, "verification": "data" },
+    "epochs": 1,
+    "ticks": 6481,
+    "transactions": 45120,
+    "events": 103696,
+    "identities": 3210,
+    "latest_timestamp": "2026-11-18T15:10:00.000Z",
+    "ingest": { "last_indexed_tick": 91916480, "epoch": 240 }
+  },
+  "meta": { "source": "direct-qubic-peers" }
+}
+```
+
+### `GET /v1/epochs`
+
+Epoch summaries derived from indexed ticks, newest first. Uses cursor
+pagination.
+
+```json
+{
+  "data": [
+    {
+      "epoch": 240,
+      "first_tick": 91880000,
+      "last_tick": 91916480,
+      "first_timestamp": "2026-11-18T02:00:00.000Z",
+      "last_timestamp": "2026-11-18T15:10:00.000Z",
+      "tick_count": 6481,
+      "transaction_count": 45120,
+      "event_count": 103696,
+      "closed": false
+    }
+  ],
+  "meta": {
+    "limit": 50,
+    "offset": 0,
+    "count": 1,
+    "nextOffset": null,
+    "nextCursor": null,
+    "hasMore": false
+  }
+}
+```
+
+`closed` is true when a later epoch is already indexed. The newest epoch can
+still receive ticks.
+
+### `GET /v1/epochs/{epoch}`
+
+One epoch summary. An epoch with no indexed ticks returns `404 not_found`.
+
+### `GET /v1/ticks`
+
+Ticks newest first, optionally filtered by `epoch`. Uses cursor pagination.
+
+| Query | Meaning |
+| --- | --- |
+| `epoch` | Restrict to one epoch. |
+| `limit` | Page size. |
+| `cursor` | Cursor from `meta.nextCursor`. |
 
 ### `GET /v1/ticks/{tick}`
 
@@ -255,8 +334,15 @@ An unknown tick returns `404 not_found`.
 
 ### `GET /v1/transactions`
 
-Recent transactions across indexed ticks, newest tick first. Uses the same
-`limit` and `offset` pagination and the same `meta` shape.
+Transactions across indexed ticks, newest tick first. Uses cursor pagination
+and the same `meta` shape.
+
+| Query | Meaning |
+| --- | --- |
+| `epoch` | Restrict to one epoch. |
+| `tick` | Restrict to one tick. |
+| `identity` | Match either source or destination (case-insensitive). |
+| `limit`, `cursor` | Pagination. |
 
 ```json
 {
@@ -289,18 +375,79 @@ Recent feeds return `200` even when the index is empty.
 
 ### `GET /v1/events`
 
-Recent typed events across indexed ticks, newest tick first. Uses the same
-`limit` and `offset` pagination and the same `meta` shape. Event `body` is a
-JSON object, as on the per-tick events route.
+Typed events across indexed ticks, newest tick first. Uses cursor pagination
+and the same `meta` shape. Event `body` is a JSON object, as on the per-tick
+events route.
+
+| Query | Meaning |
+| --- | --- |
+| `epoch` | Restrict to one epoch. |
+| `tick` | Restrict to one tick. |
+| `type` | Match `type_name`, for example `qu_transfer`. |
+| `limit`, `cursor` | Pagination. |
 
 Recent feeds return `200` even when the index is empty.
 
 ### `GET /v1/identities/{identity}/transactions`
 
 Transactions where the identity is the source or destination, newest tick
-first. Uses the same `limit` and `offset` pagination and the same `meta` shape.
+first. Uses cursor pagination and the same `meta` shape.
 A malformed identity returns `400 invalid_identity`. A valid identity with no
 history returns an empty list.
+
+### `GET /v1/identities`
+
+Indexed identity summaries ordered by most recent activity, then canonical
+identity. Uses cursor pagination.
+
+```json
+{
+  "data": [
+    {
+      "identity": "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK",
+      "public_key": "0x0000000000000000000000000000000000000000000000000000000000000000",
+      "balance": 42000000,
+      "incoming_amount": 90000000,
+      "outgoing_amount": 48000000,
+      "transfer_count": 37,
+      "first_seen_tick": 91800000,
+      "last_seen_tick": 91916480
+    }
+  ],
+  "meta": { "limit": 50, "offset": 0, "count": 1, "nextCursor": null, "hasMore": false }
+}
+```
+
+### `GET /v1/assets`
+
+Assets derived from indexed `asset_issuance` events, ordered by issuer and
+name. The last issuance for each `(issuer, name)` pair supplies the metadata.
+Uses cursor pagination. `issuer` optionally filters by canonical identity.
+
+```json
+{
+  "data": [
+    {
+      "issuer": "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK",
+      "name": "QX",
+      "decimals": 0,
+      "unit": "",
+      "managing_contract": 1,
+      "shares": 1000,
+      "issued_tick": 91916480,
+      "log_id": 1234567,
+      "timestamp": "2026-11-18T15:10:00.000Z"
+    }
+  ],
+  "meta": { "limit": 50, "offset": 0, "count": 1, "nextCursor": null, "hasMore": false }
+}
+```
+
+### `GET /v1/assets/{issuer}/{name}`
+
+One asset by canonical issuer and name. A malformed issuer returns
+`400 invalid_identity`; an unindexed asset returns `404 not_found`. The asset
+tables are planned; this read currently aggregates issuance events.
 
 ### `GET /v1/transactions/{hash}`
 
@@ -415,7 +562,9 @@ Errors are problem documents with exactly these fields:
 | `bad_request` | 400 | Missing or invalid request input, including `q` on search. |
 | `invalid_identity` | 400 | Identity is not a valid base-26 identity. |
 | `invalid_transaction_hash` | 400 | Hash is not a valid base-26 transaction hash. |
+| `invalid_cursor` | 400 | Cursor is malformed or belongs to another route/filter set. |
 | `not_found` | 404 | The resource is valid but absent from the index. |
+| `rate_limited` | 429 | `RATE_LIMIT_PER_MINUTE` was exceeded. Includes `Retry-After`. |
 | `internal_error` | 500 | Storage or server failure. |
 
 `type` is currently always `about:blank`. `title` equals `code`. `detail` is for
@@ -435,16 +584,26 @@ Recent transaction and event feeds set:
 Cache-Control: public, max-age=2, stale-while-revalidate=5
 ```
 
-Status, health, search, identity, identity history, and per-tick list responses
-do not set an explicit cache policy. There is no ETag or conditional request
-handling in the current surface.
+Per-tick transaction and event lists are immutable and use the immutable
+policy. Epoch, identity, identity history, and asset reads use:
+
+```text
+Cache-Control: public, max-age=30, stale-while-revalidate=60
+```
+
+Status and error responses use `no-store`. Health, search, and OpenAPI do not
+set an explicit policy. There is no ETag or conditional request handling in the
+current surface.
 
 ## Middleware
 
 - Response compression: gzip and zstd when requested through
   `Accept-Encoding`.
-- CORS: permissive.
+- CORS: permissive by default. `CORS_ALLOWED_ORIGINS` accepts a
+  comma-separated allowlist.
 - Request id: `x-request-id` is set when absent and propagated.
+- Rate limit hook: `RATE_LIMIT_PER_MINUTE` enables a fixed-window,
+  per-client-IP limit and returns `429 rate_limited` with `Retry-After`.
 - Tracing: tower-http trace layer; `RUST_LOG` controls verbosity.
 - Body and concurrency limits are not configured in the current surface.
 
@@ -455,6 +614,8 @@ handling in the current surface.
 | `BIND` | `127.0.0.1:8080` | Listen address. |
 | `CLICKHOUSE_URL` | `http://127.0.0.1:8123` | ClickHouse HTTP endpoint. |
 | `CLICKHOUSE_DB` | `glyph` | Database name. |
+| `CORS_ALLOWED_ORIGINS` | unset (permissive) | Comma-separated browser origins. |
+| `RATE_LIMIT_PER_MINUTE` | unset (disabled) | Per-client-IP request budget. |
 | `RUST_LOG` | `info,tower_http=info` | Tracing filter. |
 
 The API never writes ticks. It applies schema initialization on startup and can
@@ -465,13 +626,18 @@ run as multiple replicas against the same database.
 ```bash
 curl -sS localhost:8080/healthz
 curl -sS localhost:8080/v1/status | jq .data.head
+curl -sS localhost:8080/v1/network/stats | jq .data
+curl -sS 'localhost:8080/v1/epochs?limit=10' | jq .data
+curl -sS 'localhost:8080/v1/ticks?epoch=240&limit=10' | jq .data
 curl -sS localhost:8080/v1/ticks/91916480 | jq .data
-curl -sS 'localhost:8080/v1/ticks/91916480/transactions?limit=10&offset=0' | jq .
-curl -sS 'localhost:8080/v1/ticks/91916480/events?limit=10&offset=0' | jq .
-curl -sS 'localhost:8080/v1/transactions?limit=10&offset=0' | jq .
-curl -sS 'localhost:8080/v1/events?limit=10&offset=0' | jq .
+curl -sS 'localhost:8080/v1/ticks/91916480/transactions?limit=10' | jq .
+curl -sS 'localhost:8080/v1/ticks/91916480/events?limit=10' | jq .
+curl -sS 'localhost:8080/v1/transactions?limit=10' | jq .
+curl -sS 'localhost:8080/v1/events?type=asset_issuance&limit=10' | jq .
 curl -sS localhost:8080/v1/transactions/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh
+curl -sS 'localhost:8080/v1/identities?limit=10' | jq .
 curl -sS localhost:8080/v1/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK
 curl -sS 'localhost:8080/v1/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK/transactions?limit=10' | jq .
+curl -sS 'localhost:8080/v1/assets?limit=10' | jq .
 curl -sS 'localhost:8080/v1/search?q=91916480' | jq .
 ```

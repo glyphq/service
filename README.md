@@ -187,20 +187,27 @@ The v1 contract is in [docs/API.md](docs/API.md). Implemented today:
 ```bash
 curl -sS localhost:8080/healthz
 curl -sS localhost:8080/v1/status
+curl -sS localhost:8080/v1/network/stats
+curl -sS 'localhost:8080/v1/epochs?limit=25'
+curl -sS 'localhost:8080/v1/ticks?epoch=240&limit=25'
 curl -sS localhost:8080/v1/ticks/91915000
 curl -sS 'localhost:8080/v1/ticks/91915000/transactions?limit=25'
 curl -sS 'localhost:8080/v1/ticks/91915000/events?limit=25'
 curl -sS 'localhost:8080/v1/transactions?limit=25'
 curl -sS 'localhost:8080/v1/events?limit=25'
 curl -sS localhost:8080/v1/transactions/<hash>
+curl -sS 'localhost:8080/v1/identities?limit=25'
 curl -sS localhost:8080/v1/identities/<identity>
 curl -sS 'localhost:8080/v1/identities/<identity>/transactions?limit=25'
+curl -sS 'localhost:8080/v1/assets?limit=25'
+curl -sS localhost:8080/v1/assets/<issuer>/<name>
 curl -sS 'localhost:8080/v1/search?q=91915000'
 curl -sS localhost:8080/openapi.json
 ```
 
-Asset, epoch, and computor endpoints, batch lookup, SSE, and WebSocket are not
-implemented. The list handlers use `limit` and `offset`.
+Batch lookup, votes, computors, SSE, and WebSocket are not implemented. Assets
+and epochs are derived from indexed events and ticks while their dedicated
+tables remain planned.
 
 Response conventions:
 
@@ -209,9 +216,11 @@ Response conventions:
 - RFC 3339 UTC timestamps with milliseconds.
 - Canonical identities in uppercase base-26 and transaction hashes in lowercase base-26.
 - RFC 9457 problem documents with a stable `code`.
-- Offset pagination with `limit` (default 50, maximum 200) and `offset`.
+- Cursor pagination with `limit` (default 50, maximum 200) and `meta.nextCursor`.
+  `offset` is still accepted as a deprecated fallback.
 - Event `body` is a JSON object; `type_name` is a typed event name.
-- Tick and transaction reads are immutable-cacheable.
+- Tick and transaction point reads are immutable-cacheable. Collection feeds
+  are short-lived.
 
 ## Documentation
 
@@ -219,7 +228,7 @@ Response conventions:
 | --- | --- |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Goals, non-goals, direct-peer rationale, options, split ingest and API, diagrams, verification tiers, epoch handling, failure modes, capacity, operations |
 | [docs/PROTOCOL.md](docs/PROTOCOL.md) | Framing, message types, struct offsets, identity encoding, ingestion sequence, quorum rules, logs, end-epoch virtual tick, gotchas |
-| [docs/API.md](docs/API.md) | Implemented endpoints, offset pagination, RFC 9457 errors, caching, search, examples |
+| [docs/API.md](docs/API.md) | Implemented endpoints, cursor pagination, RFC 9457 errors, caching, search, examples |
 | [docs/DATA_MODEL.md](docs/DATA_MODEL.md) | Entities, invariants, ClickHouse keys and projections, capacity math, retention, replay |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Phased milestones with exit criteria |
 

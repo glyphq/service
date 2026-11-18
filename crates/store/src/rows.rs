@@ -8,7 +8,7 @@ use chrono::{DateTime, Utc};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
-use crate::{EventRow, IdentityRow, Result, TickRow, TransactionRow};
+use crate::{AssetRow, EpochRow, EventRow, IdentityRow, Result, TickRow, TransactionRow};
 
 /// RowBinary encodes `FixedString(N)` as N raw bytes. Serde's array impl only
 /// covers lengths up to 32, so serialize byte arrays as fixed-length tuples.
@@ -206,6 +206,66 @@ impl From<IdentitySelect> for IdentityRow {
             transfer_count: row.transfer_count,
             first_seen_tick: row.first_seen_tick,
             last_seen_tick: row.last_seen_tick,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct EpochSelect {
+    pub epoch: u16,
+    pub first_tick: u32,
+    pub last_tick: u32,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub first_timestamp: DateTime<Utc>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub last_timestamp: DateTime<Utc>,
+    pub tick_count: u64,
+    pub transaction_count: u64,
+    pub event_count: u64,
+}
+
+impl EpochSelect {
+    pub(crate) fn into_row(self, head_epoch: Option<u16>) -> EpochRow {
+        EpochRow {
+            closed: head_epoch.is_some_and(|head| self.epoch < head),
+            epoch: self.epoch,
+            first_tick: self.first_tick,
+            last_tick: self.last_tick,
+            first_timestamp: self.first_timestamp,
+            last_timestamp: self.last_timestamp,
+            tick_count: self.tick_count,
+            transaction_count: self.transaction_count,
+            event_count: self.event_count,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct AssetSelect {
+    pub issuer: String,
+    pub name: String,
+    pub decimals: u8,
+    pub unit: String,
+    pub managing_contract: i64,
+    pub shares: i64,
+    pub issued_tick: u32,
+    pub log_id: u64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+}
+
+impl From<AssetSelect> for AssetRow {
+    fn from(row: AssetSelect) -> Self {
+        Self {
+            issuer: row.issuer,
+            name: row.name,
+            decimals: row.decimals,
+            unit: row.unit,
+            managing_contract: row.managing_contract,
+            shares: row.shares,
+            issued_tick: row.issued_tick,
+            log_id: row.log_id,
+            timestamp: row.timestamp,
         }
     }
 }

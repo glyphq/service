@@ -3,69 +3,131 @@ use std::sync::Arc;
 use api::{AppState, router};
 use async_trait::async_trait;
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use chrono::Utc;
+use axum::http::{Request, StatusCode, header};
+use axum::response::IntoResponse;
+use chrono::{TimeZone, Utc};
 use serde_json::Value;
 use store::{
-    EventRow, IdentityRow, IngestCursor, Result as StoreResult, Store, TickBatch, TickRow,
-    TransactionRow, WriteOutcome,
+    AssetRow, EpochRow, EventFilter, EventRow, IdentityRow, IngestCursor, NetworkStats,
+    Result as StoreResult, Store, TickBatch, TickRow, TransactionFilter, TransactionRow,
+    WriteOutcome,
 };
 use tower::ServiceExt;
 
 const IDENTITY: &str = "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK";
+const OTHER: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 const HASH: &str = "yqcvscbbnhotdgqfpvcaniwcppcenlphwdxqqrewmbsfvvbpojfsnvwazgvb";
 
+fn timestamp() -> chrono::DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 11, 18, 12, 0, 0)
+        .single()
+        .expect("valid timestamp")
+}
+
 struct MockStore {
-    tick: TickRow,
+    ticks: Vec<TickRow>,
     transactions: Vec<TransactionRow>,
     events: Vec<EventRow>,
+    identities: Vec<IdentityRow>,
+    assets: Vec<AssetRow>,
 }
 
 impl MockStore {
     fn new() -> Self {
-        let now = Utc::now();
-        let tick = TickRow {
-            epoch: 1,
-            tick: 7,
-            timestamp: now,
-            computor_index: 3,
-            transaction_count: 2,
-            event_count: 1,
-            verification: "data".into(),
-        };
-        let transactions = (0..2)
-            .map(|index| TransactionRow {
-                epoch: 1,
-                tick: 7,
-                tx_index: index,
-                hash: format!("{HASH}{index}"),
-                source: IDENTITY.into(),
-                destination: IDENTITY.into(),
-                amount: 42,
-                input_type: 0,
-                input_data: String::new(),
-                status: "success".into(),
-                timestamp: now,
+        let ticks = [7u32, 6, 5]
+            .into_iter()
+            .map(|tick| TickRow {
+                epoch: if tick == 5 { 2 } else { 1 },
+                tick,
+                timestamp: timestamp(),
+                computor_index: 3,
+                transaction_count: 2,
+                event_count: 2,
+                verification: "data".into(),
             })
             .collect();
-        let events = vec![EventRow {
-            epoch: 1,
-            tick: 7,
-            log_id: 9,
-            log_type: 0,
-            type_name: "qu_transfer".into(),
-            tx_hash: format!("{HASH}0"),
-            tx_index: 0,
-            body: r#"{"amount":"42"}"#.into(),
-            log_digest: 1,
-            timestamp: now,
+        let transactions = [7u32, 6, 5]
+            .into_iter()
+            .flat_map(|tick| {
+                (0..2).map(move |index| TransactionRow {
+                    epoch: if tick == 5 { 2 } else { 1 },
+                    tick,
+                    tx_index: index,
+                    hash: format!("{HASH}{tick}{index}"),
+                    source: if index == 0 { IDENTITY } else { OTHER }.into(),
+                    destination: if index == 0 { OTHER } else { IDENTITY }.into(),
+                    amount: 42 + i64::from(tick),
+                    input_type: 0,
+                    input_data: String::new(),
+                    status: "success".into(),
+                    timestamp: timestamp(),
+                })
+            })
+            .collect();
+        let events = [7u32, 6, 5]
+            .into_iter()
+            .map(|tick| EventRow {
+                epoch: if tick == 5 { 2 } else { 1 },
+                tick,
+                log_id: u64::from(tick) * 10,
+                log_type: 1,
+                type_name: "asset_issuance".into(),
+                tx_hash: format!("{HASH}{tick}0"),
+                tx_index: 0,
+                body: r#"{"issuer":"BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK","name":"QX","decimals":0,"unit":"","managingContract":1,"shares":"1000"}"#.into(),
+                log_digest: u64::from(tick),
+                timestamp: timestamp(),
+            })
+            .collect();
+        let identities = vec![
+            IdentityRow {
+                identity: IDENTITY.into(),
+                public_key: "0x00".into(),
+                balance: 0,
+                incoming_amount: 42,
+                outgoing_amount: 42,
+                transfer_count: 4,
+                first_seen_tick: 5,
+                last_seen_tick: 7,
+            },
+            IdentityRow {
+                identity: OTHER.into(),
+                public_key: "0x01".into(),
+                balance: 10,
+                incoming_amount: 10,
+                outgoing_amount: 0,
+                transfer_count: 1,
+                first_seen_tick: 5,
+                last_seen_tick: 6,
+            },
+        ];
+        let assets = vec![AssetRow {
+            issuer: IDENTITY.into(),
+            name: "QX".into(),
+            decimals: 0,
+            unit: String::new(),
+            managing_contract: 1,
+            shares: 1000,
+            issued_tick: 7,
+            log_id: 70,
+            timestamp: timestamp(),
         }];
         Self {
-            tick,
+            ticks,
             transactions,
             events,
+            identities,
+            assets,
         }
     }
+}
+
+fn page<T: Clone>(rows: &[T], limit: u32, offset: u64) -> Vec<T> {
+    rows.iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .cloned()
+        .collect()
 }
 
 #[async_trait]
@@ -79,20 +141,26 @@ impl Store for MockStore {
     }
 
     async fn head(&self) -> StoreResult<Option<TickRow>> {
-        Ok(Some(self.tick.clone()))
+        Ok(self.ticks.first().cloned())
     }
 
     async fn tick(&self, tick: u32) -> StoreResult<Option<TickRow>> {
-        Ok((tick == self.tick.tick).then(|| self.tick.clone()))
+        Ok(self.ticks.iter().find(|row| row.tick == tick).cloned())
     }
 
     async fn transactions_for_tick(
         &self,
-        _tick: u32,
+        tick: u32,
         limit: u32,
         offset: u64,
     ) -> StoreResult<Vec<TransactionRow>> {
-        Ok(page(&self.transactions, limit, offset))
+        let rows: Vec<_> = self
+            .transactions
+            .iter()
+            .filter(|row| row.tick == tick)
+            .cloned()
+            .collect();
+        Ok(page(&rows, limit, offset))
     }
 
     async fn transaction(&self, hash: &str) -> StoreResult<Option<TransactionRow>> {
@@ -105,28 +173,163 @@ impl Store for MockStore {
 
     async fn events_for_tick(
         &self,
-        _tick: u32,
+        tick: u32,
         limit: u32,
         offset: u64,
     ) -> StoreResult<Vec<EventRow>> {
-        Ok(page(&self.events, limit, offset))
+        let rows: Vec<_> = self
+            .events
+            .iter()
+            .filter(|row| row.tick == tick)
+            .cloned()
+            .collect();
+        Ok(page(&rows, limit, offset))
     }
 
     async fn identity(&self, identity: &str) -> StoreResult<Option<IdentityRow>> {
-        Ok((identity == IDENTITY).then(|| IdentityRow {
-            identity: IDENTITY.into(),
-            public_key: "0x00".into(),
-            balance: 0,
-            incoming_amount: 42,
-            outgoing_amount: 42,
-            transfer_count: 4,
-            first_seen_tick: 7,
-            last_seen_tick: 7,
-        }))
+        Ok(self
+            .identities
+            .iter()
+            .find(|row| row.identity == identity)
+            .cloned())
     }
 
     async fn stats(&self) -> StoreResult<Value> {
-        Ok(serde_json::json!({ "counts": { "ticks": 1 } }))
+        Ok(serde_json::json!({ "counts": { "ticks": self.ticks.len() }, "ingest": {} }))
+    }
+
+    async fn ticks(
+        &self,
+        epoch: Option<u16>,
+        limit: u32,
+        offset: u64,
+    ) -> StoreResult<Vec<TickRow>> {
+        let rows: Vec<_> = self
+            .ticks
+            .iter()
+            .filter(|row| epoch.is_none_or(|epoch| row.epoch == epoch))
+            .cloned()
+            .collect();
+        Ok(page(&rows, limit, offset))
+    }
+
+    async fn epochs(&self, limit: u32, offset: u64) -> StoreResult<Vec<EpochRow>> {
+        let rows = vec![
+            EpochRow {
+                epoch: 2,
+                first_tick: 5,
+                last_tick: 5,
+                first_timestamp: timestamp(),
+                last_timestamp: timestamp(),
+                tick_count: 1,
+                transaction_count: 2,
+                event_count: 1,
+                closed: false,
+            },
+            EpochRow {
+                epoch: 1,
+                first_tick: 6,
+                last_tick: 7,
+                first_timestamp: timestamp(),
+                last_timestamp: timestamp(),
+                tick_count: 2,
+                transaction_count: 4,
+                event_count: 2,
+                closed: true,
+            },
+        ];
+        Ok(page(&rows, limit, offset))
+    }
+
+    async fn epoch(&self, epoch: u16) -> StoreResult<Option<EpochRow>> {
+        Ok(self
+            .epochs(10, 0)
+            .await?
+            .into_iter()
+            .find(|row| row.epoch == epoch))
+    }
+
+    async fn identities(&self, limit: u32, offset: u64) -> StoreResult<Vec<IdentityRow>> {
+        Ok(page(&self.identities, limit, offset))
+    }
+
+    async fn assets(
+        &self,
+        issuer: Option<&str>,
+        limit: u32,
+        offset: u64,
+    ) -> StoreResult<Vec<AssetRow>> {
+        let rows: Vec<_> = self
+            .assets
+            .iter()
+            .filter(|row| issuer.is_none_or(|issuer| row.issuer == issuer))
+            .cloned()
+            .collect();
+        Ok(page(&rows, limit, offset))
+    }
+
+    async fn asset(&self, issuer: &str, name: &str) -> StoreResult<Option<AssetRow>> {
+        Ok(self
+            .assets
+            .iter()
+            .find(|row| row.issuer == issuer && row.name == name)
+            .cloned())
+    }
+
+    async fn transactions_page(
+        &self,
+        filter: &TransactionFilter,
+        limit: u32,
+        offset: u64,
+    ) -> StoreResult<Vec<TransactionRow>> {
+        let rows: Vec<_> =
+            self.transactions
+                .iter()
+                .filter(|row| filter.epoch.is_none_or(|epoch| row.epoch == epoch))
+                .filter(|row| filter.tick.is_none_or(|tick| row.tick == tick))
+                .filter(|row| {
+                    filter.identity.as_ref().is_none_or(|identity| {
+                        row.source == *identity || row.destination == *identity
+                    })
+                })
+                .cloned()
+                .collect();
+        Ok(page(&rows, limit, offset))
+    }
+
+    async fn events_page(
+        &self,
+        filter: &EventFilter,
+        limit: u32,
+        offset: u64,
+    ) -> StoreResult<Vec<EventRow>> {
+        let rows: Vec<_> = self
+            .events
+            .iter()
+            .filter(|row| filter.epoch.is_none_or(|epoch| row.epoch == epoch))
+            .filter(|row| filter.tick.is_none_or(|tick| row.tick == tick))
+            .filter(|row| {
+                filter
+                    .type_name
+                    .as_ref()
+                    .is_none_or(|name| row.type_name == *name)
+            })
+            .cloned()
+            .collect();
+        Ok(page(&rows, limit, offset))
+    }
+
+    async fn network_stats(&self) -> StoreResult<NetworkStats> {
+        Ok(NetworkStats {
+            head: self.head().await?,
+            epochs: 2,
+            ticks: self.ticks.len() as u64,
+            transactions: self.transactions.len() as u64,
+            events: self.events.len() as u64,
+            identities: self.identities.len() as u64,
+            latest_timestamp: Some(timestamp()),
+            ingest: IngestCursor::default(),
+        })
     }
 
     async fn write_tick(&self, batch: &TickBatch) -> StoreResult<WriteOutcome> {
@@ -157,11 +360,17 @@ impl Store for MockStore {
 
     async fn transactions_for_identity(
         &self,
-        _identity: &str,
+        identity: &str,
         limit: u32,
         offset: u64,
     ) -> StoreResult<Vec<TransactionRow>> {
-        Ok(page(&self.transactions, limit, offset))
+        let rows: Vec<_> = self
+            .transactions
+            .iter()
+            .filter(|row| row.source == identity || row.destination == identity)
+            .cloned()
+            .collect();
+        Ok(page(&rows, limit, offset))
     }
 
     async fn recent_events(&self, limit: u32, offset: u64) -> StoreResult<Vec<EventRow>> {
@@ -177,28 +386,33 @@ impl Store for MockStore {
     }
 }
 
-fn page<T: Clone>(rows: &[T], limit: u32, offset: u64) -> Vec<T> {
-    rows.iter()
-        .skip(offset as usize)
-        .take(limit as usize)
-        .cloned()
-        .collect()
-}
-
-async fn get(uri: &str) -> (StatusCode, Value) {
+async fn request(
+    uri: &str,
+    headers: &[(header::HeaderName, &str)],
+) -> (StatusCode, Value, axum::http::HeaderMap) {
     let app = router(AppState {
         store: Arc::new(MockStore::new()),
     });
+    let mut builder = Request::builder().uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(name, *value);
+    }
     let response = app
-        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+        .oneshot(builder.body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap();
     let value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
-    (status, value)
+    (status, value, headers)
+}
+
+async fn get(uri: &str) -> (StatusCode, Value) {
+    let (status, body, _) = request(uri, &[]).await;
+    (status, body)
 }
 
 #[tokio::test]
@@ -212,15 +426,92 @@ async fn tick_and_transaction_resources() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"].as_array().unwrap().len(), 1);
     assert_eq!(body["meta"]["hasMore"], true);
+    assert!(body["meta"]["nextCursor"].is_string());
 
     let (status, body) = get("/v1/ticks/7/events").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["data"][0]["type_name"], "qu_transfer");
-    assert_eq!(body["data"][0]["body"]["amount"], "42");
+    assert_eq!(body["data"][0]["type_name"], "asset_issuance");
+    assert_eq!(body["data"][0]["body"]["issuer"], IDENTITY);
 
     let (status, body) = get("/v1/ticks/999/events").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "not_found");
+}
+
+#[tokio::test]
+async fn collection_resources_are_typed_and_enveloped() {
+    let (status, body) = get("/v1/epochs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["epoch"], 2);
+    assert_eq!(body["data"][1]["closed"], true);
+    assert_eq!(body["meta"]["count"], 2);
+
+    let (status, body) = get("/v1/ticks?epoch=1&limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["tick"], 7);
+
+    let (status, body) = get("/v1/epochs/1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["epoch"], 1);
+
+    let (status, body) = get("/v1/identities").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["identity"], IDENTITY);
+
+    let (status, body) = get("/v1/assets").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["name"], "QX");
+
+    let (status, body) = get(&format!("/v1/assets/{IDENTITY}/QX")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["issuer"], IDENTITY);
+
+    let (status, body) = get("/v1/network/stats").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["ticks"], 3);
+    assert_eq!(body["data"]["head"]["tick"], 7);
+}
+
+#[tokio::test]
+async fn filters_narrow_transactions_and_events() {
+    let (status, body) = get(&format!("/v1/transactions?identity={IDENTITY}&limit=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    for row in body["data"].as_array().unwrap() {
+        assert!(
+            row["source"] == IDENTITY || row["destination"] == IDENTITY,
+            "{row}"
+        );
+    }
+
+    let (status, body) = get("/v1/events?type=asset_issuance&tick=7").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+
+    let (status, body) = get("/v1/transactions?tick=5&epoch=2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn cursors_page_without_duplicates_and_reject_other_filters() {
+    let (status, body) = get("/v1/ticks?limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["tick"], 7);
+    let cursor = body["meta"]["nextCursor"].as_str().unwrap().to_owned();
+
+    let (status, body) = get(&format!("/v1/ticks?limit=1&cursor={cursor}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["tick"], 6);
+    assert_eq!(body["meta"]["offset"], 1);
+
+    let (status, body) = get(&format!("/v1/ticks?limit=1&epoch=1&cursor={cursor}")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_cursor");
+
+    let (status, body) = get("/v1/ticks?cursor=not-a-cursor").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_cursor");
 }
 
 #[tokio::test]
@@ -237,10 +528,15 @@ async fn identity_accepts_case_insensitive_input() {
 }
 
 #[tokio::test]
-async fn errors_use_problem_details() {
-    let (status, body) = get("/v1/identities/NOT-AN-IDENTITY").await;
+async fn errors_use_problem_json_and_stable_codes() {
+    let (status, body, headers) = request("/v1/identities/NOT-AN-IDENTITY", &[]).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "invalid_identity");
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "application/problem+json"
+    );
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
 
     let (status, body) = get("/v1/transactions/zzzz").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -253,4 +549,65 @@ async fn errors_use_problem_details() {
     let (status, body) = get("/does-not-exist").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "not_found");
+}
+
+#[tokio::test]
+async fn middleware_sets_request_id_cache_and_cors_headers() {
+    let (status, body, headers) =
+        request("/v1/ticks/7", &[(header::ORIGIN, "https://example.test")]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["tick"], 7);
+    assert!(headers.get("x-request-id").is_some());
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    assert!(headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+}
+
+#[tokio::test]
+async fn openapi_and_docs_are_served() {
+    let (status, body) = get("/openapi.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["openapi"], "3.1.0");
+    assert!(body["paths"]["/v1/epochs"].is_object());
+    assert!(body["paths"]["/v1/assets/{issuer}/{name}"].is_object());
+
+    let app = router(AppState {
+        store: Arc::new(MockStore::new()),
+    });
+    let response = app
+        .oneshot(Request::builder().uri("/docs").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn large_responses_are_compressed_when_requested() {
+    let app = router(AppState {
+        store: Arc::new(MockStore::new()),
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/openapi.json")
+                .header(header::ACCEPT_ENCODING, "gzip")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let headers = response.headers().clone();
+    assert_eq!(
+        headers.get(header::CONTENT_ENCODING).map(|v| v.as_bytes()),
+        Some(b"gzip".as_slice())
+    );
+}
+
+#[tokio::test]
+async fn rate_limit_problem_uses_429_and_retry_after() {
+    let response = api::ApiError::too_many_requests("slow down").into_response();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
 }
