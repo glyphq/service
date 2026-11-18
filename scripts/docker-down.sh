@@ -6,7 +6,7 @@
 #   scripts/docker-down.sh [--wipe] [--images]
 #
 # Options:
-#   --wipe     Also delete the ClickHouse, MinIO, and log named volumes.
+#   --wipe     Also delete the ClickHouse, SeaweedFS, and log named volumes.
 #              This permanently deletes indexed history and archived objects.
 #   --images   Also remove the locally built glyph image.
 #   -h, --help Show this help.
@@ -29,7 +29,7 @@ Usage:
   scripts/docker-down.sh [--wipe] [--images]
 
 Options:
-  --wipe     Also delete the ClickHouse, MinIO, and log named volumes.
+  --wipe     Also delete the ClickHouse, SeaweedFS, and log named volumes.
              This permanently deletes indexed history and archived objects.
   --images   Also remove the locally built glyph image.
   -h, --help Show this help.
@@ -99,6 +99,6 @@ echo "==> docker compose down"
 "${DOWN[@]}"
 
 if [[ "$WIPE" -eq 1 ]]; then
-  echo "removed named volumes: indexed ClickHouse data, ClickHouse logs, and MinIO objects"
+  echo "removed named volumes: indexed ClickHouse data, ClickHouse logs, and SeaweedFS objects"
 fi
 echo "done"

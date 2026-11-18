@@ -27,12 +27,10 @@ ENV CARGO_INCREMENTAL=0 \
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
-# Cache the registry and target directory between builds. Cargo's target
-# directory lives on the cache mount, so copy the two binaries into the image
-# layer at the end of the same RUN step.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release --locked -p cli -p api --bins \
+# Build in one layer so the two binaries can be copied out before the target
+# directory is discarded. This deliberately avoids BuildKit-only cache mounts
+# so the image also builds on hosts that only ship the legacy Docker builder.
+RUN cargo build --release --locked -p cli -p api --bins \
  && install -D -m 0755 /build/target/release/glyph /out/glyph \
  && install -D -m 0755 /build/target/release/glyph-api /out/glyph-api
 
@@ -48,7 +46,8 @@ RUN apt-get update \
         --home-dir /var/lib/glyph --shell /usr/sbin/nologin glyph
 
 COPY --from=builder /out/glyph /out/glyph-api /usr/local/bin/
-COPY --chmod=0755 deploy/docker/glyph-entrypoint.sh /usr/local/bin/glyph-entrypoint
+COPY deploy/docker/glyph-entrypoint.sh /usr/local/bin/glyph-entrypoint
+RUN chmod 0755 /usr/local/bin/glyph-entrypoint
 
 ENV BIND=0.0.0.0:8080 \
     CLICKHOUSE_URL=http://clickhouse:8123 \

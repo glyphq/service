@@ -8,7 +8,7 @@
 # Options:
 #   --no-build       Reuse the existing glyph:local image.
 #   --no-wait        Do not wait for healthchecks after starting.
-#   --no-indexer     Start ClickHouse, MinIO, migration, and the API only.
+#   --no-indexer     Start ClickHouse, S3, migration, and the API only.
 #   --peer ADDR      Add an indexer peer. Repeat for failover; overrides
 #                    QUBIC_PEERS from the environment or .env.
 #   --timeout SECS   Healthcheck wait budget (default 300).
@@ -42,7 +42,7 @@ Usage:
 Options:
   --no-build       Reuse the existing glyph:local image.
   --no-wait        Do not wait for healthchecks after starting.
-  --no-indexer     Start ClickHouse, MinIO, migration, and the API only.
+  --no-indexer     Start ClickHouse, S3, migration, and the API only.
   --peer ADDR      Add an indexer peer. Repeat for failover; overrides
                    QUBIC_PEERS from the environment or .env.
   --timeout SECS   Healthcheck wait budget (default 300).
@@ -152,7 +152,7 @@ if [[ "$BUILD" -eq 1 ]]; then
 fi
 if [[ "$START_INDEXER" -eq 0 ]]; then
   UP+=(--scale indexer=0)
-  UP+=(clickhouse minio minio-init migrate api)
+  UP+=(clickhouse s3-config seaweedfs s3-init migrate api)
 fi
 UP+=("${EXTRA[@]}")
 
@@ -222,7 +222,7 @@ if [[ -n "$api_port" ]]; then
   echo "health:     http://$api_host:$api_port/healthz"
 fi
 echo "clickhouse: http://127.0.0.1:${CLICKHOUSE_HTTP_PORT:-8123}"
-echo "minio:      http://127.0.0.1:${MINIO_CONSOLE_PORT:-9001} (console)"
+echo "s3:         http://127.0.0.1:${S3_PORT:-8333}"
 if [[ "$START_INDEXER" -eq 0 ]]; then
   echo "indexer:    not started (--no-indexer)"
 fi
