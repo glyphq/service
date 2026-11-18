@@ -10,8 +10,8 @@ use qubic::crypto::k12::k12_32;
 use qubic::crypto::schnorrq;
 use qubic::logs::{CONTRACT_ERROR_MESSAGE, EventBody};
 use qubic::messages::{
-    Computors, EMPTY_TICK_QUORUM, QUORUM, TICK_DATA_SIZE, TX_PER_TICK, Tick, TickData, Transaction,
-    ZERO_DIGEST,
+    COMPUTOR_COUNT, Computors, EMPTY_TICK_QUORUM, LOG_TX_PER_TICK, QUORUM, TICK_DATA_SIZE,
+    TX_PER_TICK, Tick, TickData, Transaction, ZERO_DIGEST,
 };
 use qubic::{LogEvent, PublicKey};
 use serde::Serialize;
@@ -169,6 +169,24 @@ impl<S: Store + 'static> Indexer<S> {
 
             let mut fetched = match peer.bundle(next).await {
                 Ok(bundle) => bundle,
+                Err(node::Error::NotSynchronized {
+                    head: peer_head, ..
+                }) => {
+                    // The peer moved backwards or is behind our cursor. Refresh
+                    // its view and wait for the poll interval instead of
+                    // hammering the same missing tick.
+                    tracing::warn!(
+                        tick = next,
+                        peer_head,
+                        "peer is not synchronized to the requested tick"
+                    );
+                    if let Ok(updated) = peer.head().await {
+                        head = updated;
+                    }
+                    consecutive_failures = 0;
+                    tokio::time::sleep(self.config.poll_interval).await;
+                    continue;
+                }
                 Err(error) => {
                     tracing::warn!(tick = next, %error, "tick fetch failed, retrying");
                     consecutive_failures += 1;
@@ -234,6 +252,23 @@ impl<S: Store + 'static> Indexer<S> {
             };
 
             let batch = self.build_batch(&verified).await?;
+            for event in &verified.logs {
+                match event.custom_op_code() {
+                    Some(qubic::logs::CUSTOM_OP_END_EPOCH) => tracing::info!(
+                        epoch = verified.tick.epoch,
+                        tick = verified.tick.tick,
+                        log_id = event.log_id,
+                        "epoch end event observed"
+                    ),
+                    Some(qubic::logs::CUSTOM_OP_START_EPOCH) => tracing::info!(
+                        epoch = verified.tick.epoch,
+                        tick = verified.tick.tick,
+                        log_id = event.log_id,
+                        "epoch start event observed"
+                    ),
+                    _ => {}
+                }
+            }
             let outcome = self.store.write_tick(&batch).await?;
             consecutive_failures = 0;
             if outcome.tick >= next {
@@ -263,8 +298,9 @@ impl<S: Store + 'static> Indexer<S> {
             None => self.config.start_tick.unwrap_or(head.initial_tick),
         };
         // An epoch rollover can leave the stored cursor below the new epoch's
-        // first tick. Never ask peers for ticks from a pruned epoch.
-        Ok(next.max(head.initial_tick).min(head.tick.saturating_add(1)))
+        // first tick, so move forward. Never clamp backwards: a stale peer head
+        // must not make us refetch ticks that are already persisted.
+        Ok(next.max(head.initial_tick))
     }
 
     async fn reconnect(&self, peer: Peer) -> Result<Peer> {
@@ -294,11 +330,6 @@ impl<S: Store + 'static> Indexer<S> {
         batch.signature = verified.tick.signature;
         batch.tick_digest = verified.tick_data.digest();
 
-        let mut digest_to_index = HashMap::with_capacity(TX_PER_TICK);
-        for (index, digest) in verified.tick_data.non_empty_transactions() {
-            digest_to_index.insert(*digest, index as u16);
-        }
-
         let mut error_txs = HashMap::<u16, bool>::new();
         let mut tx_hashes = HashMap::<u16, String>::new();
 
@@ -324,17 +355,7 @@ impl<S: Store + 'static> Indexer<S> {
         }
 
         for event in &verified.logs {
-            let tx_index = verified
-                .log_ranges
-                .from_log_id
-                .iter()
-                .zip(verified.log_ranges.length.iter())
-                .position(|(from, len)| {
-                    *from >= 0
-                        && *len > 0
-                        && (event.log_id as i64) >= *from
-                        && ((event.log_id as i64) < *from + *len)
-                });
+            let tx_index = log_slot(&verified.log_ranges, event.log_id);
             let (tx_hash, tx_index_i16) = match tx_index {
                 Some(index) if index < TX_PER_TICK => (
                     tx_hashes
@@ -437,78 +458,144 @@ impl<S: Store + 'static> Indexer<S> {
     }
 }
 
+/// Votes agree on the transaction digest. Per-computor salted header fields
+/// differ by design, so the digest is the only field a quorum can share.
+type VoteGroupKey = [u8; 32];
+
 /// Verifies quorum, transaction inclusion, log digests, and optionally
 /// SchnorrQ signatures.
 pub fn verify_bundle(mut bundle: TickBundle, verify_signatures: bool) -> Result<VerifiedTick> {
-    let tick = bundle.tick.clone();
     let tick_data = bundle.tick_data.clone();
-    let epoch = tick.epoch;
-    let tick_number = tick.tick;
+    let tick_number = tick_data.tick;
+    let epoch = if tick_data.epoch == 0 {
+        bundle.tick.epoch
+    } else {
+        tick_data.epoch
+    };
     let mut warnings = std::mem::take(&mut bundle.warnings);
-    let mut complete = true;
+    let mut complete = warnings.is_empty();
 
-    if bundle.tick_data.tick != tick_number {
+    if bundle.tick.tick != tick_number {
         return Err(Error::Verification(format!(
-            "tick data is for {}, requested {tick_number}",
-            bundle.tick_data.tick
+            "candidate tick {} does not match tick data {tick_number}",
+            bundle.tick.tick
         )));
     }
-    if bundle.tick_data.epoch != epoch && bundle.tick_data.epoch != 0 {
+    if tick_data.epoch != epoch {
         return Err(Error::Verification(format!(
             "tick data epoch {} does not match tick epoch {epoch}",
-            bundle.tick_data.epoch
+            tick_data.epoch
         )));
     }
-
-    let mut groups = BTreeMap::<[u8; 32], usize>::new();
-    for vote in &bundle.votes {
-        if vote.tick == tick_number && vote.epoch == epoch {
-            *groups.entry(vote.transaction_digest).or_default() += 1;
-        }
-    }
-    let (consensus_digest, consensus_count) = groups
-        .iter()
-        .max_by_key(|(_, count)| **count)
-        .map(|(digest, count)| (*digest, *count))
-        .ok_or_else(|| Error::Verification(format!("no votes for tick {tick_number}")))?;
-
-    let required = if consensus_digest == ZERO_DIGEST {
-        EMPTY_TICK_QUORUM
-    } else {
-        QUORUM
-    };
-    if consensus_count < required {
+    if bundle.computors.epoch != epoch {
         return Err(Error::Verification(format!(
-            "tick {tick_number} has {consensus_count} matching votes, needs {required}"
+            "computor set is for epoch {}, tick is epoch {epoch}",
+            bundle.computors.epoch
         )));
     }
+
+    // One vote per computor index. A peer that repeats a single valid vote
+    // must not be able to reach quorum on its own, so deduplicate before
+    // counting anything.
+    let mut by_computor = BTreeMap::<u16, &Tick>::new();
+    for vote in &bundle.votes {
+        if vote.epoch != epoch || vote.tick != tick_number {
+            continue;
+        }
+        if vote.computor_index as usize >= COMPUTOR_COUNT {
+            continue;
+        }
+        if verify_signatures && !verify_vote_signature(vote, &bundle.computors) {
+            continue;
+        }
+        by_computor.entry(vote.computor_index).or_insert(vote);
+    }
+    if by_computor.is_empty() {
+        return Err(Error::Verification(format!(
+            "no votes for tick {tick_number}"
+        )));
+    }
+
+    let mut groups = BTreeMap::<VoteGroupKey, Vec<&Tick>>::new();
+    for vote in by_computor.values() {
+        groups
+            .entry(vote.transaction_digest)
+            .or_default()
+            .push(vote);
+    }
+
+    // Invalid signatures were dropped above, so every remaining vote counts.
+    let mut candidates = Vec::new();
+    for votes in groups.into_values() {
+        let digest = votes[0].transaction_digest;
+        let required = required_quorum(&digest);
+        let valid = votes.len();
+        candidates.push((valid, required, digest, votes));
+    }
+
+    candidates.retain(|(valid, required, _, _)| valid >= required);
+    // Two candidates cannot both reach threshold with 676 computors, but check
+    // explicitly so a protocol change cannot silently pick a winner.
+    if candidates.len() > 1 {
+        return Err(Error::Verification(format!(
+            "tick {tick_number} has {} conflicting quorum candidates",
+            candidates.len()
+        )));
+    }
+    let (consensus_count, required, consensus_digest, _) = candidates.pop().ok_or_else(|| {
+        let (best, required) = candidate_hint(&by_computor);
+        Error::Verification(format!(
+            "tick {tick_number} has {best} aligned votes, needs {required}"
+        ))
+    })?;
+
     if consensus_digest != ZERO_DIGEST && tick_data.digest() != consensus_digest {
         return Err(Error::Verification(format!(
             "tick data digest does not match quorum vote for tick {tick_number}"
         )));
     }
-
-    if verify_signatures {
-        verify_signatures_for_quorum(&bundle, &consensus_digest, required)?;
-        if consensus_digest != ZERO_DIGEST {
-            verify_tick_data_signature(&bundle, &bundle.computors)?;
-        }
+    if consensus_digest == ZERO_DIGEST && tick_data.non_empty_transactions().next().is_some() {
+        return Err(Error::Verification(format!(
+            "empty tick {tick_number} carries non-empty transaction slots"
+        )));
     }
+
+    if verify_signatures && consensus_digest != ZERO_DIGEST {
+        verify_tick_data_signature(&bundle, &bundle.computors)?;
+    }
+
+    // The stored header is the requested candidate, not one computor's vote.
+    // Votes carry per-computor salted fields that are not chain state.
+    let candidate = bundle.tick.clone();
+    debug_assert!(consensus_count >= required);
 
     let digest_to_index: HashMap<[u8; 32], u16> = tick_data
         .non_empty_transactions()
         .map(|(index, digest)| (*digest, index as u16))
         .collect();
     let mut seen = 0usize;
-    for digest in tick_data.non_empty_transactions().map(|(_, digest)| digest) {
-        if let Some(transaction) = bundle.transactions.iter().find(|tx| tx.hash() == *digest) {
-            seen += 1;
-            if verify_signatures && !verify_transaction_signature(transaction) {
-                return Err(Error::Verification(format!(
-                    "invalid transaction signature for {}",
-                    qubic::encode_tx_hash(digest)
-                )));
-            }
+    for transaction in &bundle.transactions {
+        if transaction.tick != tick_number {
+            return Err(Error::Verification(format!(
+                "transaction for tick {} appears in tick {tick_number}",
+                transaction.tick
+            )));
+        }
+        let hash = transaction.hash();
+        if !digest_to_index.contains_key(&hash) {
+            complete = false;
+            warnings.push(format!(
+                "tick {tick_number}: transaction {} is not in the tick data digest set",
+                qubic::encode_tx_hash(&hash)
+            ));
+            continue;
+        }
+        seen += 1;
+        if verify_signatures && !verify_transaction_signature(transaction) {
+            return Err(Error::Verification(format!(
+                "invalid transaction signature for {}",
+                qubic::encode_tx_hash(&hash)
+            )));
         }
     }
     if seen != digest_to_index.len() {
@@ -542,9 +629,15 @@ pub fn verify_bundle(mut bundle: TickBundle, verify_signatures: bool) -> Result<
             }
         }
         last_log_id = Some(event.log_id);
+        if log_slot(&bundle.log_ranges, event.log_id).is_none() {
+            return Err(Error::Verification(format!(
+                "log {} lies outside every declared log range for tick {tick_number}",
+                event.log_id
+            )));
+        }
     }
     let expected_logs = bundle.log_ranges.count();
-    if (bundle.logs.len() as i64) < expected_logs {
+    if (bundle.logs.len() as i64) != expected_logs {
         complete = false;
         warnings.push(format!(
             "tick {tick_number}: fetched {}/{} logs",
@@ -553,72 +646,46 @@ pub fn verify_bundle(mut bundle: TickBundle, verify_signatures: bool) -> Result<
         ));
     }
 
-    if complete && verify_signatures {
-        Ok(VerifiedTick {
-            head: bundle.head,
-            tick,
-            tick_data,
-            votes: bundle.votes,
-            transactions: bundle.transactions,
-            log_ranges: bundle.log_ranges,
-            logs: bundle.logs,
-            verification: Verification::Data,
-            warnings,
-        })
+    let verification = if complete && verify_signatures {
+        Verification::Data
     } else {
-        Ok(VerifiedTick {
-            head: bundle.head,
-            tick,
-            tick_data,
-            votes: bundle.votes,
-            transactions: bundle.transactions,
-            log_ranges: bundle.log_ranges,
-            logs: bundle.logs,
-            verification: Verification::Quorum,
-            warnings,
-        })
+        Verification::Quorum
+    };
+
+    Ok(VerifiedTick {
+        head: bundle.head,
+        tick: candidate,
+        tick_data,
+        votes: bundle.votes,
+        transactions: bundle.transactions,
+        log_ranges: bundle.log_ranges,
+        logs: bundle.logs,
+        verification,
+        warnings,
+    })
+}
+
+fn required_quorum(digest: &[u8; 32]) -> usize {
+    if digest == &ZERO_DIGEST {
+        EMPTY_TICK_QUORUM
+    } else {
+        QUORUM
     }
 }
 
-fn verify_signatures_for_quorum(
-    bundle: &TickBundle,
-    consensus_digest: &[u8; 32],
-    required: usize,
-) -> Result<()> {
-    if consensus_digest == &ZERO_DIGEST {
-        // Empty ticks still need 226 valid signatures.
-        let mut valid = 0usize;
-        for vote in bundle
-            .votes
-            .iter()
-            .filter(|vote| vote.tick == bundle.tick.tick && vote.transaction_digest == ZERO_DIGEST)
-        {
-            if verify_vote_signature(vote, &bundle.computors) {
-                valid += 1;
-            }
-            if valid >= required {
-                return Ok(());
-            }
-        }
-        return Err(Error::Verification(format!(
-            "only {valid} valid empty-tick signatures, need {required}"
-        )));
+fn candidate_hint(by_computor: &BTreeMap<u16, &Tick>) -> (usize, usize) {
+    let mut counts = BTreeMap::<VoteGroupKey, ([u8; 32], usize)>::new();
+    for vote in by_computor.values() {
+        counts
+            .entry(vote.transaction_digest)
+            .or_insert((vote.transaction_digest, 0))
+            .1 += 1;
     }
-
-    let mut valid = 0usize;
-    for vote in bundle.votes.iter().filter(|vote| {
-        vote.tick == bundle.tick.tick && vote.transaction_digest == *consensus_digest
-    }) {
-        if verify_vote_signature(vote, &bundle.computors) {
-            valid += 1;
-        }
-        if valid >= required {
-            return Ok(());
-        }
-    }
-    Err(Error::Verification(format!(
-        "only {valid} valid quorum signatures, need {required}"
-    )))
+    counts
+        .into_values()
+        .map(|(digest, count)| (count, required_quorum(&digest)))
+        .max_by_key(|(count, _)| *count)
+        .unwrap_or((0, QUORUM))
 }
 
 fn verify_vote_signature(vote: &Tick, computors: &Computors) -> bool {
@@ -663,6 +730,26 @@ fn verify_transaction_signature(transaction: &Transaction) -> bool {
     let bytes = transaction.encode();
     let digest = k12_32(&bytes[..bytes.len() - 64]);
     schnorrq::verify_digest(&transaction.source, &digest, &transaction.signature)
+}
+
+/// Finds the log range slot for `log_id`. Slots 0..4096 are transaction
+/// indices; 4096..4102 are the six special system-event slots.
+fn log_slot(ranges: &qubic::messages::LogRanges, log_id: u64) -> Option<usize> {
+    let id = log_id as i64;
+    for (index, (from, length)) in ranges
+        .from_log_id
+        .iter()
+        .zip(ranges.length.iter())
+        .enumerate()
+    {
+        if index >= LOG_TX_PER_TICK {
+            break;
+        }
+        if *from >= 0 && *length > 0 && id >= *from && id < *from + *length {
+            return Some(index);
+        }
+    }
+    None
 }
 
 fn event_body_json(event: &LogEvent) -> String {
@@ -749,6 +836,69 @@ mod tests {
     fn verification_order_is_monotonic() {
         assert!(Verification::Quorum < Verification::Data);
         assert!(Verification::Data < Verification::State);
+    }
+
+    fn golden_computors() -> Computors {
+        Computors::decode(&include_bytes!("../../../fixtures/computors.bin")[8..])
+            .expect("computors fixture")
+    }
+
+    #[test]
+    fn golden_vote_signature_verifies() {
+        let computors = golden_computors();
+        let vote = Tick::decode(&include_bytes!("../../../fixtures/quorum_tick.bin")[8..])
+            .expect("vote fixture");
+        assert!(verify_vote_signature(&vote, &computors));
+
+        // The same signed bytes must not verify against a neighbouring key.
+        let mut wrong = vote.clone();
+        wrong.computor_index = (wrong.computor_index + 1) % COMPUTOR_COUNT as u16;
+        assert!(!verify_vote_signature(&wrong, &computors));
+    }
+
+    #[test]
+    fn golden_tick_data_signature_verifies() {
+        let computors = golden_computors();
+        let tick_data = TickData::decode(&include_bytes!("../../../fixtures/tick_data.bin")[8..])
+            .expect("tick data fixture");
+        let vote = Tick::decode(&include_bytes!("../../../fixtures/quorum_tick.bin")[8..])
+            .expect("vote fixture");
+        let bundle = TickBundle {
+            head: Head {
+                epoch: tick_data.epoch,
+                tick: tick_data.tick,
+                initial_tick: tick_data.tick,
+                tick_duration: 1_000,
+            },
+            computors: computors.clone(),
+            tick: vote,
+            tick_data,
+            votes: Vec::new(),
+            transactions: Vec::new(),
+            log_ranges: qubic::messages::LogRanges {
+                from_log_id: vec![-1; LOG_TX_PER_TICK],
+                length: vec![0; LOG_TX_PER_TICK],
+            },
+            logs: Vec::new(),
+            warnings: Vec::new(),
+        };
+        verify_tick_data_signature(&bundle, &computors).expect("tick data signature");
+    }
+
+    #[test]
+    fn golden_transaction_hash_matches_tick_data() {
+        let tick_data = TickData::decode(&include_bytes!("../../../fixtures/tick_data.bin")[8..])
+            .expect("tick data fixture");
+        let transaction =
+            Transaction::decode(&include_bytes!("../../../fixtures/tick_transactions.bin")[8..])
+                .expect("transaction fixture");
+        let hash = transaction.hash();
+        assert!(
+            tick_data
+                .non_empty_transactions()
+                .any(|(_, digest)| *digest == hash)
+        );
+        assert!(verify_transaction_signature(&transaction));
     }
 
     #[test]
