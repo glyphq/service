@@ -84,6 +84,25 @@ ADD PROJECTION IF NOT EXISTS by_hash
 )
 "#;
 
+/// Identity history matches either side of a transfer. Two projections keep
+/// both branches of the `source = ? OR destination = ?` union indexable; the
+/// deduplication and final ordering remain in the query.
+pub const CREATE_TRANSACTIONS_BY_SOURCE: &str = r#"
+ALTER TABLE {database}.transactions
+ADD PROJECTION IF NOT EXISTS by_source
+(
+    SELECT * ORDER BY (source, tick, tx_index)
+)
+"#;
+
+pub const CREATE_TRANSACTIONS_BY_DESTINATION: &str = r#"
+ALTER TABLE {database}.transactions
+ADD PROJECTION IF NOT EXISTS by_destination
+(
+    SELECT * ORDER BY (destination, tick, tx_index)
+)
+"#;
+
 pub const CREATE_EVENTS: &str = r#"
 CREATE TABLE IF NOT EXISTS {database}.events
 (
@@ -115,6 +134,17 @@ ALTER TABLE {database}.events
 ADD PROJECTION IF NOT EXISTS by_tick
 (
     SELECT * ORDER BY (epoch, tick, log_id)
+)
+"#;
+
+/// Global recency does not have a useful primary key because events are
+/// ordered by `(epoch, log_id)`. This projection provides `tick DESC,
+/// log_id DESC` scans in reverse order.
+pub const CREATE_EVENTS_RECENT: &str = r#"
+ALTER TABLE {database}.events
+ADD PROJECTION IF NOT EXISTS by_recent
+(
+    SELECT * ORDER BY (tick, log_id)
 )
 "#;
 
@@ -157,9 +187,12 @@ pub const ALL: &[&str] = &[
     CREATE_TRANSACTIONS,
     ALTER_TRANSACTIONS_SETTINGS,
     CREATE_TRANSACTIONS_BY_HASH,
+    CREATE_TRANSACTIONS_BY_SOURCE,
+    CREATE_TRANSACTIONS_BY_DESTINATION,
     CREATE_EVENTS,
     ALTER_EVENTS_SETTINGS,
     CREATE_EVENTS_BY_TICK,
+    CREATE_EVENTS_RECENT,
     CREATE_IDENTITIES,
     CREATE_INGEST_STATE,
 ];

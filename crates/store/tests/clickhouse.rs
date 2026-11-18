@@ -67,6 +67,13 @@ fn transaction(epoch: u16, tick: u32, index: u16, hash: &str, amount: i64) -> Tr
     }
 }
 
+fn transfer(tick: u32, index: u16, hash: &str, source: &str, destination: &str) -> TransactionRow {
+    let mut row = transaction(1, tick, index, hash, 1);
+    row.source = source.into();
+    row.destination = destination.into();
+    row
+}
+
 fn event(epoch: u16, tick: u32, log_id: u64, body: &str) -> EventRow {
     EventRow {
         epoch,
@@ -317,6 +324,89 @@ async fn ingest_cursor_round_trips_through_clickhouse() {
 }
 
 #[tokio::test]
+async fn identity_history_and_recent_activity_are_ordered_and_deduped() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    let mut tick_100 = TickBatch::new(1, 100, timestamp(), 7, "quorum");
+    tick_100.transactions = vec![
+        transfer(100, 1, "tx-100-1", "LOOKUP", "B"),
+        transfer(100, 2, "tx-100-2", "C", "LOOKUP"),
+    ];
+    tick_100.events = vec![event(1, 100, 10, "saw-100")];
+    store.write_tick(&tick_100).await.expect("write tick 100");
+
+    let mut tick_101 = TickBatch::new(1, 101, timestamp(), 7, "quorum");
+    tick_101.transactions = vec![transfer(101, 0, "tx-101-0", "LOOKUP", "LOOKUP")];
+    tick_101.events = vec![event(1, 101, 5, "saw-101")];
+    store.write_tick(&tick_101).await.expect("write tick 101");
+
+    let mut tick_99 = TickBatch::new(1, 99, timestamp(), 7, "quorum");
+    tick_99.transactions = vec![transfer(99, 5, "tx-99-5", "B", "LOOKUP")];
+    tick_99.events = vec![event(1, 99, 20, "saw-99")];
+    store.write_tick(&tick_99).await.expect("write tick 99");
+
+    let history = store
+        .transactions_for_identity("LOOKUP", 10, 0)
+        .await
+        .expect("identity history");
+    let hashes = history
+        .iter()
+        .map(|tx| tx.hash.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(hashes, vec!["tx-101-0", "tx-100-1", "tx-100-2", "tx-99-5"]);
+    assert_eq!(history[1].tx_index, 1);
+    assert_eq!(history[2].tx_index, 2);
+
+    let page = store
+        .transactions_for_identity("LOOKUP", 2, 1)
+        .await
+        .expect("identity history page");
+    let hashes = page.iter().map(|tx| tx.hash.as_str()).collect::<Vec<_>>();
+    assert_eq!(hashes, vec!["tx-100-1", "tx-100-2"]);
+
+    let recent_transactions = store
+        .recent_transactions(3, 0)
+        .await
+        .expect("recent transactions");
+    let hashes = recent_transactions
+        .iter()
+        .map(|tx| tx.hash.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(hashes, vec!["tx-101-0", "tx-100-1", "tx-100-2"]);
+
+    let recent_events = store.recent_events(10, 0).await.expect("recent events");
+    let log_ids = recent_events
+        .iter()
+        .map(|event| event.log_id)
+        .collect::<Vec<_>>();
+    assert_eq!(log_ids, vec![5, 10, 20]);
+
+    // Replaying an existing tick must not duplicate recent or identity views.
+    store.write_tick(&tick_100).await.expect("replay tick 100");
+    assert_eq!(
+        store
+            .transactions_for_identity("LOOKUP", 10, 0)
+            .await
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(store.recent_transactions(10, 0).await.unwrap().len(), 4);
+    assert_eq!(store.recent_events(10, 0).await.unwrap().len(), 3);
+    assert!(
+        store
+            .transactions_for_identity("NOBODY", 10, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
 async fn duplicate_keys_within_a_batch_are_collapsed() {
     let Some(store) = test_store().await else {
         return;
@@ -441,15 +531,16 @@ async fn schema_creates_named_read_projections() {
         return;
     };
 
-    // The projections make hash lookups and tick lookups use an index instead
-    // of scanning the table's natural sort order.
+    // The projections make hash lookups, identity history, and recent activity
+    // use an index instead of scanning the table's natural sort order.
     assert!(show_create(&store, "ticks").await.contains("by_tick"));
-    assert!(
-        show_create(&store, "transactions")
-            .await
-            .contains("by_hash")
-    );
-    assert!(show_create(&store, "events").await.contains("by_tick"));
+    let transactions = show_create(&store, "transactions").await;
+    assert!(transactions.contains("by_hash"));
+    assert!(transactions.contains("by_source"));
+    assert!(transactions.contains("by_destination"));
+    let events = show_create(&store, "events").await;
+    assert!(events.contains("by_tick"));
+    assert!(events.contains("by_recent"));
 
     store.drop_database().await.expect("drop test database");
 }

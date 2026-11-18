@@ -171,6 +171,17 @@ pub trait Store: Send + Sync {
         offset: u64,
     ) -> Result<Vec<TransactionRow>>;
     async fn transaction(&self, hash: &str) -> Result<Option<TransactionRow>>;
+    /// Transfers where `identity` is either the source or the destination.
+    async fn transactions_for_identity(
+        &self,
+        identity: &str,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<TransactionRow>>;
+    /// Most recent events across all epochs, newest tick first.
+    async fn recent_events(&self, limit: u32, offset: u64) -> Result<Vec<EventRow>>;
+    /// Most recent transactions across all epochs, newest tick first.
+    async fn recent_transactions(&self, limit: u32, offset: u64) -> Result<Vec<TransactionRow>>;
     async fn events_for_tick(&self, tick: u32, limit: u32, offset: u64) -> Result<Vec<EventRow>>;
     async fn identity(&self, identity: &str) -> Result<Option<IdentityRow>>;
     async fn stats(&self) -> Result<Value>;
@@ -255,7 +266,7 @@ impl Store for ClickHouseStore {
     async fn head(&self) -> Result<Option<TickRow>> {
         let row = self
             .client
-            .query("SELECT ?fields FROM ticks ORDER BY tick DESC, version DESC LIMIT 1")
+            .query("SELECT ?fields FROM ticks ORDER BY epoch DESC, tick DESC, version DESC LIMIT 1")
             .fetch_optional::<rows::TickSelect>()
             .await?;
         Ok(row.map(Into::into))
@@ -303,6 +314,83 @@ impl Store for ClickHouseStore {
         Ok(row.map(Into::into))
     }
 
+    async fn transactions_for_identity(
+        &self,
+        identity: &str,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<TransactionRow>> {
+        // The two projections are used by the union branches. ClickHouse still
+        // has to merge both branches and sort before applying the page, so deep
+        // offsets remain proportional to the identity's history size.
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT ?fields FROM (
+    SELECT * FROM (
+        SELECT * FROM transactions WHERE source = ?
+        UNION ALL
+        SELECT * FROM transactions WHERE destination = ?
+    )
+    ORDER BY version DESC
+    LIMIT 1 BY tick, tx_index
+)
+ORDER BY tick DESC, tx_index ASC
+LIMIT ? OFFSET ?
+"#,
+            )
+            .bind(identity)
+            .bind(identity)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all::<rows::TransactionSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn recent_events(&self, limit: u32, offset: u64) -> Result<Vec<EventRow>> {
+        // `by_recent` orders by (tick, log_id), so a reverse scan already
+        // produces the requested order. LIMIT 1 BY collapses replayed rows
+        // before the page is cut.
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT ?fields FROM events
+ORDER BY tick DESC, log_id DESC, version DESC
+LIMIT 1 BY epoch, log_id
+LIMIT ? OFFSET ?
+"#,
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all::<rows::EventSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn recent_transactions(&self, limit: u32, offset: u64) -> Result<Vec<TransactionRow>> {
+        // The table order is (tick, tx_index), which the mixed DESC/ASC sort
+        // cannot scan directly. ClickHouse uses it to bound the top-K sort;
+        // deep offsets still read more of the table.
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT ?fields FROM transactions
+ORDER BY tick DESC, tx_index ASC, version DESC
+LIMIT 1 BY tick, tx_index
+LIMIT ? OFFSET ?
+"#,
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all::<rows::TransactionSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     async fn events_for_tick(&self, tick: u32, limit: u32, offset: u64) -> Result<Vec<EventRow>> {
         let rows = self
             .client
@@ -336,12 +424,14 @@ impl Store for ClickHouseStore {
         let head = self.head().await?;
         // uniqExact on the sorting keys is exact and still avoids FINAL, so
         // replayed ticks are not double counted before merges run.
-        let ticks = self.count("SELECT uniqExact(tick) AS n FROM ticks").await?;
+        let ticks = self
+            .count("SELECT uniqExact(epoch, tick) AS n FROM ticks")
+            .await?;
         let transactions = self
             .count("SELECT uniqExact(tick, tx_index) AS n FROM transactions")
             .await?;
         let events = self
-            .count("SELECT uniqExact(log_id) AS n FROM events")
+            .count("SELECT uniqExact(epoch, log_id) AS n FROM events")
             .await?;
         let identities = self
             .count("SELECT uniqExact(identity) AS n FROM identities")
