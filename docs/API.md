@@ -834,14 +834,21 @@ An unavailable peer returns `503 unavailable`. Invalid input returns
 
 ### Prices
 
-The price routes serve the on-chain QUBIC/USDT price. Hour `0` is
-`2022-04-13T12:00:00Z`; each point carries `price_e8` (1e-8 USDT per QUBIC) and a
-rounded `price_usdt`. A background poller reads the latest verified reply of an
-active `OI::Price` oracle subscription (interface index 0) discovered through
-`RequestOracleData`. The QPayhub `GetQuUsdPrice` read function (contract index
-29, input type 4) is a secondary source. The poller stores one point per hour in
-ClickHouse and publishes a `price` stream event when a stored hour changes. It
-never substitutes the mining price series.
+The price routes serve QUBIC/USDT. Hour `0` is `2022-04-13T12:00:00Z`; each point
+carries `price_e8` (1e-8 USDT per QUBIC) and a rounded `price_usdt`. A background
+poller reads the latest verified reply of an active `OI::Price` oracle
+subscription (interface index 0) discovered through `RequestOracleData`. The
+QPayhub `GetQuUsdPrice` read function (contract index 29, input type 4) is a
+secondary source. The poller stores one point per hour in ClickHouse and
+publishes a `price` stream event when a stored hour changes. It never substitutes
+the mining price series.
+
+When neither on-chain source has produced a point, the routes fall back to the
+external exchange consensus so a chart still has data. Those rows use
+`source: 1000`, `source_name: "external_market"`, and `onchain: false`. They omit
+on-chain-only fields: `epoch`, `append_tick`, `source_tick`, `flags`, `filled`,
+`synced`, `bound`, and `series_digest`. An external price has no oracle
+observation tick, so the API does not fabricate one.
 
 | Route | Meaning |
 | --- | --- |
@@ -854,15 +861,17 @@ The oracle reply is verified by the Qubic network; the poller selects the
 QUBIC/USDT pair and scales `numerator / denominator` to 1e-8 units. `meta.pair`
 is always `QUBIC/USDT`. `meta.source` is `0` for the Price oracle interface and
 `29` for the QPayhub fallback; `meta.source_name` gives the matching name.
-`meta.stale` is true when the on-chain source marks the value stale. `PRICE_POLL_MS`
-controls the refresh cadence (default 60 seconds).
+`meta.stale` is true when the source marks the value stale. `PRICE_POLL_MS`
+controls the refresh cadence (default 60 seconds). `meta.onchain` is false for
+the external fallback series.
 
-Points use snake_case fields: `hour`, `timestamp`, `price_e8` (1e-8 USDT per
-QUBIC), `price_usdt` (rounded to eight decimals), `append_tick`, `source_tick`,
-`epoch`, `flags`, `filled`, `stale`, `source`, `source_name`, `synced`, `bound`,
-`series_digest`, and `observed_at`. `append_tick` is the reveal tick of the oracle
-reply or the QPayhub update tick; `source_tick` is the query tick or update tick.
-`series_digest` is the K12 digest of the reply payload that produced the point.
+Points use snake_case fields. All points carry `hour`, `timestamp`, `price_e8`,
+`price_usdt`, `stale`, `source`, `source_name`, `onchain`, and `observed_at`.
+On-chain points additionally carry `append_tick`, `source_tick`, `epoch`,
+`flags`, `filled`, `synced`, `bound`, and `series_digest`. `append_tick` is the
+reveal tick of the oracle reply or the QPayhub update tick; `source_tick` is the
+query tick or update tick. `series_digest` is the K12 digest of the reply payload
+that produced the point.
 
 ### Market data
 

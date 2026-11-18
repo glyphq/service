@@ -152,6 +152,7 @@ async fn latest(State(state): State<AppState>) -> Result<impl IntoResponse, ApiE
                 "source_name": source_name(row.source),
                 "stale": point_stale(row.flags),
                 "available": true,
+                "onchain": row.source != PRICE_SOURCE_MARKET,
             },
         })),
     ))
@@ -271,13 +272,19 @@ async fn history(
                     .map_or("none", |row| source_name(row.source)),
                 "stale": latest.as_ref().is_some_and(|row| point_stale(row.flags)),
                 "available": latest.is_some(),
+                "onchain": latest
+                    .as_ref()
+                    .is_some_and(|row| row.source != PRICE_SOURCE_MARKET),
             },
         })),
     ))
 }
 
 fn meta(latest: &Option<PricePointRow>, from_hour: u32, limit: u32, count: usize) -> Value {
-    json!({
+    let onchain = latest
+        .as_ref()
+        .is_some_and(|row| row.source != PRICE_SOURCE_MARKET);
+    let mut meta = json!({
         "from_hour": from_hour,
         "limit": limit,
         "count": count,
@@ -286,36 +293,58 @@ fn meta(latest: &Option<PricePointRow>, from_hour: u32, limit: u32, count: usize
         "source_name": latest.as_ref().map_or("none", |row| source_name(row.source)),
         "stale": latest.as_ref().is_some_and(|row| point_stale(row.flags)),
         "available": latest.is_some(),
-        "synced": latest.as_ref().is_some_and(|row| row.synced != 0),
-        "bound": latest.as_ref().is_some_and(|row| row.bound != 0),
+        "onchain": onchain,
         "latest_hour": latest.as_ref().map(|row| row.hour),
         "price_scale": PRICE_SCALE,
-    })
+    });
+    if onchain {
+        meta["synced"] = json!(latest.as_ref().is_some_and(|row| row.synced != 0));
+        meta["bound"] = json!(latest.as_ref().is_some_and(|row| row.bound != 0));
+    }
+    meta
 }
 
 fn snapshot_json(snapshot: &PriceSnapshot, latest: Option<&PricePointRow>) -> Value {
-    json!({
+    let onchain = snapshot.source != PRICE_SOURCE_MARKET;
+    let mut value = json!({
         "latest": latest.map(point_json),
         "points": snapshot.points,
         "hour": latest.map(|row| row.hour),
         "timestamp": latest.map(|row| timestamp_string(row.hour)),
         "price_e8": latest.map(|row| row.price_e8),
         "price_usdt": latest.map(|row| price_usdt(row.price_e8)),
-        "append_tick": snapshot.append_tick,
-        "source_tick": snapshot.source_tick,
-        "epoch": snapshot.epoch,
         "source": snapshot.source,
         "source_name": source_name(snapshot.source),
+        "onchain": onchain,
         "stale": latest.is_some_and(|row| point_stale(row.flags)),
-        "synced": snapshot.synced,
-        "bound": snapshot.bound,
-        "series_digest": hex::encode(snapshot.series_digest),
         "observed_at": observed_string(snapshot.observed_at),
-    })
+    });
+    if onchain {
+        value["append_tick"] = json!(snapshot.append_tick);
+        value["source_tick"] = json!(snapshot.source_tick);
+        value["epoch"] = json!(snapshot.epoch);
+        value["synced"] = json!(snapshot.synced);
+        value["bound"] = json!(snapshot.bound);
+        value["series_digest"] = json!(hex::encode(snapshot.series_digest));
+    }
+    value
 }
 
 /// One point in the public response shape.
 pub fn point_json(row: &PricePointRow) -> Value {
+    if row.source == PRICE_SOURCE_MARKET {
+        return json!({
+            "hour": row.hour,
+            "timestamp": timestamp_string(row.hour),
+            "price_e8": row.price_e8,
+            "price_usdt": price_usdt(row.price_e8),
+            "source": row.source,
+            "source_name": source_name(row.source),
+            "onchain": false,
+            "stale": point_stale(row.flags),
+            "observed_at": observed_string(row.observed_at),
+        });
+    }
     json!({
         "hour": row.hour,
         "timestamp": timestamp_string(row.hour),
@@ -329,6 +358,7 @@ pub fn point_json(row: &PricePointRow) -> Value {
         "stale": point_stale(row.flags),
         "source": row.source,
         "source_name": source_name(row.source),
+        "onchain": true,
         "synced": row.synced != 0,
         "bound": row.bound != 0,
         "series_digest": hex::encode(row.series_digest),
@@ -1351,6 +1381,7 @@ mod tests {
         assert_eq!(body["data"]["price_e8"], 1_234_567_800i64);
         assert_eq!(body["data"]["source_tick"], 900);
         assert_eq!(body["data"]["epoch"], 42);
+        assert_eq!(body["data"]["onchain"], true);
         assert!(!body["data"]["filled"].as_bool().unwrap());
         assert!(!body["data"]["stale"].as_bool().unwrap());
         assert_eq!(body["data"]["series_digest"].as_str().unwrap().len(), 64);
@@ -1460,6 +1491,12 @@ mod tests {
         assert_eq!(body["data"]["price_e8"], 35);
         assert_eq!(body["data"]["source"], PRICE_SOURCE_MARKET);
         assert_eq!(body["data"]["source_name"], "external_market");
+        assert_eq!(body["data"]["onchain"], false);
+        assert!(body["data"]["epoch"].is_null());
+        assert!(body["data"]["append_tick"].is_null());
+        assert!(body["data"]["source_tick"].is_null());
+        assert!(body["data"]["series_digest"].is_null());
+        assert_eq!(body["meta"]["onchain"], false);
 
         let response = app
             .oneshot(
@@ -1477,6 +1514,8 @@ mod tests {
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["data"]["latest"]["price_e8"], 35);
         assert_eq!(body["meta"]["onchain"], false);
+        assert!(body["data"]["epoch"].is_null());
+        assert!(body["data"]["series_digest"].is_null());
         assert!(
             body["meta"]["warning"]
                 .as_str()
