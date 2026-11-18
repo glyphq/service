@@ -1,5 +1,7 @@
 //! ClickHouse-backed storage for the glyph indexer and API.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -150,6 +152,28 @@ pub struct NetworkStats {
     pub ingest: IngestCursor,
 }
 
+/// One time bucket produced by [`Store::activity_analytics`].
+///
+/// `bucket` is the start of the interval. Counts are deduplicated across
+/// replayed ticks, and `volume` is the sum of transaction amounts in the
+/// bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivityBucket {
+    pub bucket: DateTime<Utc>,
+    pub ticks: u64,
+    pub transactions: u64,
+    pub events: u64,
+    pub volume: i64,
+}
+
+/// Number of events of one `type_name` produced by
+/// [`Store::event_type_counts`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventTypeCount {
+    pub type_name: String,
+    pub count: u64,
+}
+
 /// Filters accepted by the transaction collection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransactionFilter {
@@ -237,6 +261,29 @@ pub trait Store: Send + Sync {
         offset: u64,
     ) -> Result<Vec<TransactionRow>>;
     async fn transaction(&self, hash: &str) -> Result<Option<TransactionRow>>;
+    /// Batch transaction lookup by hash. At most one row per hash is returned,
+    /// newest tick first. Unknown hashes are omitted.
+    ///
+    /// The default implementation issues one point read per hash. Stores with
+    /// native batch support override it.
+    async fn transactions_by_hashes(&self, hashes: &[String]) -> Result<Vec<TransactionRow>> {
+        let mut seen = HashSet::new();
+        let mut rows = Vec::new();
+        for hash in hashes {
+            if !seen.insert(hash.as_str()) {
+                continue;
+            }
+            if let Some(row) = self.transaction(hash).await? {
+                rows.push(row);
+            }
+        }
+        rows.sort_by(|a, b| {
+            b.tick
+                .cmp(&a.tick)
+                .then_with(|| a.tx_index.cmp(&b.tx_index))
+        });
+        Ok(rows)
+    }
     /// Transfers where `identity` is either the source or the destination.
     async fn transactions_for_identity(
         &self,
@@ -250,10 +297,26 @@ pub trait Store: Send + Sync {
     async fn recent_transactions(&self, limit: u32, offset: u64) -> Result<Vec<TransactionRow>>;
     async fn events_for_tick(&self, tick: u32, limit: u32, offset: u64) -> Result<Vec<EventRow>>;
     async fn identity(&self, identity: &str) -> Result<Option<IdentityRow>>;
+    /// Identities with the highest transfer counts, then highest balance,
+    /// then canonical identity.
+    async fn top_identities(&self, limit: u32) -> Result<Vec<IdentityRow>> {
+        let _ = limit;
+        Err(Error::Config(
+            "top_identities is not supported by this store".into(),
+        ))
+    }
     async fn stats(&self) -> Result<Value>;
 
     /// Newest ticks first, optionally restricted to one epoch.
     async fn ticks(&self, epoch: Option<u16>, limit: u32, offset: u64) -> Result<Vec<TickRow>>;
+    /// Ticks strictly newer than `tick`, oldest first. Used by streaming to
+    /// resume from the last delivered tick.
+    async fn ticks_after(&self, tick: u32, limit: u32) -> Result<Vec<TickRow>> {
+        let _ = (tick, limit);
+        Err(Error::Config(
+            "ticks_after is not supported by this store".into(),
+        ))
+    }
     /// Epoch summaries newest first, derived from `ticks`.
     async fn epochs(&self, limit: u32, offset: u64) -> Result<Vec<EpochRow>>;
     async fn epoch(&self, epoch: u16) -> Result<Option<EpochRow>>;
@@ -276,6 +339,27 @@ pub trait Store: Send + Sync {
         limit: u32,
         offset: u64,
     ) -> Result<Vec<EventRow>>;
+    /// Event counts grouped by `type_name`, most frequent first.
+    async fn event_type_counts(&self, limit: u32) -> Result<Vec<EventTypeCount>> {
+        let _ = limit;
+        Err(Error::Config(
+            "event_type_counts is not supported by this store".into(),
+        ))
+    }
+    /// Activity aggregated into `interval_seconds` buckets, newest first.
+    ///
+    /// A zero interval is treated as one second so callers cannot accidentally
+    /// request an unbounded number of buckets.
+    async fn activity_analytics(
+        &self,
+        interval_seconds: u32,
+        limit: u32,
+    ) -> Result<Vec<ActivityBucket>> {
+        let _ = (interval_seconds, limit);
+        Err(Error::Config(
+            "activity_analytics is not supported by this store".into(),
+        ))
+    }
     async fn network_stats(&self) -> Result<NetworkStats>;
 
     /// Persist a fully verified tick and advance the head cursor.
@@ -406,6 +490,29 @@ impl Store for ClickHouseStore {
         Ok(row.map(Into::into))
     }
 
+    async fn transactions_by_hashes(&self, hashes: &[String]) -> Result<Vec<TransactionRow>> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT ?fields FROM (
+    SELECT * FROM transactions
+    WHERE hash IN (?)
+    ORDER BY version DESC
+    LIMIT 1 BY hash
+)
+ORDER BY tick DESC, tx_index ASC
+"#,
+            )
+            .bind(hashes)
+            .fetch_all::<rows::TransactionSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     async fn transactions_for_identity(
         &self,
         identity: &str,
@@ -512,6 +619,21 @@ LIMIT ? OFFSET ?
         Ok(row.map(Into::into))
     }
 
+    async fn top_identities(&self, limit: u32) -> Result<Vec<IdentityRow>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM (\
+                     SELECT * FROM identities \
+                     ORDER BY version DESC LIMIT 1 BY identity\
+                 ) ORDER BY transfer_count DESC, balance DESC, identity ASC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all::<rows::IdentitySelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     async fn stats(&self) -> Result<Value> {
         let head = self.head().await?;
         // uniqExact on the sorting keys is exact and still avoids FINAL, so
@@ -576,6 +698,22 @@ LIMIT ? OFFSET ?
                     .await?
             }
         };
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn ticks_after(&self, tick: u32, limit: u32) -> Result<Vec<TickRow>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM (\
+                     SELECT * FROM ticks WHERE tick > ? \
+                     ORDER BY version DESC LIMIT 1 BY epoch, tick\
+                 ) ORDER BY tick ASC, epoch ASC LIMIT ?",
+            )
+            .bind(tick)
+            .bind(limit)
+            .fetch_all::<rows::TickSelect>()
+            .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
@@ -805,6 +943,88 @@ LIMIT ? OFFSET ?
             .bind(limit)
             .bind(offset)
             .fetch_all::<rows::EventSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn event_type_counts(&self, limit: u32) -> Result<Vec<EventTypeCount>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT type_name, count() AS n FROM (\
+                     SELECT type_name FROM events \
+                     ORDER BY version DESC LIMIT 1 BY epoch, log_id\
+                 ) GROUP BY type_name ORDER BY n DESC, type_name ASC LIMIT ?",
+            )
+            .bind(limit)
+            .fetch_all::<rows::EventTypeCountSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn activity_analytics(
+        &self,
+        interval_seconds: u32,
+        limit: u32,
+    ) -> Result<Vec<ActivityBucket>> {
+        // The three branches read one deduplicated projection of each table so
+        // a replayed tick contributes exactly once. The interval is bound as a
+        // value (not interpolated) and each count is widened to UInt64 so the
+        // union has one type per column.
+        let interval = i64::from(interval_seconds.max(1));
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT bucket,
+       sum(ticks) AS ticks,
+       sum(transactions) AS transactions,
+       sum(events) AS events,
+       sum(volume) AS volume
+FROM (
+    SELECT toStartOfInterval(timestamp, toIntervalSecond(?)) AS bucket,
+           count() AS ticks,
+           toUInt64(0) AS transactions,
+           toUInt64(0) AS events,
+           toInt64(0) AS volume
+    FROM (
+        SELECT timestamp FROM ticks
+        ORDER BY version DESC LIMIT 1 BY epoch, tick
+    )
+    GROUP BY bucket
+    UNION ALL
+    SELECT toStartOfInterval(timestamp, toIntervalSecond(?)) AS bucket,
+           toUInt64(0) AS ticks,
+           count() AS transactions,
+           toUInt64(0) AS events,
+           sum(amount) AS volume
+    FROM (
+        SELECT timestamp, amount FROM transactions
+        ORDER BY version DESC LIMIT 1 BY tick, tx_index
+    )
+    GROUP BY bucket
+    UNION ALL
+    SELECT toStartOfInterval(timestamp, toIntervalSecond(?)) AS bucket,
+           toUInt64(0) AS ticks,
+           toUInt64(0) AS transactions,
+           count() AS events,
+           toInt64(0) AS volume
+    FROM (
+        SELECT timestamp FROM events
+        ORDER BY version DESC LIMIT 1 BY epoch, log_id
+    )
+    GROUP BY bucket
+)
+GROUP BY bucket
+ORDER BY bucket DESC
+LIMIT ?
+"#,
+            )
+            .bind(interval)
+            .bind(interval)
+            .bind(interval)
+            .bind(limit)
+            .fetch_all::<rows::ActivityBucketSelect>()
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }

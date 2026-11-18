@@ -8,7 +8,10 @@ use chrono::{DateTime, Utc};
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
-use crate::{AssetRow, EpochRow, EventRow, IdentityRow, Result, TickRow, TransactionRow};
+use crate::{
+    ActivityBucket, AssetRow, EpochRow, EventRow, EventTypeCount, IdentityRow, Result, TickRow,
+    TransactionRow,
+};
 
 /// RowBinary encodes `FixedString(N)` as N raw bytes. Serde's array impl only
 /// covers lengths up to 32, so serialize byte arrays as fixed-length tuples.
@@ -266,6 +269,43 @@ impl From<AssetSelect> for AssetRow {
             issued_tick: row.issued_tick,
             log_id: row.log_id,
             timestamp: row.timestamp,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct ActivityBucketSelect {
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub bucket: DateTime<Utc>,
+    pub ticks: u64,
+    pub transactions: u64,
+    pub events: u64,
+    pub volume: i64,
+}
+
+impl From<ActivityBucketSelect> for ActivityBucket {
+    fn from(row: ActivityBucketSelect) -> Self {
+        Self {
+            bucket: row.bucket,
+            ticks: row.ticks,
+            transactions: row.transactions,
+            events: row.events,
+            volume: row.volume,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct EventTypeCountSelect {
+    pub type_name: String,
+    pub n: u64,
+}
+
+impl From<EventTypeCountSelect> for EventTypeCount {
+    fn from(row: EventTypeCountSelect) -> Self {
+        Self {
+            type_name: row.type_name,
+            count: row.n,
         }
     }
 }

@@ -148,6 +148,16 @@ ADD PROJECTION IF NOT EXISTS by_recent
 )
 "#;
 
+/// `event_type_counts` groups by `type_name`. The projection lets ClickHouse
+/// scan only that column in type order instead of the natural tick order.
+pub const CREATE_EVENTS_BY_TYPE: &str = r#"
+ALTER TABLE {database}.events
+ADD PROJECTION IF NOT EXISTS by_type
+(
+    SELECT * ORDER BY (type_name, epoch, log_id)
+)
+"#;
+
 pub const CREATE_IDENTITIES: &str = r#"
 CREATE TABLE IF NOT EXISTS {database}.identities
 (
@@ -163,6 +173,21 @@ CREATE TABLE IF NOT EXISTS {database}.identities
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY identity
+"#;
+
+pub const ALTER_IDENTITIES_SETTINGS: &str = r#"
+ALTER TABLE {database}.identities
+MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild'
+"#;
+
+/// `top_identities` orders by transfer count, so keep an activity-sorted copy
+/// that can be scanned from the high end for small limits.
+pub const CREATE_IDENTITIES_BY_ACTIVITY: &str = r#"
+ALTER TABLE {database}.identities
+ADD PROJECTION IF NOT EXISTS by_activity
+(
+    SELECT * ORDER BY (transfer_count, identity)
+)
 "#;
 
 /// Generic key/value cursor storage. Cursors are read with `ORDER BY version
@@ -193,7 +218,10 @@ pub const ALL: &[&str] = &[
     ALTER_EVENTS_SETTINGS,
     CREATE_EVENTS_BY_TICK,
     CREATE_EVENTS_RECENT,
+    CREATE_EVENTS_BY_TYPE,
     CREATE_IDENTITIES,
+    ALTER_IDENTITIES_SETTINGS,
+    CREATE_IDENTITIES_BY_ACTIVITY,
     CREATE_INGEST_STATE,
 ];
 

@@ -36,6 +36,12 @@ fn timestamp() -> DateTime<Utc> {
         .expect("valid timestamp")
 }
 
+fn timestamp_at(hour: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 11, 18, hour, 0, 0)
+        .single()
+        .expect("valid timestamp")
+}
+
 async fn test_store() -> Option<ClickHouseStore> {
     let store = ClickHouseStore::new(&clickhouse_url(), &unique_database())
         .expect("valid store configuration");
@@ -75,12 +81,16 @@ fn transfer(tick: u32, index: u16, hash: &str, source: &str, destination: &str) 
 }
 
 fn event(epoch: u16, tick: u32, log_id: u64, body: &str) -> EventRow {
+    event_typed(epoch, tick, log_id, "qu_transfer", body)
+}
+
+fn event_typed(epoch: u16, tick: u32, log_id: u64, type_name: &str, body: &str) -> EventRow {
     EventRow {
         epoch,
         tick,
         log_id,
         log_type: 0,
-        type_name: "qu_transfer".into(),
+        type_name: type_name.into(),
         tx_hash: format!("hash-{log_id}"),
         tx_index: log_id as i16,
         body: body.into(),
@@ -90,13 +100,22 @@ fn event(epoch: u16, tick: u32, log_id: u64, body: &str) -> EventRow {
 }
 
 fn identity(identity: &str, balance: i64, last_seen_tick: u32) -> IdentityRow {
+    identity_with_transfers(identity, balance, 1, last_seen_tick)
+}
+
+fn identity_with_transfers(
+    identity: &str,
+    balance: i64,
+    transfer_count: u64,
+    last_seen_tick: u32,
+) -> IdentityRow {
     IdentityRow {
         identity: identity.into(),
         public_key: format!("0x{}", "ab".repeat(32)),
         balance,
         incoming_amount: balance.max(0),
         outgoing_amount: (-balance).max(0),
-        transfer_count: 1,
+        transfer_count,
         first_seen_tick: 1,
         last_seen_tick,
     }
@@ -473,6 +492,160 @@ async fn rejecting_mismatched_rows_writes_nothing() {
 }
 
 #[tokio::test]
+async fn advanced_reads_are_ordered_deduped_and_bucketed() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    let mut tick_99 = TickBatch::new(1, 99, timestamp_at(11), 7, "quorum");
+    tick_99.transactions = vec![transfer(99, 0, "hash-d", "D", "E")];
+    tick_99.transactions[0].amount = 5;
+    tick_99.events = vec![event_typed(1, 99, 30, "oracle", "saw-99")];
+    store.write_tick(&tick_99).await.expect("write tick 99");
+
+    let mut tick_100 = TickBatch::new(1, 100, timestamp_at(12), 7, "quorum");
+    tick_100.transactions = vec![
+        transfer(100, 0, "hash-a", "AAAA", "DST"),
+        transfer(100, 1, "hash-b", "BBBB", "DST"),
+    ];
+    tick_100.transactions[0].amount = 10;
+    tick_100.transactions[1].amount = 20;
+    tick_100.events = vec![
+        event_typed(1, 100, 10, "qu_transfer", "saw-100"),
+        event_typed(1, 100, 11, "asset_issuance", "issued-100"),
+    ];
+    tick_100.identities = vec![
+        identity_with_transfers("AAAA", 100, 5, 100),
+        identity_with_transfers("BBBB", 200, 2, 100),
+    ];
+    store.write_tick(&tick_100).await.expect("write tick 100");
+
+    let mut tick_101 = TickBatch::new(1, 101, timestamp_at(13), 7, "quorum");
+    tick_101.transactions = vec![transfer(101, 0, "hash-c", "AAAA", "DST")];
+    tick_101.transactions[0].amount = 30;
+    tick_101.events = vec![event_typed(1, 101, 20, "qu_transfer", "saw-101")];
+    tick_101.identities = vec![
+        identity_with_transfers("AAAA", 150, 7, 101),
+        identity_with_transfers("CCCC", 300, 9, 101),
+    ];
+    store.write_tick(&tick_101).await.expect("write tick 101");
+
+    // Batch hash lookup collapses duplicate hashes and sorts newest first.
+    let hashes = vec![
+        "hash-a".to_string(),
+        "hash-c".to_string(),
+        "hash-c".to_string(),
+        "missing".to_string(),
+    ];
+    let found = store
+        .transactions_by_hashes(&hashes)
+        .await
+        .expect("batch hashes");
+    let order = found.iter().map(|tx| tx.hash.as_str()).collect::<Vec<_>>();
+    assert_eq!(order, vec!["hash-c", "hash-a"]);
+    assert_eq!(found[0].amount, 30);
+    assert!(store.transactions_by_hashes(&[]).await.unwrap().is_empty());
+
+    // Streaming resumes strictly after the last delivered tick, oldest first.
+    let after = store.ticks_after(100, 10).await.expect("ticks after");
+    assert_eq!(
+        after.iter().map(|row| row.tick).collect::<Vec<_>>(),
+        vec![101]
+    );
+    let page = store.ticks_after(98, 2).await.expect("ticks after page");
+    assert_eq!(
+        page.iter().map(|row| row.tick).collect::<Vec<_>>(),
+        vec![99, 100]
+    );
+    assert!(store.ticks_after(101, 10).await.unwrap().is_empty());
+
+    // Top identities use the latest snapshot and rank by transfer count.
+    let top = store.top_identities(2).await.expect("top identities");
+    assert_eq!(
+        top.iter()
+            .map(|row| (row.identity.as_str(), row.transfer_count))
+            .collect::<Vec<_>>(),
+        vec![("CCCC", 9), ("AAAA", 7)]
+    );
+    assert_eq!(top[1].balance, 150);
+
+    let types = store.event_type_counts(10).await.expect("event types");
+    assert_eq!(
+        types
+            .iter()
+            .map(|row| (row.type_name.as_str(), row.count))
+            .collect::<Vec<_>>(),
+        vec![("qu_transfer", 2), ("asset_issuance", 1), ("oracle", 1)]
+    );
+    assert_eq!(store.event_type_counts(1).await.unwrap().len(), 1);
+
+    let hourly = store
+        .activity_analytics(3600, 10)
+        .await
+        .expect("hourly analytics");
+    assert_eq!(hourly.len(), 3);
+    assert_eq!(hourly[0].bucket, timestamp_at(13));
+    assert_eq!(
+        (
+            hourly[0].ticks,
+            hourly[0].transactions,
+            hourly[0].events,
+            hourly[0].volume
+        ),
+        (1, 1, 1, 30)
+    );
+    assert_eq!(
+        (
+            hourly[1].ticks,
+            hourly[1].transactions,
+            hourly[1].events,
+            hourly[1].volume
+        ),
+        (1, 2, 2, 30)
+    );
+    assert_eq!((hourly[2].ticks, hourly[2].volume), (1, 5));
+
+    let limited = store.activity_analytics(3600, 2).await.unwrap();
+    assert_eq!(limited.len(), 2);
+    assert_eq!(limited[0].bucket, timestamp_at(13));
+    assert_eq!(limited[1].bucket, timestamp_at(12));
+
+    let daily = store.activity_analytics(86_400, 10).await.unwrap();
+    assert_eq!(daily.len(), 1);
+    assert_eq!(
+        (
+            daily[0].ticks,
+            daily[0].transactions,
+            daily[0].events,
+            daily[0].volume
+        ),
+        (3, 4, 4, 65)
+    );
+
+    // A zero interval is clamped to one second instead of failing.
+    assert_eq!(store.activity_analytics(0, 10).await.unwrap().len(), 3);
+
+    // Replaying a tick must not inflate any aggregate.
+    store.write_tick(&tick_100).await.expect("replay tick 100");
+    let replayed = store.activity_analytics(86_400, 10).await.unwrap();
+    assert_eq!(replayed[0].ticks, 3);
+    assert_eq!(replayed[0].transactions, 4);
+    assert_eq!(replayed[0].events, 4);
+    assert_eq!(
+        store
+            .event_type_counts(10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.count)
+            .sum::<u64>(),
+        4
+    );
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
 async fn initializes_the_real_glyph_database() {
     let store =
         ClickHouseStore::new(&clickhouse_url(), "glyph").expect("valid store configuration");
@@ -541,6 +714,12 @@ async fn schema_creates_named_read_projections() {
     let events = show_create(&store, "events").await;
     assert!(events.contains("by_tick"));
     assert!(events.contains("by_recent"));
+    assert!(events.contains("by_type"));
+    assert!(
+        show_create(&store, "identities")
+            .await
+            .contains("by_activity")
+    );
 
     store.drop_database().await.expect("drop test database");
 }
