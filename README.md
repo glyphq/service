@@ -28,15 +28,16 @@ protocol as the source of truth:
 - Live indexing from direct Qubic peers, with bounded concurrent fetch and ordered
   writes.
 - Quorum and data verification tiers. Every stored tick records the tier it reached.
-- Raw tick archive as zstd-compressed QBB1 bundles on local disk or S3/MinIO.
+- Raw tick archive as zstd-compressed QBB1 bundles on local disk or any S3-compatible store.
 - REST resources for ticks, transactions, events, identities, wallets, assets, epochs,
   the on-chain QUBIC/USDT price, analytics, search, and network status.
 - SSE and WebSocket streams that follow the verified local head.
 - Optional direct-peer routes for entity lookup, transaction status, contract queries,
   and signed transaction broadcast.
 - A server-rendered status dashboard at `/status` and a Scalar API reference at `/docs`.
-- Docker Compose deployment with ClickHouse, MinIO, schema migration, API, and indexer,
-  plus local scripts for development without Docker.
+- Docker Compose deployment with ClickHouse, SeaweedFS S3, schema migration, API, and
+  indexer, plus a no-Compose runner for Container-Optimized hosts and local scripts for
+  development without Docker.
 
 ## Quick start
 
@@ -97,12 +98,12 @@ The API listens on `127.0.0.1:8080` by default.
 | --- | --- | --- | --- |
 | OS | Linux x86_64/aarch64 or macOS | Linux x86_64 | Windows works through WSL. Dev scripts assume Bash. |
 | Rust | 1.85 | Current stable | The Docker image pins 1.88. |
-| ClickHouse | 26.x | 26.11 or newer | Local binary or Compose service. |
+| ClickHouse | 25.8 LTS or newer | Current stable | Local binary or Compose service. |
 | Memory | 2 GB | 16 GB | 8 GB is workable for the full stack. |
 | CPU | 2 vCPU | 4 vCPU | Live ingestion is I/O-bound. Signature verification and ClickHouse merges use the rest. |
 | Disk | 20 GB free | Sized per retained epoch | About 16 GB of indexed data per epoch. Budget 20 GB per epoch. |
 | Network | Outbound TCP | Low-latency route to peers | Qubic core peers use port `21841`; Bob peers use `21842`. |
-| Local ports | `8080`, `8123`, `9000` | Same | API, ClickHouse HTTP, ClickHouse native or MinIO S3. All are configurable. |
+| Local ports | `8080`, `8123`, `8333` | Same | API, ClickHouse HTTP, S3-compatible API. All are configurable. |
 
 An epoch is 604,800 ticks. At current activity, a sizing run of 1,000 ticks measured
 about 26 MB with the schema and its projections, or roughly **16 GB per epoch**. Raw
@@ -158,7 +159,7 @@ The most common variables are below. The full list is in
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval |
 | `PRICE_POLL_MS` | `60000` | Live price feed refresh interval |
 | `ARCHIVE_DIR` | unset | Filesystem raw archive when S3 is unset |
-| `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PREFIX` | unset | Raw archive to S3/MinIO |
+| `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PREFIX` | unset | Raw archive to any S3-compatible store |
 | `ARCHIVE_FAIL_CLOSED` | `false` | Fail a tick instead of indexing when archiving fails |
 
 Peer selection starts from the configured seeds. `NodePool::connect_best` picks the

@@ -2,14 +2,14 @@
 
 This document describes the single-host Docker Compose deployment. It runs the
 same two long-running processes as the development stack, with ClickHouse and
-MinIO as dependencies:
+SeaweedFS S3 as dependencies:
 
 | Process | Binary | Role |
 | --- | --- | --- |
 | API | `glyph-api` | HTTP API. Reads ClickHouse; optional peer-backed routes and broadcast connect directly to Qubic peers. |
 | Indexer | `glyph sync` | Fetches and verifies peer ticks, writes ClickHouse. |
 | ClickHouse | `clickhouse-server` | Shared analytical store and ingest checkpoint. |
-| MinIO | `minio` | S3-compatible storage, provisioned for the raw archive. |
+| SeaweedFS | `seaweedfs` | S3-compatible storage, provisioned for the raw archive. |
 
 The deployment is intentionally a single host with one indexer. ClickHouse is a
 single node and the indexer owns the write path. Scale API replicas only behind
@@ -18,7 +18,7 @@ a load balancer; see [Scaling the API](#scaling-the-api).
 ## Prerequisites
 
 - Docker Engine 24 or newer with the Compose v2 plugin (`docker compose`).
-- 8 GB of RAM is the practical minimum for ClickHouse, MinIO, the API, and the
+- 8 GB of RAM is the practical minimum for ClickHouse, SeaweedFS, the API, and the
   indexer together; 16 GB is recommended for production. Two vCPUs are workable
   for testing, but 4 vCPUs are recommended for full signature verification,
   ClickHouse merges, and API traffic at the same time.
@@ -40,7 +40,7 @@ the unprivileged `glyph` user (`uid 10001`).
 ## Quick start
 
 ```bash
-# Build the image, start ClickHouse, MinIO, the schema migration, the API, and
+# Build the image, start ClickHouse, SeaweedFS, the schema migration, the API, and
 # the indexer, then wait for their healthchecks.
 scripts/docker-up.sh
 
@@ -62,7 +62,7 @@ scripts/docker-down.sh
 # or: docker compose down
 ```
 
-Stop and delete ClickHouse, MinIO, and log volumes. This is irreversible:
+Stop and delete ClickHouse, SeaweedFS, and log volumes. This is irreversible:
 
 ```bash
 scripts/docker-down.sh --wipe
@@ -112,29 +112,37 @@ and the stack is reachable only from the same machine.
 | `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before an idle partial batch is flushed. |
 | `INDEXER_DISCOVER_PEERS` | `false` | Append IPv4 peers advertised through `ExchangePublicPeers`, using port `21841`. |
 | `GLYPH_VERIFY_SIGNATURES` | `true` | Set `false` to skip SchnorrQ checks. Keep enabled for live ingest. |
-| `S3_ENDPOINT` | `http://minio:9000` | S3 endpoint inside the Compose network, passed to the archive client and `minio-init`. |
-| `S3_BUCKET` | `glyph-archive` | Bucket created by `minio-init` and used by the archive client. |
-| `S3_ACCESS_KEY` | `glyph` | MinIO root user and S3 access key. |
-| `S3_SECRET_KEY` | `glyph-dev-secret` | MinIO root password and S3 secret key. Must be at least 8 characters. |
-| `S3_REGION` | `us-east-1` | S3 region. MinIO accepts the default. |
+| `S3_ENDPOINT` | `http://seaweedfs:8333` | S3 endpoint inside the Compose network, passed to the archive client and `s3-init`. |
+| `S3_BUCKET` | `glyph-archive` | Bucket created by `s3-init` and used by the archive client. |
+| `S3_ACCESS_KEY` | `glyph` | SeaweedFS identity access key. |
+| `S3_SECRET_KEY` | `glyph-dev-secret` | SeaweedFS identity secret key. Must be at least 8 characters. |
+| `S3_REGION` | `us-east-1` | S3 region. SeaweedFS accepts the default. |
+| `S3_PORT` | `8333` | Host loopback port for the SeaweedFS S3 API. |
+| `CLICKHOUSE_USER` | `glyph` | ClickHouse user created by the image entrypoint. |
+| `CLICKHOUSE_PASSWORD` | `glyph-dev-secret` | ClickHouse password. `CLICKHOUSE_URL` must embed the same credentials. |
 | `ARCHIVE_FAIL_CLOSED` | `false` | Set `true` to stop ingestion when a bundle cannot be archived. |
-| `MINIO_PORT` | `9000` | Host loopback port for the MinIO S3 API. |
-| `MINIO_CONSOLE_PORT` | `9001` | Host loopback port for the MinIO console. |
 | `GLYPH_IMAGE` | `glyph:local` | Image tag built and used by all glyph services. |
 | `GLYPH_API_LOG` | `info,tower_http=info` | `RUST_LOG` for the API. |
 | `GLYPH_INDEXER_LOG` | `info` | `RUST_LOG` for the indexer. |
 | `GLYPH_MIGRATE_LOG` | `info` | `RUST_LOG` for the one-shot migration. |
 
 `CLICKHOUSE_URL` and `S3_ENDPOINT` are resolved inside the glyph containers.
-Keep the Compose service names (`clickhouse`, `minio`); `127.0.0.1` would point
-at the container itself. Use `API_HOST`/`API_PORT` and the published ClickHouse
-and MinIO ports to reach the stack from the host.
+Keep the Compose service names (`clickhouse`, `seaweedfs`); `127.0.0.1` would
+point at the container itself. The default URL embeds `CLICKHOUSE_USER` and
+`CLICKHOUSE_PASSWORD`; change all three together. Use `API_HOST`/`API_PORT` and
+the published ClickHouse and S3 ports to reach the stack from the host.
 
 The `migrate` service runs `glyph db-init` on every start. The DDL is
 `CREATE ... IF NOT EXISTS`, so it is idempotent and safe to rerun.
 
-`minio-init` creates the archive bucket, enables versioning, and removes any
-anonymous policy. It is also idempotent. The indexer writes one
+On a fresh database the indexer starts from the current epoch initial tick. Peers
+prune old tick data after a few thousand ticks, so set `GLYPH_FROM_TICK` to a
+recent retained tick when bootstrapping after that point. Find one with
+`glyph tick <tick> --peer <addr>`; the indexer logs `peer returned end response`
+and retries forever if the requested tick is gone. Once the first batch is
+stored, the cursor takes over and `GLYPH_FROM_TICK` is ignored.
+
+`s3-init` creates the archive bucket. It is idempotent. The indexer writes one
 zstd-compressed QBB1 bundle per verified tick before persisting that tick, using
 the S3 variables from the shared application environment. The API exposes the
 same objects through `GET /v1/ticks/{tick}/raw`.
@@ -157,9 +165,9 @@ scripts/docker-up.sh --peer 1.2.3.4:21841 --peer 5.6.7.8:21841
 
 | Service | Image | Published | Healthcheck |
 | --- | --- | --- | --- |
-| `clickhouse` | `clickhouse/clickhouse-server:26.11` | `127.0.0.1:${CLICKHOUSE_HTTP_PORT}` | `clickhouse-client --query "SELECT 1"` |
-| `minio` | `minio/minio:latest` | `127.0.0.1:${MINIO_PORT}`, `127.0.0.1:${MINIO_CONSOLE_PORT}` | `GET /minio/health/live` |
-| `minio-init` | `minio/mc:latest` | none, one-shot | exit status |
+| `clickhouse` | `clickhouse/clickhouse-server:25.8` | `127.0.0.1:${CLICKHOUSE_HTTP_PORT}` | `clickhouse-client --user ... --query "SELECT 1"` |
+| `seaweedfs` | `chrislusf/seaweedfs:latest` | `127.0.0.1:${S3_PORT}` | S3 bucket bootstrap |
+| `s3-init` | `amazon/aws-cli:latest` | none, one-shot | exit status |
 | `migrate` | local `glyph:local` image | none, one-shot | exit status |
 | `api` | local `glyph:local` image | `${API_HOST}:${API_PORT}` | `GET /healthz` |
 | `indexer` | local `glyph:local` image | none | process liveness (`kill -0 1`) |
@@ -168,7 +176,7 @@ Startup order:
 
 1. ClickHouse becomes healthy.
 2. `migrate` runs `glyph db-init` and exits successfully.
-3. MinIO becomes healthy; `minio-init` creates and versions the archive bucket.
+3. SeaweedFS starts; `s3-init` creates the archive bucket.
 4. API and indexer start. The API becomes healthy on `/healthz`; the indexer
    healthcheck starts after a 30 second start period.
 
@@ -191,7 +199,7 @@ Compose file uses `api`, `indexer`, and `glyph db-init` respectively.
 | --- | --- | --- |
 | `glyph_clickhouse-data` | `/var/lib/clickhouse` | Canonical tables, projections, and the ingest checkpoint. |
 | `glyph_clickhouse-logs` | `/var/log/clickhouse-server` | ClickHouse server logs. |
-| `glyph_minio-data` | `/data` | Raw archive bucket objects. |
+| `glyph_seaweedfs-data` | `/data` | Raw archive bucket objects. |
 
 ClickHouse is the required online state. Deleting its volume loses the index and
 the checkpoint. The raw archive preserves the verified bundle for every tick
@@ -366,9 +374,9 @@ checkpoint and duplicate writes, though writes are idempotent.
   in `QUBIC_PEERS`; the indexer fails over across configured peers.
 - Log rotation: service logs use the `json-file` driver with a 10 MB limit and
   three files per container. ClickHouse's own logs are in a volume.
-- Image tags: `clickhouse/clickhouse-server:26.11` is pinned. `minio/minio` and
-  `minio/mc` use `latest`; pin release tags for reproducible production builds.
-  The MinIO healthcheck assumes `curl` exists in the server image.
+- Image tags: `clickhouse/clickhouse-server:25.8` is pinned. `chrislusf/seaweedfs`
+  and `amazon/aws-cli` use `latest`; pin release tags for reproducible production
+  builds.
 
 ## Security
 
@@ -379,12 +387,11 @@ platform.
   `ALLOW_BROADCAST=true`; peer-backed routes only read peer state. It has
   permissive CORS, no API keys, and no rate limit by default. Put it behind an
   authenticating reverse proxy if it is not on a trusted network.
-- ClickHouse is published only on `127.0.0.1` and uses its default user with no
-  password. The application does not currently support ClickHouse credentials.
-  Never expose ports `8123` or `9000` publicly.
-- MinIO ports are published only on `127.0.0.1`. Change `S3_SECRET_KEY` before
-  putting the host on an untrusted network. The bucket is private;
-  `minio-init` removes anonymous access.
+- ClickHouse is published only on `127.0.0.1` and uses the credentials embedded
+  in `CLICKHOUSE_URL`. The HTTP connection is not TLS inside the Docker network.
+  Never expose port `8123` publicly.
+- S3 ports are published only on `127.0.0.1`. Change `S3_SECRET_KEY` and
+  `CLICKHOUSE_PASSWORD` before putting the host on an untrusted network.
 - Peer traffic is outbound only. Peer data is untrusted and is verified before
   it is stored.
 - The container runs as a non-root user (`uid 10001`).
@@ -404,8 +411,8 @@ platform.
 | Indexer restart loops | `docker compose logs indexer`; confirm `QUBIC_PEERS` addresses are reachable and use port `21841` (or `21842` for Bob peers). |
 | API returns 500 on `/v1/status` | ClickHouse is down or the schema is missing. Run `docker compose run --rm migrate`. |
 | No indexed head after a few minutes | Check the indexer log. The first tick comes from the current epoch; a stale or unreachable peer fails over. Try another `--peer`. |
-| `minio-init` fails with a credential error | `S3_ACCESS_KEY` and `S3_SECRET_KEY` must be identical for `minio` and `minio-init`; the secret must be at least 8 characters. |
-| Port already allocated | Another local stack or the dev scripts own `8080`, `8123`, `9000`, or `9001`. Stop it or change `API_PORT`, `CLICKHOUSE_HTTP_PORT`, `MINIO_PORT`, `MINIO_CONSOLE_PORT`. |
+| `s3-init` fails with a credential error | `S3_ACCESS_KEY` and `S3_SECRET_KEY` are written into the shared SeaweedFS config; check the `s3-config` service logs. |
+| Port already allocated | Another local stack or the dev scripts own `8080`, `8123`, or `8333`. Stop it or change `API_PORT`, `CLICKHOUSE_HTTP_PORT`, `S3_PORT`. |
 | API reachable inside the container but not from the host | Keep `BIND=0.0.0.0:8080` and change the host side with `API_HOST`/`API_PORT`. |
 | Disk fills up | Drop old epoch partitions or add disk. Do not delete ClickHouse files under a running server. |
 
@@ -473,3 +480,65 @@ curl -fsS https://api.glyphq.org/v1/status | jq .data.head
 The indexer is the only writer. Never run two indexers against the same
 ClickHouse database. To upgrade, replace the binaries and restart in order:
 `glyph-indexer`, then `glyph-api`.
+
+## Continuous deployment
+
+`.github/workflows/deploy.yml` deploys every push to `main`:
+
+1. Build the runtime image with BuildKit and a GitHub Actions layer cache.
+2. Smoke-test the image with `glyph --version`.
+3. `docker save | gzip` the image and copy it to the server over SSH.
+4. Load the image and run `bash deploy/docker/run-stack.sh up`.
+5. Poll `https://api.glyphq.org/healthz` until it returns `200`.
+
+The workflow needs these repository secrets:
+
+| Secret | Example | Meaning |
+| --- | --- | --- |
+| `DEPLOY_HOST` | `34.107.41.199` | Server address |
+| `DEPLOY_USER` | `alexgeminilabs` | SSH user in the `docker` group |
+| `DEPLOY_PATH` | `/home/alexgeminilabs/glyph` | Writable deployment directory |
+| `DEPLOY_SSH_KEY` | private key text | Key authorized for `DEPLOY_USER` |
+| `HEALTHCHECK_URL` | `https://api.glyphq.org/healthz` | Optional public check |
+
+Set them with the GitHub CLI:
+
+```bash
+gh secret set DEPLOY_HOST --body 203.0.113.10
+gh secret set DEPLOY_USER --body deploy
+gh secret set DEPLOY_PATH --body /home/deploy/glyph
+gh secret set HEALTHCHECK_URL --body https://api.glyphq.org/healthz
+gh secret set DEPLOY_SSH_KEY < deploy_key
+```
+
+The server needs Docker and outbound access to Docker Hub and Qubic peers. The
+first deployment must be run once by hand:
+
+```bash
+cd "$DEPLOY_PATH"
+bash deploy/docker/run-stack.sh up
+```
+
+### Hosts without an executable home
+
+GCP Container-Optimized OS mounts `/home` and `/mnt/stateful_partition` with
+`noexec`, and the root filesystem is read-only. The Compose plugin cannot run
+there. `deploy/docker/run-stack.sh` is the supported path: it uses plain
+`docker run`, keeps data in named volumes, and only needs the source directory
+for `deploy/Caddyfile.docker` and `deploy/docker/run-stack.sh`.
+
+Always invoke it as `bash deploy/docker/run-stack.sh ...`; do not rely on the
+script's executable bit on a `noexec` mount.
+
+The stack exposes:
+
+| Port | Scope | Service |
+| --- | --- | --- |
+| `80`, `443` | Public | Caddy TLS termination |
+| `8080` | Loopback | API |
+| `8123` | Loopback | ClickHouse HTTP |
+| `8333` | Loopback | SeaweedFS S3 |
+
+Open GCP firewall ports `80` and `443` before the first Caddy start. Caddy
+obtains a Let's Encrypt certificate for `api.glyphq.org`; the DNS A record must
+already point at the host.
