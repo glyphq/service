@@ -1,12 +1,17 @@
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
+use qubic::messages::RespondEntity;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use store::{EventFilter, TransactionFilter};
 
@@ -16,6 +21,95 @@ use crate::{ApiError, AppState};
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const RECENT: &str = "public, max-age=2, stale-while-revalidate=5";
 const AGGREGATE: &str = "public, max-age=30, stale-while-revalidate=60";
+/// Maximum concurrent peer spectrum lookups used to enrich top identities.
+const TOP_IDENTITY_CONCURRENCY: usize = 8;
+/// A single peer lookup must not hold the analytics request open.
+const TOP_IDENTITY_PEER_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// Enrichment is best effort; after this budget every missed row falls back to
+/// its indexed values instead of delaying the response.
+const TOP_IDENTITY_BUDGET: Duration = Duration::from_secs(4);
+const LOGO_DARK_PNG: &[u8] = include_bytes!("../assets/logo-dark.png");
+const LOGO_LIGHT_PNG: &[u8] = include_bytes!("../assets/logo-light.png");
+const FAVICON_PNG: &[u8] = include_bytes!("../assets/favicon.png");
+
+/// [`axum::extract::Path`] with API error responses.
+///
+/// The built-in extractor rejects malformed path segments with `text/plain`,
+/// which makes numeric path parameters the one place where the API does not
+/// return problem JSON. Routing extraction failures through [`ApiError`] keeps
+/// the error contract consistent across the surface.
+struct Path<T>(T);
+
+/// [`axum::extract::Query`] with API error responses.
+struct Query<T>(T);
+
+impl<T, S> FromRequestParts<S> for Path<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        axum::extract::Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Path(value)| Self(value))
+            .map_err(|rejection| ApiError::bad_request(rejection.to_string()))
+    }
+}
+
+impl<T, S> FromRequestParts<S> for Query<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        axum::extract::Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Query(value)| Self(value))
+            .map_err(|rejection| ApiError::bad_request(rejection.to_string()))
+    }
+}
+
+const DOCS_BRAND: &str = r#"<style>
+.glyph-brand { display: flex; align-items: center; gap: 8px; padding: 14px 14px 2px; font: 500 14px/1.2 var(--scalar-font, ui-sans-serif, system-ui, sans-serif); color: var(--scalar-sidebar-color-1, #fff); text-decoration: none; }
+.glyph-brand:hover { color: var(--scalar-sidebar-color-active, #fff); }
+.glyph-brand__mark { display: block; width: 22px; height: 22px; }
+.glyph-brand__mark--light { display: none; }
+.light-mode .glyph-brand__mark--dark { display: none; }
+.light-mode .glyph-brand__mark--light { display: block; }
+.glyph-brand__suffix { color: var(--scalar-sidebar-color-2, #999); font-weight: 400; }
+</style>
+<script>
+(() => {
+  let observer;
+  const mount = () => {
+    const sidebar = document.querySelector('aside[aria-label^="Sidebar"]');
+    if (!sidebar) return false;
+    if (sidebar.querySelector(".glyph-brand")) {
+      observer?.disconnect();
+      return true;
+    }
+    const link = document.createElement("a");
+    link.className = "glyph-brand";
+    link.href = "https://glyphq.org";
+    link.target = "_blank";
+    link.rel = "noreferrer";
+    link.setAttribute("aria-label", "Glyph");
+    link.innerHTML = '<img class="glyph-brand__mark glyph-brand__mark--dark" src="/logo.png" alt="" width="22" height="22">'
+      + '<img class="glyph-brand__mark glyph-brand__mark--light" src="/logo-light.png" alt="" width="22" height="22">'
+      + '<span>Glyph <span class="glyph-brand__suffix">API</span></span>';
+    sidebar.prepend(link);
+    observer?.disconnect();
+    return true;
+  };
+  observer = new MutationObserver(mount);
+  observer.observe(document.body, { childList: true, subtree: true });
+  mount();
+})();
+</script>"#;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -490,7 +584,7 @@ async fn transaction(
     State(state): State<AppState>,
     Path(hash): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let hash = hash.to_ascii_lowercase();
+    let hash = hash.trim().to_ascii_lowercase();
     let _ =
         qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
     let row = state
@@ -511,17 +605,23 @@ async fn transactions_batch(
     if body.hashes.is_empty() {
         return Err(ApiError::bad_request("hashes must not be empty"));
     }
-    if body.hashes.len() > 100 {
-        return Err(ApiError::bad_request("at most 100 hashes per request"));
-    }
+    // The limit applies to unique hashes, so a caller may submit duplicates of
+    // a small working set without tripping the cap.
     let mut hashes = Vec::with_capacity(body.hashes.len());
     let mut seen = HashSet::new();
     for value in body.hashes {
         let hash = value.trim().to_ascii_lowercase();
-        qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
         if seen.insert(hash.clone()) {
             hashes.push(hash);
+            if hashes.len() > 100 {
+                return Err(ApiError::bad_request(
+                    "at most 100 unique hashes per request",
+                ));
+            }
         }
+    }
+    for hash in &hashes {
+        qubic::decode_tx_hash(hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
     }
     let rows = state.store.transactions_by_hashes(&hashes).await?;
     let found: HashMap<String, store::TransactionRow> = rows
@@ -790,12 +890,17 @@ async fn search(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request("query parameter q is required"))?;
 
+    let mut data = Vec::new();
+
     if query.chars().all(|c| c.is_ascii_digit()) {
         if let Ok(tick) = query.parse::<u32>() {
             if let Some(row) = state.store.tick(tick).await? {
-                return Ok(Json(json!({
-                    "data": [{ "type": "tick", "tick": tick, "value": row }]
-                })));
+                data.push(json!({ "type": "tick", "tick": tick, "value": row }));
+            }
+        }
+        if let Ok(epoch) = query.parse::<u16>() {
+            if let Some(row) = state.store.epoch(epoch).await? {
+                data.push(json!({ "type": "epoch", "epoch": epoch, "value": row }));
             }
         }
     }
@@ -803,22 +908,39 @@ async fn search(
     let lower = query.to_ascii_lowercase();
     if qubic::decode_tx_hash(&lower).is_ok() {
         if let Some(row) = state.store.transaction(&lower).await? {
-            return Ok(Json(json!({
-                "data": [{ "type": "transaction", "value": row }]
-            })));
+            data.push(json!({ "type": "transaction", "value": row }));
         }
     }
 
     let upper = query.to_ascii_uppercase();
     if qubic::PublicKey::from_identity(&upper).is_ok() {
         if let Some(row) = state.store.identity(&upper).await? {
-            return Ok(Json(json!({
-                "data": [{ "type": "identity", "value": row }]
-            })));
+            data.push(json!({ "type": "identity", "value": row }));
         }
     }
 
-    Ok(Json(json!({ "data": [] })))
+    if let Some((issuer, name)) = query.split_once('/') {
+        let issuer = issuer.trim().to_ascii_uppercase();
+        let name = name.trim().to_ascii_uppercase();
+        let valid_name = !name.is_empty()
+            && name.len() <= 7
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase());
+        if valid_name && qubic::PublicKey::from_identity(&issuer).is_ok() {
+            if let Some(row) = state.store.asset(&issuer, &name).await? {
+                data.push(json!({ "type": "asset", "value": row }));
+            }
+        }
+    }
+
+    Ok((
+        [(header::CACHE_CONTROL, RECENT)],
+        Json(json!({
+            "data": data,
+            "meta": { "query": query, "count": data.len() },
+        })),
+    ))
 }
 
 async fn analytics_activity(
@@ -837,15 +959,186 @@ async fn analytics_activity(
     ))
 }
 
+/// A live spectrum entity value read from a peer.
+///
+/// The indexed `balance` is the net QU flow observed in the indexed epoch
+/// range, which is not the same thing as the balance stored in the spectrum.
+/// Keeping both values distinct lets clients (and the response `meta`) say
+/// which number they are looking at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SpectrumBalance {
+    public_key: String,
+    balance: i64,
+    incoming_amount: i64,
+    outgoing_amount: i64,
+    incoming_transfers: u32,
+    outgoing_transfers: u32,
+    latest_incoming_tick: u32,
+    latest_outgoing_tick: u32,
+    spectrum_index: i32,
+    tick: u32,
+}
+
+impl SpectrumBalance {
+    /// Returns `None` when the peer has no spectrum entry for the identity,
+    /// which is reported as a negative spectrum index.
+    fn from_response(response: RespondEntity) -> Option<Self> {
+        if response.spectrum_index < 0 {
+            return None;
+        }
+        let entity = response.entity;
+        Some(Self {
+            public_key: qubic::PublicKey(entity.public_key).to_hex(),
+            balance: entity
+                .incoming_amount
+                .saturating_sub(entity.outgoing_amount),
+            incoming_amount: entity.incoming_amount,
+            outgoing_amount: entity.outgoing_amount,
+            incoming_transfers: entity.number_of_incoming_transfers,
+            outgoing_transfers: entity.number_of_outgoing_transfers,
+            latest_incoming_tick: entity.latest_incoming_transfer_tick,
+            latest_outgoing_tick: entity.latest_outgoing_transfer_tick,
+            spectrum_index: response.spectrum_index,
+            tick: response.tick,
+        })
+    }
+
+    fn value(&self) -> Value {
+        json!({
+            "public_key": self.public_key,
+            "balance": self.balance,
+            "incoming_amount": self.incoming_amount,
+            "outgoing_amount": self.outgoing_amount,
+            "incoming_transfers": self.incoming_transfers,
+            "outgoing_transfers": self.outgoing_transfers,
+            "latest_incoming_tick": self.latest_incoming_tick,
+            "latest_outgoing_tick": self.latest_outgoing_tick,
+            "spectrum_index": self.spectrum_index,
+            "tick": self.tick,
+        })
+    }
+}
+
+/// Looks up every identity with bounded concurrency. Results keep the input
+/// order; a `None` entry means the peer lookup failed or has no entry, and the
+/// caller must fall back to the indexed row.
+async fn collect_spectrum_balances<F, Fut>(
+    identities: Vec<String>,
+    lookup: F,
+) -> Vec<Option<SpectrumBalance>>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = Option<SpectrumBalance>>,
+{
+    if identities.is_empty() {
+        return Vec::new();
+    }
+    let count = identities.len();
+    let results: Vec<(usize, Option<SpectrumBalance>)> =
+        futures_util::stream::iter(identities.into_iter().enumerate().map(|(index, identity)| {
+            let lookup = &lookup;
+            async move { (index, lookup(identity).await) }
+        }))
+        .buffer_unordered(TOP_IDENTITY_CONCURRENCY)
+        .collect()
+        .await;
+    let mut balances = vec![None; count];
+    for (index, balance) in results {
+        balances[index] = balance;
+    }
+    balances
+}
+
+fn top_identity_value(row: &store::IdentityRow, spectrum: Option<&SpectrumBalance>) -> Value {
+    let mut value = serde_json::to_value(row).expect("IdentityRow is serializable");
+    value["indexed_balance"] = json!(row.balance);
+    match spectrum {
+        Some(spectrum) => {
+            // Prefer the live value for the headline balance and keep the
+            // indexed net flow available under `indexed_balance`.
+            value["balance"] = json!(spectrum.balance);
+            value["spectrum_balance"] = json!(spectrum.balance);
+            value["balance_source"] = json!("spectrum");
+            value["spectrum"] = spectrum.value();
+        }
+        None => {
+            value["spectrum_balance"] = Value::Null;
+            value["balance_source"] = json!("indexed");
+            value["spectrum"] = Value::Null;
+        }
+    }
+    value
+}
+
+fn top_identities_meta(
+    limit: u32,
+    peers_configured: bool,
+    indexed_fallbacks: usize,
+    live: usize,
+) -> Value {
+    let balance_source = if live == 0 {
+        "indexed_net_flow"
+    } else if indexed_fallbacks == 0 {
+        "spectrum"
+    } else {
+        "mixed"
+    };
+    json!({
+        "limit": limit,
+        "ranking": "transfer_count_desc_then_indexed_balance_desc_then_identity_asc",
+        "balance_source": balance_source,
+        "live_spectrum_balances": live,
+        "indexed_fallbacks": indexed_fallbacks,
+        "peers_configured": peers_configured,
+        "notes": "row.balance is the live peer spectrum balance when available and indexed net QU flow otherwise. row.indexed_balance always carries the indexed net QU flow, and row.spectrum.balance is the live spectrum entity. The ranking always uses the indexed transfer_count, so adding live balances does not reorder rows.",
+    })
+}
+
 async fn analytics_top_identities(
     State(state): State<AppState>,
     Query(params): Query<AnalyticsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let limit = params.limit.unwrap_or(25).clamp(1, 200);
     let rows = state.store.top_identities(limit).await?;
+    let peers_configured = !state.peers.is_empty();
+    let mut balances = vec![None; rows.len()];
+    if peers_configured {
+        let identities = rows.iter().map(|row| row.identity.clone()).collect();
+        let pool = state.pool.clone();
+        let lookup = move |identity: String| {
+            let pool = pool.clone();
+            async move {
+                match tokio::time::timeout(
+                    TOP_IDENTITY_PEER_TIMEOUT,
+                    pool.entity_by_identity(&identity),
+                )
+                .await
+                {
+                    Ok(Ok(response)) => SpectrumBalance::from_response(response),
+                    Ok(Err(_)) | Err(_) => None,
+                }
+            }
+        };
+        balances = tokio::time::timeout(
+            TOP_IDENTITY_BUDGET,
+            collect_spectrum_balances(identities, lookup),
+        )
+        .await
+        .unwrap_or_else(|_| vec![None; rows.len()]);
+    }
+    let live = balances.iter().filter(|balance| balance.is_some()).count();
+    let indexed_fallbacks = rows.len() - live;
+    let data: Vec<Value> = rows
+        .iter()
+        .zip(balances.iter())
+        .map(|(row, balance)| top_identity_value(row, balance.as_ref()))
+        .collect();
     Ok((
         [(header::CACHE_CONTROL, AGGREGATE)],
-        Json(json!({ "data": rows, "meta": { "limit": limit } })),
+        Json(json!({
+            "data": data,
+            "meta": top_identities_meta(limit, peers_configured, indexed_fallbacks, live),
+        })),
     ))
 }
 
@@ -864,11 +1157,11 @@ async fn analytics_event_types(
 pub async fn docs() -> Html<&'static str> {
     Html(
         r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>Glyph Qubic API</title>
+<html><head><meta charset="utf-8"><title>Glyph API Status</title><link rel="icon" href="/favicon.png">
 <style>body{font-family:ui-sans-serif,system-ui;max-width:52rem;margin:3rem auto;padding:0 1rem;line-height:1.5}code{background:#f4f4f5;padding:.15rem .35rem;border-radius:.25rem}</style>
 </head><body>
-<h1>Glyph Qubic API</h1>
-<p>Direct-peer Qubic index. The OpenAPI 3.1 document is at <a href="/openapi.json"><code>/openapi.json</code></a>.</p>
+<h1>Glyph API</h1>
+<p>Read the Qubic chain directly from peers. The OpenAPI 3.1 document is at <a href="/openapi.json"><code>/openapi.json</code></a> and the interactive reference is at <a href="/docs"><code>/docs</code></a>.</p>
 <ul>
 <li><code>GET /v1/status</code></li>
 <li><code>GET /v1/network/stats</code></li>
@@ -926,11 +1219,22 @@ pub async fn scalar_docs() -> Html<String> {
         "theme": "purple",
         "darkMode": true,
         "agent": { "disabled": true },
+        "favicon": "/favicon.png",
+        "metaData": {
+            "title": "Glyph API Reference",
+            "description": "Read the Qubic chain directly from peers. Ticks, transactions, events, accounts, assets, mining, and markets.",
+            "ogTitle": "Glyph API Reference",
+            "ogDescription": "Read the Qubic chain directly from peers. Ticks, transactions, events, accounts, assets, mining, and markets.",
+            "twitterCard": "summary",
+        },
     });
-    Html(scalar_api_reference::scalar_html(
-        &config,
-        Some("/scalar.js"),
-    ))
+    let html = scalar_api_reference::scalar_html(&config, Some("/scalar.js"))
+        .replace(
+            "<title>Scalar API Reference</title>",
+            "<title>Glyph API Reference</title>",
+        )
+        .replace("</body>", &format!("{DOCS_BRAND}</body>"));
+    Html(html)
 }
 
 pub async fn scalar_js() -> Response {
@@ -948,5 +1252,143 @@ pub async fn scalar_js() -> Response {
         )
             .into_response(),
         None => ApiError::internal("Scalar JavaScript asset is missing").into_response(),
+    }
+}
+
+pub async fn logo_dark() -> Response {
+    png(LOGO_DARK_PNG)
+}
+
+pub async fn logo_light() -> Response {
+    png(LOGO_LIGHT_PNG)
+}
+
+pub async fn favicon() -> Response {
+    png(FAVICON_PNG)
+}
+
+fn png(bytes: &'static [u8]) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            (header::CACHE_CONTROL, IMMUTABLE),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn indexed_row(identity: &str, balance: i64, transfers: u64) -> store::IdentityRow {
+        store::IdentityRow {
+            identity: identity.into(),
+            public_key: "0x01".into(),
+            balance,
+            incoming_amount: balance.saturating_add(10),
+            outgoing_amount: 10,
+            transfer_count: transfers,
+            first_seen_tick: 1,
+            last_seen_tick: 2,
+        }
+    }
+
+    fn spectrum(_identity: &str) -> SpectrumBalance {
+        SpectrumBalance {
+            public_key: "0x01".into(),
+            balance: 12_345,
+            incoming_amount: 12_500,
+            outgoing_amount: 155,
+            incoming_transfers: 4,
+            outgoing_transfers: 2,
+            latest_incoming_tick: 10,
+            latest_outgoing_tick: 9,
+            spectrum_index: 7,
+            tick: 11,
+        }
+    }
+
+    #[test]
+    fn top_identity_value_prefers_live_balance_and_keeps_indexed_flow() {
+        let row = indexed_row("IDENTITY", 175, 39_475);
+        let live = spectrum("IDENTITY");
+        let value = top_identity_value(&row, Some(&live));
+
+        // Identity and ranking fields stay intact.
+        assert_eq!(value["identity"], "IDENTITY");
+        assert_eq!(value["transfer_count"], 39_475);
+        // The live number is the headline balance; the indexed number is explicit.
+        assert_eq!(value["balance"], 12_345);
+        assert_eq!(value["indexed_balance"], 175);
+        assert_eq!(value["spectrum_balance"], 12_345);
+        assert_eq!(value["balance_source"], "spectrum");
+        assert_eq!(value["spectrum"]["balance"], 12_345);
+        assert_eq!(value["spectrum"]["spectrum_index"], 7);
+    }
+
+    #[test]
+    fn top_identity_value_falls_back_to_indexed_fields() {
+        let row = indexed_row("IDENTITY", -13, 30_935);
+        let value = top_identity_value(&row, None);
+
+        assert_eq!(value["balance"], -13);
+        assert_eq!(value["indexed_balance"], -13);
+        assert!(value["spectrum_balance"].is_null());
+        assert!(value["spectrum"].is_null());
+        assert_eq!(value["balance_source"], "indexed");
+    }
+
+    #[tokio::test]
+    async fn partial_peer_failures_only_affect_their_own_rows() {
+        let identities = vec!["A".to_owned(), "B".to_owned(), "C".to_owned()];
+        let balances = collect_spectrum_balances(identities, |identity| async move {
+            (identity != "B").then(|| spectrum(&identity))
+        })
+        .await;
+
+        assert_eq!(balances.len(), 3);
+        assert_eq!(balances[0].as_ref().map(|row| row.balance), Some(12_345));
+        assert!(balances[1].is_none());
+        assert_eq!(balances[2].as_ref().map(|row| row.balance), Some(12_345));
+    }
+
+    #[test]
+    fn meta_distinguishes_live_spectrum_from_indexed_net_flow() {
+        let indexed = top_identities_meta(25, false, 2, 0);
+        assert_eq!(indexed["balance_source"], "indexed_net_flow");
+        assert_eq!(
+            indexed["ranking"],
+            "transfer_count_desc_then_indexed_balance_desc_then_identity_asc"
+        );
+        assert_eq!(indexed["indexed_fallbacks"], 2);
+
+        let mixed = top_identities_meta(25, true, 1, 1);
+        assert_eq!(mixed["balance_source"], "mixed");
+        assert_eq!(mixed["live_spectrum_balances"], 1);
+
+        let live = top_identities_meta(25, true, 0, 2);
+        assert_eq!(live["balance_source"], "spectrum");
+    }
+
+    #[test]
+    fn spectrum_response_without_entity_is_treated_as_a_fallback() {
+        let response = RespondEntity {
+            entity: qubic::messages::EntityRecord {
+                public_key: [0; 32],
+                incoming_amount: 0,
+                outgoing_amount: 0,
+                number_of_incoming_transfers: 0,
+                number_of_outgoing_transfers: 0,
+                latest_incoming_transfer_tick: 0,
+                latest_outgoing_transfer_tick: 0,
+            },
+            tick: 10,
+            spectrum_index: -1,
+            siblings: Vec::new(),
+        };
+        assert!(SpectrumBalance::from_response(response).is_none());
     }
 }

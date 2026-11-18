@@ -1738,3 +1738,68 @@ async fn activity_rows_serialize_to_a_stable_json_shape() {
     assert_eq!(json["input_type"], 0);
     assert_eq!(json["status"], "success");
 }
+
+#[tokio::test]
+async fn explorer_history_queries_return_deduped_rows() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let mut batch = batch(1, 100);
+    batch.transactions = vec![
+        transfer(100, 0, "hash-a", "ALICE", "BOB"),
+        transfer(100, 1, "hash-b", "BOB", "ALICE"),
+    ];
+    let mut transfer_event = event_typed(
+        1,
+        100,
+        20,
+        "qu_transfer",
+        r#"{"from":"ALICE","to":"BOB","amount":10}"#,
+    );
+    transfer_event.tx_hash = "hash-a".into();
+    let mut asset_event = event_typed(
+        1,
+        100,
+        21,
+        "asset_ownership_change",
+        r#"{"from":"ALICE","to":"BOB","issuer":"ALICE","name":"QX","managingContract":1,"shares":5}"#,
+    );
+    asset_event.tx_hash = "hash-a".into();
+    batch.events = vec![transfer_event, asset_event];
+    store.write_tick(&batch).await.expect("write batch");
+
+    let events = store
+        .events_for_transaction("hash-a")
+        .await
+        .expect("events for transaction");
+    assert_eq!(events.len(), 2);
+
+    let counterparties = store
+        .counterparties("ALICE", None, 10)
+        .await
+        .expect("counterparties");
+    assert_eq!(counterparties.len(), 1);
+    assert_eq!(counterparties[0].identity, "BOB");
+    assert_eq!(counterparties[0].incoming_amount, 1);
+    assert_eq!(counterparties[0].outgoing_amount, 1);
+    assert_eq!(counterparties[0].transaction_count, 2);
+
+    let flow = store
+        .identity_flow("ALICE", 3600, timestamp() - chrono::Duration::hours(2), 10)
+        .await
+        .expect("identity flow");
+    assert_eq!(flow.len(), 1);
+    assert_eq!(flow[0].incoming_amount, 1);
+    assert_eq!(flow[0].outgoing_amount, 1);
+    assert_eq!(flow[0].transaction_count, 2);
+
+    let transfers = store
+        .asset_transfers("ALICE", "QX", None, 10, 0)
+        .await
+        .expect("asset transfers");
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].kind, "ownership");
+    assert_eq!(transfers[0].from, "ALICE");
+    assert_eq!(transfers[0].to, "BOB");
+    assert_eq!(transfers[0].shares, 5);
+}

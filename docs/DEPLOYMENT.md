@@ -104,6 +104,9 @@ and the stack is reachable only from the same machine.
 | `BROADCAST_PEERS` | `3` | Peers contacted concurrently per broadcast. Capped at `8`; each connection is a direct peer socket. |
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval. |
 | `PRICE_POLL_MS` | `60000` | Live QUBIC/USDT oracle price refresh interval in the API. |
+| `MARKET_ENABLED` | `true` | Enable the external exchange consensus poller. Set `false` to disable outbound HTTP market reads. |
+| `MARKET_POLL_MS` | `5000` | Market poll interval. One provider is queried per tick in round robin. |
+| `COINGECKO_API_KEY`, `COINGECKO_URL`, `MEXC_URL`, `GATE_URL` | unset | Optional market endpoints and CoinGecko key. |
 | `GLYPH_FROM_TICK` | unset | Optional first tick when there is no stored cursor. |
 | `INDEXER_POLL_MS` | `750` | Head poll interval once caught up. |
 | `INDEXER_PROGRESS_EVERY` | `100` | Log progress every N indexed ticks. |

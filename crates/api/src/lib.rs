@@ -19,6 +19,8 @@ use tower_http::trace::TraceLayer;
 pub mod advanced;
 pub mod dto;
 pub mod error;
+pub mod identity;
+pub mod market;
 pub mod openapi;
 pub mod prices;
 pub mod routes;
@@ -44,6 +46,10 @@ pub struct AppState {
     /// Per-process sample used to report observed tick rates without a
     /// background task or an extra database write.
     pub progress: Arc<ProgressSampler>,
+    /// Externally sourced QUBIC market snapshot, refreshed in the background.
+    pub market: Arc<market::MarketCache>,
+    /// Exchange endpoints and timeouts used by market reads.
+    pub market_config: Arc<market::MarketConfig>,
 }
 
 impl AppState {
@@ -58,6 +64,8 @@ impl AppState {
             archive: None,
             started_at: Instant::now(),
             progress: Arc::new(ProgressSampler::default()),
+            market: Arc::new(market::MarketCache::default()),
+            market_config: Arc::new(market::MarketConfig::from_env()),
         }
     }
 
@@ -131,7 +139,9 @@ pub fn router(state: AppState) -> Router {
     let request_id = axum::http::HeaderName::from_static("x-request-id");
     let mut app = Router::new()
         .merge(routes::router())
+        .merge(identity::router())
         .merge(advanced::router())
+        .merge(market::router())
         .merge(prices::router())
         .merge(stream::router())
         .merge(status_page::router())
@@ -143,6 +153,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/docs", axum::routing::get(routes::scalar_docs))
         .route("/scalar.js", axum::routing::get(routes::scalar_js))
+        .route("/logo.png", axum::routing::get(routes::logo_dark))
+        .route("/logo-light.png", axum::routing::get(routes::logo_light))
+        .route("/favicon.png", axum::routing::get(routes::favicon))
         .fallback(routes::not_found)
         .with_state(state);
     if let Some(limiter) = RateLimiter::from_env() {
@@ -293,6 +306,19 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(60));
+    let market_cache = Arc::new(market::MarketCache::default());
+    let market_config = market::MarketConfig::from_env();
+    let market_task = if std::env::var("MARKET_ENABLED").is_ok_and(|value| value == "false") {
+        None
+    } else {
+        Some(tokio::spawn(market::run_poller(
+            market_cache.clone(),
+            store.clone(),
+            market_config.clone(),
+            Some(hub.clone()),
+            cancel.clone(),
+        )))
+    };
     let price_task = if peers.is_empty() {
         None
     } else {
@@ -300,6 +326,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
             store.clone(),
             peers.clone(),
             Some(hub.clone()),
+            market_cache.clone(),
             price_interval,
             cancel.clone(),
         )))
@@ -314,6 +341,8 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         archive,
         started_at: Instant::now(),
         progress: Arc::new(ProgressSampler::default()),
+        market: market_cache,
+        market_config: Arc::new(market_config),
     });
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "glyph api listening");
@@ -323,6 +352,9 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
     cancel.cancel();
     let _ = hub_task.await;
     if let Some(task) = price_task {
+        let _ = task.await;
+    }
+    if let Some(task) = market_task {
         let _ = task.await;
     }
     Ok(())

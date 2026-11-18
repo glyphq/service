@@ -47,6 +47,7 @@ pub fn spec() -> Value {
             "title": "Glyph API",
             "version": "0.1.0",
             "summary": "A direct-peer read API for the Qubic network.",
+            "x-logo": { "url": "/logo.png", "altText": "Glyph" },
             "description": "# Glyph API\n\nGlyph indexes Qubic by connecting straight to peers and verifying quorum evidence. There is no hosted RPC in the path: every tick, transaction, and event served here came from peer messages that Glyph fetched, aligned, and persisted itself.\n\n## Reading the API\n\n- Every response wraps its payload in `data` and, where relevant, `meta`.\n- Newest-first collections accept `limit` and an opaque `cursor` from `meta.next_cursor`.\n- Tick, epoch, transaction, event, identity, wallet, asset, and price routes are read-only.\n- `/v1/status` reports live ingest and network progress; `/status` renders the same state as HTML.\n\n## Freshness\n\nNewest-first responses are cached briefly. `/v1/status` is never cached and includes the latest indexed tick, the current network head sampled from peers, indexer throughput, and current-epoch backfill coverage."
         },
         "servers": [{ "url": "/" }],
@@ -60,6 +61,7 @@ pub fn spec() -> Value {
             { "name": "Wallets", "description": "Wallet-centric balances and issued or held assets." },
             { "name": "Assets", "description": "Asset issuances, metadata, and holder sets." },
             { "name": "Prices", "description": "Oracle price samples and hourly QUBIC/USDT history." },
+            { "name": "Market", "description": "External exchange consensus and market reference data." },
             { "name": "Analytics", "description": "Aggregated activity, volume, and network-level counts." },
             { "name": "Stream", "description": "Server-sent event streams for new ticks and transactions." },
             { "name": "Network", "description": "Peer-observed network state and index coverage." },
@@ -71,7 +73,7 @@ pub fn spec() -> Value {
             { "name": "Operations", "tags": ["Status", "Network"] },
             { "name": "Chain Data", "tags": ["Epochs", "Ticks", "Transactions", "Events", "Contracts", "Archive"] },
             { "name": "Accounts & Assets", "tags": ["Identities", "Wallets", "Assets"] },
-            { "name": "Markets & Analytics", "tags": ["Prices", "Analytics"] },
+            { "name": "Markets & Analytics", "tags": ["Prices", "Market", "Analytics"] },
             { "name": "Live & Lookup", "tags": ["Stream", "Search"] }
         ],
         "paths": {
@@ -284,6 +286,20 @@ pub fn spec() -> Value {
                     }
                 }
             },
+            "/v1/transactions/{hash}/effects": {
+                "get": {
+                    "operationId": "getTransactionEffects",
+                    "tags": ["Transactions", "Events"],
+                    "summary": "Transaction, tick header, events, and normalized effects",
+                    "description": "One request for an explorer transaction page. Returns the indexed transaction, its tick header, every decoded event, a typed effect list for transfers, asset movements, burns, contract messages, and custom messages, plus an aggregate summary. This route is local-only and never opens a peer connection.",
+                    "parameters": [path_param("hash", "60-character transaction hash")],
+                    "responses": {
+                        "200": { "description": "Transaction effects", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/TransactionEffects" } } } } } },
+                        "400": { "description": "Invalid transaction hash" },
+                        "404": { "description": "Transaction not indexed" }
+                    }
+                }
+            },
             "/v1/events": {
                 "get": {
                     "operationId": "listEvents",
@@ -349,6 +365,41 @@ pub fn spec() -> Value {
                     }
                 }
             },
+            "/v1/identities/{identity}/counterparties": {
+                "get": {
+                    "operationId": "listIdentityCounterparties",
+                    "tags": ["Identities", "Analytics"],
+                    "summary": "Top counterparties by transfer volume",
+                    "description": "Aggregates indexed transfers where the identity is the source or destination. Each row reports incoming and outgoing amounts, net flow, transaction count, and first and last tick. Self-transfers are excluded. This route is local-only.",
+                    "parameters": [
+                        path_param("identity", "Uppercase base-26 identity"),
+                        { "name": "direction", "in": "query", "schema": { "type": "string", "enum": ["all", "incoming", "outgoing"], "default": "all" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Ranked counterparties", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "type": "array", "items": { "$ref": "#/components/schemas/Counterparty" } } } } } } },
+                        "400": { "description": "Invalid identity or direction" }
+                    }
+                }
+            },
+            "/v1/identities/{identity}/flow": {
+                "get": {
+                    "operationId": "getIdentityFlow",
+                    "tags": ["Identities", "Analytics"],
+                    "summary": "Bucketed incoming and outgoing QU flow",
+                    "description": "Returns a fixed window of buckets ending at the indexed head. Empty buckets are zero-filled so charts do not need to resample. Amounts are in the network's base unit and are not rescaled.",
+                    "parameters": [
+                        path_param("identity", "Uppercase base-26 identity"),
+                        { "name": "interval", "in": "query", "schema": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 3600 }, "description": "Bucket width in seconds" },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 168 }, "description": "Number of buckets, newest first" }
+                    ],
+                    "responses": {
+                        "200": { "description": "Flow buckets", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "type": "array", "items": { "$ref": "#/components/schemas/FlowBucket" } } } } } } },
+                        "400": { "description": "Invalid identity or interval" },
+                        "404": { "description": "The index has no ticks yet" }
+                    }
+                }
+            },
             "/v1/identities/{identity}/events": {
                 "get": {
                     "operationId": "listIdentityEvents",
@@ -386,6 +437,24 @@ pub fn spec() -> Value {
                         "200": { "description": "Asset" },
                         "400": { "description": "Invalid issuer" },
                         "404": { "description": "Asset not indexed" }
+                    }
+                }
+            },
+            "/v1/assets/{issuer}/{name}/transfers": {
+                "get": {
+                    "operationId": "listAssetTransfers",
+                    "tags": ["Assets", "Events"],
+                    "summary": "Ownership and possession transfers for one asset",
+                    "description": "Local indexed history of decoded asset_ownership_change and asset_possession_change events, newest first. Works without a peer and does not rebuild the holder set.",
+                    "parameters": [
+                        path_param("issuer", "Issuer identity"),
+                        path_param("name", "Asset name, 1-7 ASCII letters or digits"),
+                        { "name": "kind", "in": "query", "schema": { "type": "string", "enum": ["all", "ownership", "possession"], "default": "all" } },
+                        limit_param(), cursor_param(), offset_param()
+                    ],
+                    "responses": {
+                        "200": { "description": "Paginated transfer events", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "type": "array", "items": { "$ref": "#/components/schemas/AssetTransfer" } } } } } } },
+                        "400": { "description": "Invalid issuer, asset name, kind, or cursor" }
                     }
                 }
             },
@@ -519,7 +588,9 @@ pub fn spec() -> Value {
                     "summary": "Server-sent events for ticks, transactions, and events",
                     "description": "Polls the local index head only; never opens a peer connection. Sends keep-alive comments every 15 seconds and lag events when a subscriber falls behind.",
                     "parameters": [
-                        { "name": "types", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated subset of tick,transaction,event. The poll interval is set on the server with STREAM_POLL_MS." }
+                        { "name": "types", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated subset of tick,transaction,event,price,market. The poll interval is set on the server with STREAM_POLL_MS." },
+                        { "name": "identity", "in": "query", "schema": { "type": "string" }, "description": "Only emit transactions and events that mention this identity. Tick, price, and market events are suppressed while this filter is set." },
+                        { "name": "asset", "in": "query", "schema": { "type": "string" }, "description": "Only emit asset events for {issuer}/{name}." }
                     ],
                     "responses": {
                         "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
@@ -737,6 +808,42 @@ pub fn spec() -> Value {
                         "500": { "description": "Storage failure" }
                     }
                 }
+            },
+            "/v1/market": {
+                "get": {
+                    "operationId": "getMarket",
+                    "tags": ["Market", "Prices"],
+                    "summary": "Current QUBIC/USDT market snapshot",
+                    "description": "Cached external exchange consensus plus CoinGecko reference data. MEXC and Gate.io spot tickers provide the price; CoinGecko supplies market cap, 24-hour volume, and 24-hour change. The endpoint never fans out to an exchange per request.",
+                    "responses": {
+                        "200": { "description": "Market snapshot" },
+                        "503": { "description": "No market snapshot has been fetched yet" }
+                    }
+                }
+            },
+            "/v1/market/qubic": {
+                "get": {
+                    "operationId": "getMarketQubic",
+                    "tags": ["Market"],
+                    "summary": "QUBIC market alias",
+                    "description": "Alias for /v1/market. Returns the same cached QUBIC/USDT market snapshot.",
+                    "responses": {
+                        "200": { "description": "Market snapshot" },
+                        "503": { "description": "No market snapshot has been fetched yet" }
+                    }
+                }
+            },
+            "/v1/prices/market": {
+                "get": {
+                    "operationId": "getPriceMarket",
+                    "tags": ["Market", "Prices"],
+                    "summary": "Market price alias",
+                    "description": "Alias for /v1/market. Returns the external QUBIC/USDT price and market reference, not an on-chain price series point.",
+                    "responses": {
+                        "200": { "description": "Market snapshot" },
+                        "503": { "description": "No market snapshot has been fetched yet" }
+                    }
+                }
             }
         },
         "components": {
@@ -922,6 +1029,110 @@ pub fn spec() -> Value {
                         "body": { "type": "object" },
                         "log_digest": { "type": "integer", "format": "int64" },
                         "timestamp": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "Counterparty": {
+                    "type": "object",
+                    "required": ["identity", "incoming_amount", "outgoing_amount", "net_amount", "transaction_count"],
+                    "properties": {
+                        "identity": { "type": "string" },
+                        "incoming_amount": { "type": "integer", "format": "int64" },
+                        "outgoing_amount": { "type": "integer", "format": "int64" },
+                        "net_amount": { "type": "integer", "format": "int64" },
+                        "transaction_count": { "type": "integer", "format": "int64" },
+                        "first_tick": { "type": "integer" },
+                        "last_tick": { "type": "integer" }
+                    }
+                },
+                "FlowBucket": {
+                    "type": "object",
+                    "required": ["bucket", "incoming_amount", "outgoing_amount", "net_amount", "transaction_count"],
+                    "properties": {
+                        "bucket": { "type": "string", "format": "date-time" },
+                        "incoming_amount": { "type": "integer", "format": "int64" },
+                        "outgoing_amount": { "type": "integer", "format": "int64" },
+                        "net_amount": { "type": "integer", "format": "int64" },
+                        "transaction_count": { "type": "integer", "format": "int64" },
+                        "counterparty_count": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "AssetTransfer": {
+                    "type": "object",
+                    "required": ["epoch", "tick", "log_id", "kind", "issuer", "name", "from", "to", "shares"],
+                    "properties": {
+                        "epoch": { "type": "integer" },
+                        "tick": { "type": "integer" },
+                        "log_id": { "type": "integer", "format": "int64" },
+                        "kind": { "type": "string", "enum": ["ownership", "possession"] },
+                        "hash": { "type": "string" },
+                        "tx_index": { "type": "integer" },
+                        "issuer": { "type": "string" },
+                        "name": { "type": "string" },
+                        "from": { "type": "string" },
+                        "to": { "type": "string" },
+                        "shares": { "type": "integer", "format": "int64" },
+                        "managing_contract": { "type": "integer", "format": "int64" },
+                        "timestamp": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "TransactionEffect": {
+                    "type": "object",
+                    "required": ["kind", "tick", "log_id"],
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["qu_transfer", "asset_ownership_change", "asset_possession_change", "burning", "contract_error", "contract_warning", "contract_information", "contract_debug", "custom_message"] },
+                        "tick": { "type": "integer" },
+                        "log_id": { "type": "integer", "format": "int64" },
+                        "tx_hash": { "type": "string" },
+                        "from": { "type": "string" },
+                        "to": { "type": "string" },
+                        "amount": { "type": "integer", "format": "int64" },
+                        "issuer": { "type": "string" },
+                        "name": { "type": "string" },
+                        "shares": { "type": "integer", "format": "int64" },
+                        "managing_contract": { "type": "integer", "format": "int64" },
+                        "contract_index": { "type": "integer" },
+                        "message_type": { "type": "integer" },
+                        "op_code": { "type": "string" },
+                        "data": { "type": "string" }
+                    }
+                },
+                "TransactionEffects": {
+                    "type": "object",
+                    "required": ["transaction", "events", "effects", "summary"],
+                    "properties": {
+                        "transaction": { "$ref": "#/components/schemas/Transaction" },
+                        "tick": { "oneOf": [{ "$ref": "#/components/schemas/Tick" }, { "type": "null" }] },
+                        "events": { "type": "array", "items": { "$ref": "#/components/schemas/Event" } },
+                        "effects": { "type": "array", "items": { "$ref": "#/components/schemas/TransactionEffect" } },
+                        "summary": {
+                            "type": "object",
+                            "properties": {
+                                "event_count": { "type": "integer" },
+                                "qu_transfer_count": { "type": "integer" },
+                                "qu_transfer_amount": { "type": "integer", "format": "int64" },
+                                "asset_ownership_change_count": { "type": "integer" },
+                                "asset_possession_change_count": { "type": "integer" },
+                                "burn_count": { "type": "integer" },
+                                "contract_error_count": { "type": "integer" },
+                                "custom_message_count": { "type": "integer" }
+                            }
+                        }
+                    }
+                },
+                "MarketSnapshot": {
+                    "type": "object",
+                    "required": ["source", "coin_id", "price_usd", "price_e8", "fetched_at"],
+                    "properties": {
+                        "source": { "type": "string" },
+                        "coin_id": { "type": "string" },
+                        "price_usd": { "type": "number" },
+                        "price_e8": { "type": "integer", "format": "int64" },
+                        "market_cap_usd": { "type": ["number", "null"] },
+                        "volume_24h_usd": { "type": ["number", "null"] },
+                        "change_24h_percent": { "type": ["number", "null"] },
+                        "last_updated_at": { "type": ["string", "null"], "format": "date-time" },
+                        "fetched_at": { "type": "string", "format": "date-time" },
+                        "sources": { "type": "array", "items": { "type": "object" } }
                     }
                 },
                 "Identity": {
@@ -1226,14 +1437,18 @@ mod tests {
             "/v1/ticks/{tick}/events",
             "/v1/transactions",
             "/v1/transactions/{hash}",
+            "/v1/transactions/{hash}/effects",
             "/v1/events",
             "/v1/identities",
             "/v1/identities/{identity}",
             "/v1/identities/{identity}/transactions",
             "/v1/identities/{identity}/activity",
+            "/v1/identities/{identity}/counterparties",
+            "/v1/identities/{identity}/flow",
             "/v1/identities/{identity}/events",
             "/v1/assets",
             "/v1/assets/{issuer}/{name}",
+            "/v1/assets/{issuer}/{name}/transfers",
             "/v1/assets/{issuer}/{name}/holders",
             "/v1/wallets/{identity}",
             "/v1/wallets/{identity}/assets",
@@ -1259,6 +1474,9 @@ mod tests {
             "/v1/prices/history",
             "/v1/prices/latest",
             "/v1/prices/snapshot",
+            "/v1/market",
+            "/v1/market/qubic",
+            "/v1/prices/market",
             "/v1/wallets/{identity}",
             "/v1/wallets/{identity}/assets",
             "/v1/wallets/{identity}/snapshot",

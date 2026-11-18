@@ -65,7 +65,8 @@ documented below. Clients must ignore unknown fields.
   the enum and reserved; the current indexer emits `quorum` or `data`.
 - Transaction `input_data` is a lowercase hex string without a `0x` prefix.
   Event `body` is a JSON object. It contains the decoded body when a typed
-  decoder applies, or a raw representation otherwise.
+  decoder applies, or a raw representation otherwise. Body keys are
+  `snake_case` and `amount`/`shares` are JSON integers.
 - `tx_index` is the transaction slot. Special events use `-1`. `tx_hash` is
   empty or a synthetic `special:` marker for special events.
 
@@ -532,6 +533,50 @@ event row has no transaction `status` or `input_data`, and `source`,
 The event-only projection of the same participant index, newest first. Use this
 when a client wants contract effects without direct transaction rows.
 
+### `GET /v1/identities/{identity}/counterparties`
+
+Top counterparties derived from the local transaction index. Self-transfers are
+excluded so a row always names a distinct identity.
+
+| Query | Meaning |
+| --- | --- |
+| `direction` | `all` (default), `incoming`, or `outgoing`. |
+| `limit` | Maximum rows, default 20, maximum 100. |
+
+Rows are ranked by total incoming plus outgoing amount, then transaction count,
+then identity. `net_amount` is incoming minus outgoing. Amounts stay in the
+network's base unit.
+
+```json
+{
+  "data": [
+    {
+      "identity": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "incoming_amount": 120,
+      "outgoing_amount": 80,
+      "net_amount": 40,
+      "transaction_count": 7,
+      "first_tick": 91910000,
+      "last_tick": 91933164
+    }
+  ],
+  "meta": { "identity": "BZBQ...", "direction": "all", "limit": 20, "count": 1 }
+}
+```
+
+### `GET /v1/identities/{identity}/flow`
+
+Incoming and outgoing QU flow in fixed buckets ending at the indexed head.
+Empty buckets are zero-filled so a chart can render the series directly.
+
+| Query | Meaning |
+| --- | --- |
+| `interval` | Bucket width in seconds, default 3600, range 60 to 86400. |
+| `limit` | Bucket count, default 168, maximum 1000. Newest first. |
+
+`meta.totals` sums the requested window. `counterparty_count` is the number of
+distinct counterparties inside one bucket.
+
 ### `GET /v1/identities`
 
 Indexed identity summaries ordered by most recent activity, then canonical
@@ -586,6 +631,21 @@ One asset by canonical issuer and name. A malformed issuer returns
 `400 invalid_identity`; an unindexed asset returns `404 not_found`. The asset
 tables are planned; this read currently aggregates issuance events.
 
+### `GET /v1/assets/{issuer}/{name}/transfers`
+
+Local ownership and possession transfer history for one asset, newest first.
+This route reads decoded `asset_ownership_change` and `asset_possession_change`
+events and works without a peer.
+
+| Query | Meaning |
+| --- | --- |
+| `kind` | `all` (default), `ownership`, or `possession`. |
+| `limit`, `cursor` | Cursor pagination. |
+
+Rows carry `kind`, `hash`, `tx_index`, `from`, `to`, `shares`, and
+`managing_contract`. `/holders` remains the peer snapshot of current ownership;
+`/transfers` is the indexed history that produced it.
+
 ### `GET /v1/transactions/{hash}`
 
 One transaction by lowercase base-26 hash.
@@ -613,6 +673,17 @@ One transaction by lowercase base-26 hash.
 - An unindexed hash returns `404 not_found`.
 - Success responses are cacheable with
   `Cache-Control: public, max-age=31536000, immutable`.
+
+### `GET /v1/transactions/{hash}/effects`
+
+One request for an explorer transaction page. It returns the indexed
+transaction, its tick header, every decoded event, a typed effect list, and an
+aggregate summary. It never opens a peer connection.
+
+The effect list covers `qu_transfer`, `asset_ownership_change`,
+`asset_possession_change`, `burning`, contract message types, and
+`custom_message`. The summary counts each kind and sums QU transfer amounts.
+The response is immutable and cached for one year.
 
 ### `GET /v1/identities/{identity}`
 
@@ -645,15 +716,14 @@ Identity summary derived from indexed QU transfer events.
 
 ### `GET /v1/search?q=`
 
-Resolves a single value against the index. `q` is required and trimmed.
+Resolves a value against the index. `q` is required and trimmed. Results are
+accumulated rather than stopping at the first match:
 
-Resolution order:
-
-1. All ASCII digits: parse as a tick and return it if indexed.
-2. Lowercase value that decodes as a transaction hash: return the transaction
-   if indexed.
-3. Uppercase value that decodes as an identity: return the identity if indexed.
-4. Otherwise return an empty list.
+1. All ASCII digits: try both a tick and an epoch.
+2. Lowercase value that decodes as a transaction hash: return the transaction.
+3. Uppercase value that decodes as an identity: return the identity.
+4. `{issuer}/{name}`: return the asset when the issuer and name are valid.
+5. Otherwise return an empty list.
 
 ```json
 {
@@ -663,8 +733,8 @@ Resolution order:
 }
 ```
 
-`type` is `tick`, `transaction`, or `identity`. A missing or empty `q` returns
-`400 bad_request`.
+`type` is `tick`, `epoch`, `transaction`, `identity`, or `asset`. A missing or
+empty `q` returns `400 bad_request`.
 
 ### `POST /v1/transactions/batch`
 
@@ -722,13 +792,21 @@ verified and persisted.
 | `GET /v1/ws` | WebSocket carrying the same JSON events. |
 
 `GET /v1/stream` accepts `?types=tick,event` to select a subset. Event names are
-`tick`, `transaction`, and `event`; each SSE frame has an `id` and a JSON `data`
-payload. The type-specific routes always filter to their own event regardless
-of `types`. The server sends a keep-alive comment every 15 seconds. If a client
-falls behind the internal 4096-event buffer, it receives a `lag` event with the
-number of dropped events and the stream continues from the current head. When
-the hub itself is catching up after an index jump, it emits a `catchup` event
-with `last_published_tick`, `head_tick`, and `pending` before continuing.
+`tick`, `transaction`, `event`, `price`, and `market`; each SSE frame has an `id`
+and a JSON `data` payload. The type-specific routes always filter to their own
+event regardless of `types`. Add `identity=<identity>` to receive only
+transactions and events that mention one identity, and
+`asset=<issuer>/<name>` to receive only events for one asset. A filtered stream
+suppresses tick and price events. Both filters are applied per subscriber, so
+one broadcast still serves every client.
+
+The server sends a keep-alive comment every 15 seconds. If a client falls behind
+the internal 4096-event buffer, it receives a `lag` event with the number of
+dropped events and the stream continues from the current head. When the hub
+itself is catching up after an index jump, it emits a `catchup` event with
+`last_published_tick`, `head_tick`, and `pending` before continuing. A failed
+store read does not advance the stream cursor, so the tick is retried instead of
+being skipped.
 
 The polling cadence is controlled by `STREAM_POLL_MS`. A hub that is not running
 returns `503 unavailable`.
@@ -785,6 +863,26 @@ QUBIC), `price_usdt` (rounded to eight decimals), `append_tick`, `source_tick`,
 `series_digest`, and `observed_at`. `append_tick` is the reveal tick of the oracle
 reply or the QPayhub update tick; `source_tick` is the query tick or update tick.
 `series_digest` is the K12 digest of the reply payload that produced the point.
+
+### Market data
+
+The market routes expose a cached external QUBIC/USDT reference. MEXC and
+Gate.io spot tickers provide the price consensus; CoinGecko supplies market cap,
+24-hour volume, and 24-hour change. The poller runs every five seconds and
+contacts one provider per tick in round robin, so each venue is queried every
+fifteen seconds instead of all three at once. The API never calls an exchange
+per request. Set `MARKET_ENABLED=false` to disable the poller.
+
+| Route | Meaning |
+| --- | --- |
+| `GET /v1/market` | Current market snapshot with per-exchange quotes. |
+| `GET /v1/market/qubic` | Alias for `/v1/market`. |
+| `GET /v1/prices/market` | Alias for `/v1/market`. |
+
+These are reference values, not on-chain oracle points. `/v1/prices` remains the
+verified on-chain series. A cold process returns `503 unavailable` until the
+first poll succeeds; a failed refresh keeps the previous snapshot and reports
+`stale` from its age.
 
 ### Wallets and snapshots
 

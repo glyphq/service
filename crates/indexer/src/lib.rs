@@ -105,6 +105,74 @@ pub struct VerifiedTick {
     pub warnings: Vec<String>,
 }
 
+/// Build the event and participant rows for one verified tick without touching
+/// any other table. Log repair uses this when logs became available after the
+/// tick was first persisted.
+pub fn event_rows(verified: &VerifiedTick) -> (Vec<EventRow>, Vec<EventParticipantRow>) {
+    let timestamp = verified_timestamp(verified);
+    let tx_hashes = transaction_hashes(verified);
+    let log_slots = LogSlotLookup::new(&verified.log_ranges);
+    let mut events = Vec::with_capacity(verified.logs.len());
+    let mut participants = Vec::new();
+    for event in &verified.logs {
+        let tx_index = log_slots.slot(event.log_id);
+        let (tx_hash, tx_index_i16) = match tx_index {
+            Some(index) if index < TX_PER_TICK => (
+                tx_hashes
+                    .get(&(index as u16))
+                    .cloned()
+                    .unwrap_or_else(|| format!("slot:{index:?}")),
+                index as i16,
+            ),
+            Some(index) => (format!("special:{}:{index}", event.tick), -1),
+            None => (String::new(), -1),
+        };
+        events.push(EventRow {
+            epoch: event.epoch,
+            tick: event.tick,
+            log_id: event.log_id,
+            log_type: event.log_type as u16,
+            type_name: event.type_name().to_string(),
+            tx_hash: tx_hash.clone(),
+            tx_index: tx_index_i16,
+            body: event_body_json(event),
+            log_digest: event.log_digest,
+            timestamp,
+        });
+        for (identity, role) in event.body().participant_identities() {
+            participants.push(EventParticipantRow {
+                epoch: event.epoch,
+                tick: event.tick,
+                log_id: event.log_id,
+                identity,
+                role: role.to_string(),
+                tx_hash: tx_hash.clone(),
+                tx_index: tx_index_i16,
+                timestamp,
+            });
+        }
+    }
+    (events, participants)
+}
+
+fn verified_timestamp(verified: &VerifiedTick) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(verified.tick.timestamp_millis()).unwrap_or_else(Utc::now)
+}
+
+fn transaction_hashes(verified: &VerifiedTick) -> HashMap<u16, String> {
+    let mut hashes = HashMap::new();
+    let mut by_hash = HashMap::<[u8; 32], &Transaction>::new();
+    for transaction in &verified.transactions {
+        by_hash.entry(transaction.hash()).or_insert(transaction);
+    }
+    for (index, digest) in verified.tick_data.non_empty_transactions() {
+        if by_hash.contains_key(digest) {
+            hashes.insert(index as u16, qubic::encode_tx_hash(digest));
+        }
+    }
+    hashes
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PipelineTuning {
     fetch_concurrency: usize,
@@ -842,8 +910,7 @@ impl<S: Store + 'static> Indexer<S> {
     }
 
     async fn build_batch(&mut self, verified: &VerifiedTick) -> Result<TickBatch> {
-        let timestamp = DateTime::from_timestamp_millis(verified.tick.timestamp_millis())
-            .unwrap_or_else(Utc::now);
+        let timestamp = verified_timestamp(verified);
         let mut batch = TickBatch::new(
             verified.tick.epoch,
             verified.tick.tick,
@@ -949,30 +1016,38 @@ impl<S: Store + 'static> Indexer<S> {
         &mut self,
         verified: &VerifiedTick,
     ) -> Result<Vec<IdentityRow>> {
+        let tick = verified.tick.tick;
         let mut touched = BTreeMap::<[u8; 32], IdentityRow>::new();
         for event in &verified.logs {
-            if let EventBody::QuTransfer { from, to, amount } = event.body() {
-                for (key, incoming) in [(from, false), (to, true)] {
-                    if key == [0u8; 32] {
-                        continue;
+            match event.body() {
+                EventBody::QuTransfer { from, to, amount } => {
+                    for (key, incoming) in [(from, false), (to, true)] {
+                        if key == [0u8; 32] {
+                            continue;
+                        }
+                        let row = self.load_identity(key).await?;
+                        let row = touched.entry(key).or_insert(row);
+                        apply_transfer(row, incoming, amount, tick);
                     }
-                    let row = self.load_identity(key).await?;
-                    let row = touched.entry(key).or_insert(row);
-                    if incoming {
-                        row.incoming_amount = row.incoming_amount.saturating_add(amount);
-                        row.balance = row.balance.saturating_add(amount);
-                    } else {
-                        row.outgoing_amount = row.outgoing_amount.saturating_add(amount);
-                        row.balance = row.balance.saturating_sub(amount);
-                    }
-                    row.transfer_count = row.transfer_count.saturating_add(1);
-                    row.last_seen_tick = row.last_seen_tick.max(verified.tick.tick);
-                    row.first_seen_tick = if row.first_seen_tick == 0 {
-                        verified.tick.tick
-                    } else {
-                        row.first_seen_tick.min(verified.tick.tick)
-                    };
                 }
+                EventBody::Burning { from, amount, .. } => {
+                    if from != [0u8; 32] {
+                        let row = self.load_identity(from).await?;
+                        let row = touched.entry(from).or_insert(row);
+                        apply_burn(row, amount, tick);
+                    }
+                }
+                EventBody::DustBurning { burns } => {
+                    for (key, amount) in burns {
+                        if key == [0u8; 32] {
+                            continue;
+                        }
+                        let row = self.load_identity(key).await?;
+                        let row = touched.entry(key).or_insert(row);
+                        apply_burn(row, amount, tick);
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -1005,6 +1080,36 @@ impl<S: Store + 'static> Indexer<S> {
         self.identities.insert(key, row.clone());
         Ok(row)
     }
+}
+
+/// Apply one side of a QU transfer to a materialized identity row.
+fn apply_transfer(row: &mut IdentityRow, incoming: bool, amount: i64, tick: u32) {
+    if incoming {
+        row.incoming_amount = row.incoming_amount.saturating_add(amount);
+        row.balance = row.balance.saturating_add(amount);
+    } else {
+        row.outgoing_amount = row.outgoing_amount.saturating_add(amount);
+        row.balance = row.balance.saturating_sub(amount);
+    }
+    row.transfer_count = row.transfer_count.saturating_add(1);
+    touch_identity(row, tick);
+}
+
+/// Burns remove QU without a matching transfer, so they only increase the
+/// outgoing side. They are not transfer events and do not bump the count.
+fn apply_burn(row: &mut IdentityRow, amount: i64, tick: u32) {
+    row.outgoing_amount = row.outgoing_amount.saturating_add(amount);
+    row.balance = row.balance.saturating_sub(amount);
+    touch_identity(row, tick);
+}
+
+fn touch_identity(row: &mut IdentityRow, tick: u32) {
+    row.last_seen_tick = row.last_seen_tick.max(tick);
+    row.first_seen_tick = if row.first_seen_tick == 0 {
+        tick
+    } else {
+        row.first_seen_tick.min(tick)
+    };
 }
 
 fn quorum_evidence(
@@ -1895,15 +2000,15 @@ fn event_body_json(event: &LogEvent) -> String {
         EventBody::QuTransfer { from, to, amount } => serde_json::json!({
             "from": key(from),
             "to": key(to),
-            "amount": amount.to_string(),
+            "amount": amount,
         }),
         EventBody::AssetIssuance { asset, shares } => serde_json::json!({
             "issuer": key(asset.issuer),
             "name": asset.name,
             "decimals": asset.decimals,
             "unit": asset.unit,
-            "managingContract": asset.managing_contract,
-            "shares": shares.to_string(),
+            "managing_contract": asset.managing_contract,
+            "shares": shares,
         }),
         EventBody::AssetOwnershipChange {
             from,
@@ -1915,8 +2020,8 @@ fn event_body_json(event: &LogEvent) -> String {
             "to": key(to),
             "issuer": key(asset.issuer),
             "name": asset.name,
-            "managingContract": asset.managing_contract,
-            "shares": shares.to_string(),
+            "managing_contract": asset.managing_contract,
+            "shares": shares,
         }),
         EventBody::AssetPossessionChange {
             from,
@@ -1928,8 +2033,8 @@ fn event_body_json(event: &LogEvent) -> String {
             "to": key(to),
             "issuer": key(asset.issuer),
             "name": asset.name,
-            "managingContract": asset.managing_contract,
-            "shares": shares.to_string(),
+            "managing_contract": asset.managing_contract,
+            "shares": shares,
         }),
         EventBody::Burning {
             from,
@@ -1937,13 +2042,13 @@ fn event_body_json(event: &LogEvent) -> String {
             contract_index,
         } => serde_json::json!({
             "from": key(from),
-            "amount": amount.to_string(),
-            "contractIndex": contract_index,
+            "amount": amount,
+            "contract_index": contract_index,
         }),
         EventBody::DustBurning { burns } => serde_json::json!({
             "burns": burns
                 .into_iter()
-                .map(|(who, amount)| serde_json::json!({ "identity": key(who), "amount": amount.to_string() }))
+                .map(|(who, amount)| serde_json::json!({ "identity": key(who), "amount": amount }))
                 .collect::<Vec<_>>(),
         }),
         EventBody::ContractMessage {
@@ -1951,12 +2056,12 @@ fn event_body_json(event: &LogEvent) -> String {
             message_type,
             data,
         } => serde_json::json!({
-            "contractIndex": contract_index,
-            "messageType": message_type,
+            "contract_index": contract_index,
+            "message_type": message_type,
             "data": hex::encode(data),
         }),
         EventBody::Custom { op_code, data } => serde_json::json!({
-            "opCode": op_code.to_string(),
+            "op_code": op_code.to_string(),
             "data": hex::encode(data),
         }),
         EventBody::Unknown { raw } => serde_json::json!({ "raw": hex::encode(raw) }),
@@ -2057,7 +2162,7 @@ mod tests {
         };
         let json = event_body_json(&event);
         assert!(json.contains(&PublicKey(key).to_identity()));
-        assert!(json.contains("\"42\""));
+        assert!(json.contains("\"amount\":42"));
     }
 
     #[test]

@@ -234,6 +234,50 @@ pub struct AssetRow {
     pub timestamp: DateTime<Utc>,
 }
 
+/// One counterparty of an identity, aggregated over indexed transfers.
+///
+/// `net_amount` is incoming minus outgoing. Amounts are in the base unit the
+/// network stores; this API does not rescale them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CounterpartyRow {
+    pub identity: String,
+    pub incoming_amount: i64,
+    pub outgoing_amount: i64,
+    pub net_amount: i64,
+    pub transaction_count: u64,
+    pub first_tick: u32,
+    pub last_tick: u32,
+}
+
+/// One bucket of an identity's incoming and outgoing QU flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FlowBucket {
+    pub bucket: DateTime<Utc>,
+    pub incoming_amount: i64,
+    pub outgoing_amount: i64,
+    pub net_amount: i64,
+    pub transaction_count: u64,
+    pub counterparty_count: u64,
+}
+
+/// One asset ownership or possession transfer event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetTransferRow {
+    pub epoch: u16,
+    pub tick: u32,
+    pub log_id: u64,
+    pub kind: String,
+    pub hash: String,
+    pub tx_index: i16,
+    pub issuer: String,
+    pub name: String,
+    pub from: String,
+    pub to: String,
+    pub shares: i64,
+    pub managing_contract: i64,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// Index-wide counts and progress for the network stats endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkStats {
@@ -443,6 +487,51 @@ pub trait Store: Send + Sync {
     /// Most recent transactions across all epochs, newest tick first.
     async fn recent_transactions(&self, limit: u32, offset: u64) -> Result<Vec<TransactionRow>>;
     async fn events_for_tick(&self, tick: u32, limit: u32, offset: u64) -> Result<Vec<EventRow>>;
+    /// Events emitted by one transaction hash, oldest log first.
+    async fn events_for_transaction(&self, hash: &str) -> Result<Vec<EventRow>> {
+        let _ = hash;
+        Err(Error::Config(
+            "transaction event storage unsupported".into(),
+        ))
+    }
+    /// Counterparties ranked by total transfer volume, then transaction count.
+    ///
+    /// `direction` is `incoming`, `outgoing`, or `all` (default).
+    async fn counterparties(
+        &self,
+        identity: &str,
+        direction: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<CounterpartyRow>> {
+        let _ = (identity, direction, limit);
+        Err(Error::Config("counterparty storage unsupported".into()))
+    }
+    /// Incoming and outgoing QU flow bucketed by `interval_seconds`, newest
+    /// bucket first. Buckets older than `from` are excluded.
+    async fn identity_flow(
+        &self,
+        identity: &str,
+        interval_seconds: u32,
+        from: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<FlowBucket>> {
+        let _ = (identity, interval_seconds, from, limit);
+        Err(Error::Config("identity flow storage unsupported".into()))
+    }
+    /// Ownership and possession transfer events for one asset, newest first.
+    ///
+    /// `kind` is `ownership`, `possession`, or `all` (default).
+    async fn asset_transfers(
+        &self,
+        issuer: &str,
+        name: &str,
+        kind: Option<&str>,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<AssetTransferRow>> {
+        let _ = (issuer, name, kind, limit, offset);
+        Err(Error::Config("asset transfer storage unsupported".into()))
+    }
     /// Events where `identity` is a participant, newest tick and log first.
     ///
     /// `limit` is clamped to `1..=500`. The default implementation reports the
@@ -590,6 +679,26 @@ pub trait Store: Send + Sync {
     /// Latest point plus series metadata. `None` when no points are stored.
     async fn price_snapshot(&self) -> Result<Option<PriceSnapshot>> {
         Err(Error::Config("price storage unsupported".into()))
+    }
+
+    /// Insert late-arriving log rows and raise the tick's event count without
+    /// rewriting transactions, identities, or the ingest cursor.
+    async fn repair_tick_logs(
+        &self,
+        epoch: u16,
+        tick: u32,
+        events: &[EventRow],
+        participants: &[EventParticipantRow],
+        event_count: u32,
+    ) -> Result<usize> {
+        let _ = (epoch, tick, events, participants, event_count);
+        Err(Error::Config("tick log repair unsupported".into()))
+    }
+
+    /// Ticks whose stored `event_count` is zero, used to target log repair.
+    async fn ticks_without_events(&self, epoch: u16, from: u32, to: u32) -> Result<Vec<u32>> {
+        let _ = (epoch, from, to);
+        Err(Error::Config("zero-event tick lookup unsupported".into()))
     }
 
     /// Persist a fully verified tick and advance the head cursor.
@@ -971,6 +1080,176 @@ LIMIT ? OFFSET ?
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    async fn events_for_transaction(&self, hash: &str) -> Result<Vec<EventRow>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM events FINAL WHERE tx_hash = ? \
+                 ORDER BY tick ASC, log_id ASC",
+            )
+            .bind(hash)
+            .fetch_all::<rows::EventSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn counterparties(
+        &self,
+        identity: &str,
+        direction: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<CounterpartyRow>> {
+        let include_outgoing = !matches!(direction, Some("incoming"));
+        let include_incoming = !matches!(direction, Some("outgoing"));
+        let mut branches = Vec::new();
+        if include_outgoing {
+            branches.push(
+                "SELECT destination AS counterparty, toInt64(0) AS incoming_amount, \
+                        amount AS outgoing_amount, tick \
+                 FROM (SELECT * FROM transactions WHERE source = ? \
+                       ORDER BY version DESC LIMIT 1 BY tick, tx_index)",
+            );
+        }
+        if include_incoming {
+            branches.push(
+                "SELECT source AS counterparty, amount AS incoming_amount, \
+                        toInt64(0) AS outgoing_amount, tick \
+                 FROM (SELECT * FROM transactions WHERE destination = ? \
+                       ORDER BY version DESC LIMIT 1 BY tick, tx_index)",
+            );
+        }
+        let sql = format!(
+            "SELECT counterparty, incoming_amount, outgoing_amount, \
+                    incoming_amount - outgoing_amount AS net_amount, \
+                    transaction_count, first_tick, last_tick \
+             FROM ( \
+                 SELECT counterparty, sum(incoming_amount) AS incoming_amount, \
+                        sum(outgoing_amount) AS outgoing_amount, \
+                        count() AS transaction_count, min(tick) AS first_tick, \
+                        max(tick) AS last_tick \
+                 FROM ({}) WHERE counterparty != ? \
+                 GROUP BY counterparty \
+             ) \
+             ORDER BY (incoming_amount + outgoing_amount) DESC, \
+                      transaction_count DESC, counterparty ASC LIMIT ?",
+            branches.join(" UNION ALL ")
+        );
+        let mut query = self.client.query(&sql);
+        if include_outgoing {
+            query = query.bind(identity);
+        }
+        if include_incoming {
+            query = query.bind(identity);
+        }
+        let rows = query
+            .bind(identity)
+            .bind(limit.clamp(1, 100))
+            .fetch_all::<rows::CounterpartySelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn identity_flow(
+        &self,
+        identity: &str,
+        interval_seconds: u32,
+        from: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<FlowBucket>> {
+        let interval = i64::from(interval_seconds.max(1));
+        let from_seconds = u32::try_from(from.timestamp()).unwrap_or(0);
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT bucket, incoming_amount, outgoing_amount,
+       incoming_amount - outgoing_amount AS net_amount,
+       transaction_count, counterparty_count
+FROM (
+    SELECT toDateTime64(toStartOfInterval(timestamp, toIntervalSecond(?)), 3, 'UTC') AS bucket,
+           sum(incoming_amount) AS incoming_amount,
+           sum(outgoing_amount) AS outgoing_amount,
+           count() AS transaction_count,
+           uniqExact(counterparty) AS counterparty_count
+    FROM (
+        SELECT timestamp, destination AS counterparty, toInt64(0) AS incoming_amount,
+               amount AS outgoing_amount
+        FROM (
+            SELECT * FROM transactions WHERE source = ?
+            ORDER BY version DESC LIMIT 1 BY tick, tx_index
+        )
+        UNION ALL
+        SELECT timestamp, source AS counterparty, amount AS incoming_amount,
+               toInt64(0) AS outgoing_amount
+        FROM (
+            SELECT * FROM transactions WHERE destination = ?
+            ORDER BY version DESC LIMIT 1 BY tick, tx_index
+        )
+    )
+    WHERE timestamp >= toDateTime64(?, 3, 'UTC')
+    GROUP BY bucket
+)
+ORDER BY bucket DESC
+LIMIT ?
+"#,
+            )
+            .bind(interval)
+            .bind(identity)
+            .bind(identity)
+            .bind(from_seconds)
+            .bind(limit.clamp(1, 1000))
+            .fetch_all::<rows::FlowBucketSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn asset_transfers(
+        &self,
+        issuer: &str,
+        name: &str,
+        kind: Option<&str>,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<AssetTransferRow>> {
+        let kind_clause = match kind {
+            Some("ownership") => " AND type_name = 'asset_ownership_change'",
+            Some("possession") => " AND type_name = 'asset_possession_change'",
+            _ => "",
+        };
+        let sql = format!(
+            r#"
+SELECT epoch, tick, log_id,
+       if(type_name = 'asset_ownership_change', 'ownership', 'possession') AS kind,
+       tx_hash AS hash, tx_index,
+       JSONExtractString(body, 'issuer') AS issuer,
+       JSONExtractString(body, 'name') AS name,
+       JSONExtractString(body, 'from') AS from_identity,
+       JSONExtractString(body, 'to') AS to_identity,
+       toInt64OrZero(JSONExtractString(body, 'shares')) AS shares,
+       toInt64OrZero(coalesce(
+           nullIf(JSONExtractString(body, 'managing_contract'), ''),
+           JSONExtractString(body, 'managingContract')
+       )) AS managing_contract,
+       timestamp
+FROM events FINAL
+WHERE type_name IN ('asset_ownership_change', 'asset_possession_change')
+  AND issuer = ? AND name = ?{kind_clause}
+ORDER BY tick DESC, log_id DESC
+LIMIT ? OFFSET ?
+"#
+        );
+        let rows = self
+            .client
+            .query(&sql)
+            .bind(issuer)
+            .bind(name)
+            .bind(limit.clamp(1, 200))
+            .bind(offset)
+            .fetch_all::<rows::AssetTransferSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     async fn events_for_identity(
         &self,
         identity: &str,
@@ -1185,17 +1464,13 @@ LIMIT ? OFFSET ?
         let head = self.head().await?;
         // uniqExact on the sorting keys is exact and still avoids FINAL, so
         // replayed ticks are not double counted before merges run.
-        let ticks = self
-            .count("SELECT uniqExact(epoch, tick) AS n FROM ticks")
-            .await?;
+        let ticks = self.count("SELECT count() AS n FROM ticks FINAL").await?;
         let transactions = self
-            .count("SELECT uniqExact(tick, tx_index) AS n FROM transactions")
+            .count("SELECT count() AS n FROM transactions FINAL")
             .await?;
-        let events = self
-            .count("SELECT uniqExact(epoch, log_id) AS n FROM events")
-            .await?;
+        let events = self.count("SELECT count() AS n FROM events FINAL").await?;
         let identities = self
-            .count("SELECT uniqExact(identity) AS n FROM identities")
+            .count("SELECT count() AS n FROM identities FINAL")
             .await?;
         let cursor = match self.cursor(CURSOR_HEAD).await? {
             Some(value) => serde_json::from_str(&value).unwrap_or_else(|_| json!(value)),
@@ -1333,7 +1608,10 @@ LIMIT ? OFFSET ?
                        JSONExtractString(body, 'name') AS name, \
                        toUInt8(JSONExtractUInt(body, 'decimals')) AS decimals, \
                        JSONExtractString(body, 'unit') AS unit, \
-                       JSONExtractInt(body, 'managingContract') AS managing_contract, \
+                       toInt64OrZero(coalesce( \
+                           nullIf(JSONExtractString(body, 'managing_contract'), ''), \
+                           JSONExtractString(body, 'managingContract') \
+                       )) AS managing_contract, \
                        toInt64OrZero(JSONExtractString(body, 'shares')) AS shares, \
                        tick AS issued_tick, \
                        log_id AS log_id, \
@@ -1384,7 +1662,10 @@ LIMIT ? OFFSET ?
                        JSONExtractString(body, 'name') AS name, \
                        toUInt8(JSONExtractUInt(body, 'decimals')) AS decimals, \
                        JSONExtractString(body, 'unit') AS unit, \
-                       JSONExtractInt(body, 'managingContract') AS managing_contract, \
+                       toInt64OrZero(coalesce( \
+                           nullIf(JSONExtractString(body, 'managing_contract'), ''), \
+                           JSONExtractString(body, 'managingContract') \
+                       )) AS managing_contract, \
                        toInt64OrZero(JSONExtractString(body, 'shares')) AS shares, \
                        tick AS issued_tick, \
                        log_id AS log_id, \
@@ -1412,6 +1693,34 @@ LIMIT ? OFFSET ?
         limit: u32,
         offset: u64,
     ) -> Result<Vec<TransactionRow>> {
+        if filter.identity.is_none() {
+            let mut sql = String::from("SELECT ?fields FROM transactions FINAL");
+            let mut conditions = Vec::new();
+            if filter.epoch.is_some() {
+                conditions.push("epoch = ?");
+            }
+            if filter.tick.is_some() {
+                conditions.push("tick = ?");
+            }
+            if !conditions.is_empty() {
+                sql.push_str(" WHERE ");
+                sql.push_str(&conditions.join(" AND "));
+            }
+            sql.push_str(" ORDER BY tick DESC, tx_index ASC LIMIT ? OFFSET ?");
+            let mut query = self.client.query(&sql);
+            if let Some(epoch) = filter.epoch {
+                query = query.bind(epoch);
+            }
+            if let Some(tick) = filter.tick {
+                query = query.bind(tick);
+            }
+            let rows = query
+                .bind(limit)
+                .bind(offset)
+                .fetch_all::<rows::TransactionSelect>()
+                .await?;
+            return Ok(rows.into_iter().map(Into::into).collect());
+        }
         let mut sql = String::from("SELECT ?fields FROM (SELECT * FROM transactions");
         let mut conditions = Vec::new();
         if filter.epoch.is_some() {
@@ -1456,7 +1765,7 @@ LIMIT ? OFFSET ?
         limit: u32,
         offset: u64,
     ) -> Result<Vec<EventRow>> {
-        let mut sql = String::from("SELECT ?fields FROM (SELECT * FROM events");
+        let mut sql = String::from("SELECT ?fields FROM events FINAL");
         let mut conditions = Vec::new();
         if filter.epoch.is_some() {
             conditions.push("epoch = ?");
@@ -1471,10 +1780,7 @@ LIMIT ? OFFSET ?
             sql.push_str(" WHERE ");
             sql.push_str(&conditions.join(" AND "));
         }
-        sql.push_str(
-            " ORDER BY version DESC LIMIT 1 BY epoch, log_id\
-             ) ORDER BY tick DESC, log_id DESC LIMIT ? OFFSET ?",
-        );
+        sql.push_str(" ORDER BY tick DESC, log_id DESC LIMIT ? OFFSET ?");
 
         let mut query = self.client.query(&sql);
         if let Some(epoch) = filter.epoch {
@@ -1498,10 +1804,8 @@ LIMIT ? OFFSET ?
         let rows = self
             .client
             .query(
-                "SELECT type_name, count() AS n FROM (\
-                     SELECT type_name FROM events \
-                     ORDER BY version DESC LIMIT 1 BY epoch, log_id\
-                 ) GROUP BY type_name ORDER BY n DESC, type_name ASC LIMIT ?",
+                "SELECT type_name, count() AS n FROM events FINAL \
+                 GROUP BY type_name ORDER BY n DESC, type_name ASC LIMIT ?",
             )
             .bind(limit)
             .fetch_all::<rows::EventTypeCountSelect>()
@@ -1514,10 +1818,9 @@ LIMIT ? OFFSET ?
         interval_seconds: u32,
         limit: u32,
     ) -> Result<Vec<ActivityBucket>> {
-        // The three branches read one deduplicated projection of each table so
-        // a replayed tick contributes exactly once. The interval is bound as a
-        // value (not interpolated) and each count is widened to UInt64 so the
-        // union has one type per column.
+        // FINAL resolves replayed rows without a separate deduplicating sort.
+        // `toStartOfInterval` returns DateTime; the explicit DateTime64 cast
+        // matches the RowBinary shape used by the store.
         let interval = i64::from(interval_seconds.max(1));
         let rows = self
             .client
@@ -1529,37 +1832,28 @@ SELECT bucket,
        sum(events) AS events,
        sum(volume) AS volume
 FROM (
-    SELECT toStartOfInterval(timestamp, toIntervalSecond(?)) AS bucket,
+    SELECT toDateTime64(toStartOfInterval(timestamp, toIntervalSecond(?)), 3, 'UTC') AS bucket,
            count() AS ticks,
            toUInt64(0) AS transactions,
            toUInt64(0) AS events,
            toInt64(0) AS volume
-    FROM (
-        SELECT timestamp FROM ticks
-        ORDER BY version DESC LIMIT 1 BY epoch, tick
-    )
+    FROM ticks FINAL
     GROUP BY bucket
     UNION ALL
-    SELECT toStartOfInterval(timestamp, toIntervalSecond(?)) AS bucket,
+    SELECT toDateTime64(toStartOfInterval(timestamp, toIntervalSecond(?)), 3, 'UTC') AS bucket,
            toUInt64(0) AS ticks,
            count() AS transactions,
            toUInt64(0) AS events,
            sum(amount) AS volume
-    FROM (
-        SELECT timestamp, amount FROM transactions
-        ORDER BY version DESC LIMIT 1 BY tick, tx_index
-    )
+    FROM transactions FINAL
     GROUP BY bucket
     UNION ALL
-    SELECT toStartOfInterval(timestamp, toIntervalSecond(?)) AS bucket,
+    SELECT toDateTime64(toStartOfInterval(timestamp, toIntervalSecond(?)), 3, 'UTC') AS bucket,
            toUInt64(0) AS ticks,
            toUInt64(0) AS transactions,
            count() AS events,
            toInt64(0) AS volume
-    FROM (
-        SELECT timestamp FROM events
-        ORDER BY version DESC LIMIT 1 BY epoch, log_id
-    )
+    FROM events FINAL
     GROUP BY bucket
 )
 GROUP BY bucket
@@ -1581,17 +1875,13 @@ LIMIT ?
         let epochs = self
             .count("SELECT uniqExact(epoch) AS n FROM ticks")
             .await?;
-        let ticks = self
-            .count("SELECT uniqExact(epoch, tick) AS n FROM ticks")
-            .await?;
+        let ticks = self.count("SELECT count() AS n FROM ticks FINAL").await?;
         let transactions = self
-            .count("SELECT uniqExact(tick, tx_index) AS n FROM transactions")
+            .count("SELECT count() AS n FROM transactions FINAL")
             .await?;
-        let events = self
-            .count("SELECT uniqExact(epoch, log_id) AS n FROM events")
-            .await?;
+        let events = self.count("SELECT count() AS n FROM events FINAL").await?;
         let identities = self
-            .count("SELECT uniqExact(identity) AS n FROM identities")
+            .count("SELECT count() AS n FROM identities FINAL")
             .await?;
         let ingest = self.ingest_cursor().await?;
         Ok(NetworkStats {
@@ -1764,6 +2054,89 @@ LIMIT ?
             latest: Some(latest),
             points,
         }))
+    }
+
+    async fn repair_tick_logs(
+        &self,
+        epoch: u16,
+        tick: u32,
+        events: &[EventRow],
+        participants: &[EventParticipantRow],
+        event_count: u32,
+    ) -> Result<usize> {
+        let version = Self::timestamp_version(Utc::now());
+        let current = self
+            .client
+            .query(
+                "SELECT epoch, tick, timestamp, computor_index, transaction_count, \
+                        event_count, signature, tick_digest, verification \
+                 FROM ticks WHERE epoch = ? AND tick = ? \
+                 ORDER BY version DESC LIMIT 1",
+            )
+            .bind(epoch)
+            .bind(tick)
+            .fetch_optional::<rows::TickFullSelect>()
+            .await?;
+        if current
+            .as_ref()
+            .is_some_and(|current| current.event_count >= event_count)
+        {
+            return Ok(0);
+        }
+        let inserts = events
+            .iter()
+            .map(|event| rows::EventInsert {
+                epoch: event.epoch,
+                tick: event.tick,
+                log_id: event.log_id,
+                log_type: event.log_type,
+                type_name: event.type_name.clone(),
+                tx_hash: event.tx_hash.clone(),
+                tx_index: event.tx_index,
+                body: event.body.clone(),
+                log_digest: event.log_digest,
+                timestamp: event.timestamp,
+                version,
+            })
+            .collect::<Vec<_>>();
+        writer::insert_all(&self.client, "events", &inserts).await?;
+        self.write_event_participants(participants).await?;
+        if let Some(current) = current {
+            if event_count > current.event_count {
+                let row = rows::TickInsert {
+                    epoch: current.epoch,
+                    tick: current.tick,
+                    timestamp: current.timestamp,
+                    computor_index: current.computor_index,
+                    transaction_count: current.transaction_count,
+                    event_count,
+                    signature: current.signature,
+                    tick_digest: current.tick_digest,
+                    verification: current.verification,
+                    version,
+                };
+                writer::insert_all(&self.client, "ticks", &[row]).await?;
+            }
+        }
+        Ok(inserts.len())
+    }
+
+    async fn ticks_without_events(&self, epoch: u16, from: u32, to: u32) -> Result<Vec<u32>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT tick FROM (\
+                     SELECT epoch, tick, event_count FROM ticks \
+                     ORDER BY version DESC LIMIT 1 BY epoch, tick\
+                 ) WHERE epoch = ? AND event_count = 0 AND tick BETWEEN ? AND ? \
+                 ORDER BY tick",
+            )
+            .bind(epoch)
+            .bind(from)
+            .bind(to)
+            .fetch_all::<rows::TickNumberSelect>()
+            .await?;
+        Ok(rows.into_iter().map(|row| row.tick).collect())
     }
 
     async fn write_tick(&self, batch: &TickBatch) -> Result<WriteOutcome> {

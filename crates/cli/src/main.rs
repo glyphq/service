@@ -40,7 +40,7 @@ enum Command {
         #[arg(long)]
         no_verify_signatures: bool,
     },
-    /// Read the current QUBIC/USDT price from a peer.
+    /// Read QUBIC/USDT from a peer, falling back to exchange prices.
     Price {
         #[arg(long, default_value = "157.180.10.49:21841")]
         peer: SocketAddr,
@@ -176,14 +176,33 @@ async fn main() -> anyhow::Result<()> {
                         "series_digest": hex::encode(price.digest),
                     }))?
                 ),
-                None => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "pair": api::prices::PRICE_PAIR,
-                        "available": false,
-                        "detail": "no active QUBIC/USDT oracle subscription and no usable QPayhub price",
-                    }))?
-                ),
+                None => match api::market::fetch_once(&api::market::MarketConfig::from_env()).await
+                {
+                    Ok(snapshot) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "pair": api::prices::PRICE_PAIR,
+                            "available": true,
+                            "onchain": false,
+                            "price_e8": snapshot.price_e8,
+                            "price_usdt": api::prices::price_usdt(snapshot.price_e8),
+                            "source": api::prices::PRICE_SOURCE_MARKET,
+                            "source_name": api::prices::source_name(api::prices::PRICE_SOURCE_MARKET),
+                            "sources": snapshot.sources,
+                            "fetched_at": snapshot.fetched_at,
+                            "stale": snapshot.stale(),
+                            "detail": "no active QUBIC/USDT oracle subscription and no usable QPayhub price; using the external exchange consensus",
+                        }))?
+                    ),
+                    Err(error) => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "pair": api::prices::PRICE_PAIR,
+                            "available": false,
+                            "detail": format!("no on-chain or external QUBIC/USDT price is available: {error}"),
+                        }))?
+                    ),
+                },
             }
         }
         Command::Sync {

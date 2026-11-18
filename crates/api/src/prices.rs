@@ -14,7 +14,7 @@
 //! only for hours whose value changed. The oracle reply itself is verified by
 //! the Qubic network; this poller only selects it and scales its ratio.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +35,7 @@ use serde_json::{Value, json};
 use store::{PricePointRow, PriceSnapshot, Store};
 use tokio_util::sync::CancellationToken;
 
+use crate::market::{MarketCache, MarketSnapshot};
 use crate::stream::StreamHub;
 use crate::{ApiError, AppState};
 
@@ -56,6 +57,9 @@ pub const PRICE_PAIR: &str = "QUBIC/USDT";
 pub const PRICE_SOURCE_ORACLE: u32 = PRICE_ORACLE_INTERFACE_INDEX;
 /// QPayhub contract index, used only as a secondary price source.
 pub const QPAYHUB_CONTRACT_INDEX: u32 = 29;
+/// Synthetic source used when no on-chain oracle point exists and the price
+/// comes from the external QUBIC/USDT exchange consensus.
+pub const PRICE_SOURCE_MARKET: u32 = 1000;
 /// QPayhub `GetQuUsdPrice` read function input type.
 pub const QPAYHUB_GET_QU_USD_PRICE_INPUT_TYPE: u16 = 4;
 /// Cap on subscriptions inspected in one discovery pass.
@@ -93,13 +97,29 @@ async fn prices(
     State(state): State<AppState>,
     Query(params): Query<PriceQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let from_hour = params.from_hour.unwrap_or(0);
     let limit = params
         .limit
         .unwrap_or(PRICE_WINDOW_DEFAULT)
         .clamp(1, PRICE_WINDOW_MAX);
-    let latest = state.store.latest_price().await?;
-    let rows = state.store.price_points(from_hour, limit).await?;
+    let stored_latest = state.store.latest_price().await?;
+    let market = state.market.snapshot();
+    let latest = stored_latest
+        .clone()
+        .or_else(|| market.as_ref().map(market_point));
+    // An unspecified window ends at the newest point. Anchoring the default at
+    // hour zero would pin the first page to the oldest rows forever once the
+    // series grows beyond `limit` hours.
+    let from_hour = params.from_hour.unwrap_or_else(|| {
+        latest
+            .as_ref()
+            .map_or(0, |row| row.hour.saturating_sub(limit.saturating_sub(1)))
+    });
+    let mut rows = state.store.price_points(from_hour, limit).await?;
+    if rows.is_empty() && stored_latest.is_none() {
+        if let Some(point) = latest.clone() {
+            rows.push(point);
+        }
+    }
     let data: Vec<Value> = rows.iter().map(point_json).collect();
     Ok((
         [(header::CACHE_CONTROL, SHORT_CACHE)],
@@ -115,7 +135,12 @@ async fn latest(State(state): State<AppState>) -> Result<impl IntoResponse, ApiE
         .store
         .latest_price()
         .await?
-        .ok_or_else(|| ApiError::not_found("no QUBIC/USDT price data has been indexed"))?;
+        .or_else(|| state.market.snapshot().as_ref().map(market_point));
+    let row = row.ok_or_else(|| {
+        ApiError::not_found(
+            "no QUBIC/USDT price is available from the on-chain oracle or external exchanges",
+        )
+    })?;
     Ok((
         [(header::CACHE_CONTROL, NO_STORE)],
         Json(json!({
@@ -133,7 +158,23 @@ async fn latest(State(state): State<AppState>) -> Result<impl IntoResponse, ApiE
 }
 
 async fn snapshot(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let snapshot = state.store.price_snapshot().await?;
+    let stored = state.store.price_snapshot().await?;
+    let snapshot = stored.or_else(|| {
+        let market = state.market.snapshot()?;
+        let point = market_point(&market);
+        Some(PriceSnapshot {
+            latest: Some(point.clone()),
+            points: 1,
+            synced: point.synced != 0,
+            bound: false,
+            source: PRICE_SOURCE_MARKET,
+            series_digest: point.series_digest,
+            epoch: 0,
+            append_tick: 0,
+            source_tick: 0,
+            observed_at: point.observed_at,
+        })
+    });
     let available = snapshot.is_some();
     let stale = snapshot
         .as_ref()
@@ -152,9 +193,32 @@ async fn snapshot(State(state): State<AppState>) -> Result<impl IntoResponse, Ap
             .map_or("none", |snapshot| source_name(snapshot.source)),
         "stale": stale,
         "available": available,
+        "onchain": snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.source != PRICE_SOURCE_MARKET),
     });
     if !available {
         meta["warning"] = json!(no_price_warning());
+        if let Some(market) = state.market.snapshot() {
+            meta["market"] = json!({
+                "pair": "QUBIC/USD",
+                "price_usd": market.price_usd,
+                "market_cap_usd": market.market_cap_usd,
+                "volume_24h_usd": market.volume_24h_usd,
+                "change_24h_percent": market.change_24h_percent,
+                "source": market.source,
+                "last_updated_at": market.last_updated_at.map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
+                "external": true,
+                "note": "Fallback spot reference; no on-chain QUBIC/USDT oracle point exists yet."
+            });
+        }
+    } else if snapshot
+        .as_ref()
+        .is_some_and(|snapshot| snapshot.source == PRICE_SOURCE_MARKET)
+    {
+        meta["warning"] = json!(
+            "no on-chain QUBIC/USDT oracle point exists; price is the external exchange consensus"
+        );
     } else if stale {
         meta["warning"] =
             json!("the latest QUBIC/USDT price is marked stale by its on-chain source");
@@ -174,10 +238,21 @@ async fn history(
         .unwrap_or(PRICE_HISTORY_DEFAULT)
         .clamp(1, PRICE_WINDOW_MAX);
     let current = price_hour_at(Utc::now());
-    let from_hour = current.saturating_sub(hours.saturating_sub(1));
-    let latest = state.store.latest_price().await?;
+    let stored_latest = state.store.latest_price().await?;
+    let latest = stored_latest
+        .clone()
+        .or_else(|| state.market.snapshot().as_ref().map(market_point));
+    // The window ends at the newest stored hour, not the wall clock. A poller
+    // outage must not blank the chart while recent points are still stored.
+    let latest_hour = latest.as_ref().map_or(current, |row| row.hour.min(current));
+    let from_hour = latest_hour.saturating_sub(hours.saturating_sub(1));
     let mut rows = state.store.price_points(from_hour, hours).await?;
-    rows.retain(|row| row.hour <= current);
+    rows.retain(|row| row.hour <= latest_hour);
+    if rows.is_empty() && stored_latest.is_none() {
+        if let Some(point) = latest.clone() {
+            rows.push(point);
+        }
+    }
     let data: Vec<Value> = rows.iter().map(point_json).collect();
     Ok((
         [(header::CACHE_CONTROL, SHORT_CACHE)],
@@ -274,12 +349,13 @@ pub fn source_name(source: u32) -> &'static str {
     match source {
         PRICE_SOURCE_ORACLE => "price_oracle",
         QPAYHUB_CONTRACT_INDEX => "qpayhub",
+        PRICE_SOURCE_MARKET => "external_market",
         _ => "unknown",
     }
 }
 
 fn no_price_warning() -> &'static str {
-    "no on-chain QUBIC/USDT price is available yet; the poller found no active Price oracle subscription with a revealed QUBIC/USDT reply and the QPayhub GetQuUsdPrice fallback returned no usable value"
+    "no on-chain QUBIC/USDT price is available; using the external exchange consensus for the spot price"
 }
 
 /// Core price hour for a UTC timestamp. Timestamps before the epoch map to 0.
@@ -410,6 +486,45 @@ impl OnchainPrice {
     }
 }
 
+/// Converts an external exchange snapshot into the on-chain price shape.
+pub fn market_price(snapshot: &MarketSnapshot) -> OnchainPrice {
+    OnchainPrice {
+        price_e8: snapshot.price_e8,
+        source: PRICE_SOURCE_MARKET,
+        source_tick: 0,
+        append_tick: 0,
+        epoch: 0,
+        stale: market_stale(snapshot),
+        digest: [0u8; 32],
+    }
+}
+
+/// Builds a response/storage point from an external exchange snapshot.
+pub fn market_point(snapshot: &MarketSnapshot) -> PricePointRow {
+    PricePointRow {
+        hour: price_hour_at(snapshot.fetched_at),
+        append_tick: 0,
+        source_tick: 0,
+        epoch: 0,
+        flags: if market_stale(snapshot) {
+            PRICE_POINT_FLAG_STALE
+        } else {
+            0
+        },
+        price_e8: snapshot.price_e8,
+        source: PRICE_SOURCE_MARKET,
+        synced: u8::from(!market_stale(snapshot)),
+        bound: 0,
+        series_digest: [0u8; 32],
+        observed_at: snapshot.fetched_at,
+        version: 0,
+    }
+}
+
+fn market_stale(snapshot: &MarketSnapshot) -> bool {
+    snapshot.stale()
+}
+
 /// Reads the latest verified QUBIC/USDT price from the best reachable peer.
 ///
 /// The Price oracle subscription reader is tried first. If it finds no active
@@ -483,7 +598,13 @@ pub async fn oracle_price(pool: &NodePool) -> node::Result<Option<OnchainPrice>>
         let Some(query_bytes) = response.query.as_deref() else {
             continue;
         };
-        let query = PriceOracleQuery::decode(query_bytes)?;
+        let query = match PriceOracleQuery::decode(query_bytes) {
+            Ok(query) => query,
+            Err(error) => {
+                tracing::debug!(%error, subscription_id, "skipping undecodable revealed query");
+                continue;
+            }
+        };
         let orientation = match pair_orientation(&query) {
             Some(orientation) => orientation,
             None => continue,
@@ -491,7 +612,13 @@ pub async fn oracle_price(pool: &NodePool) -> node::Result<Option<OnchainPrice>>
         let Some(reply_bytes) = response.reply.as_deref() else {
             continue;
         };
-        let reply = PriceOracleReply::decode(reply_bytes)?;
+        let reply = match PriceOracleReply::decode(reply_bytes) {
+            Ok(reply) => reply,
+            Err(error) => {
+                tracing::debug!(%error, subscription_id, "skipping undecodable oracle reply");
+                continue;
+            }
+        };
         let Some(price_e8) = orientation.price_e8(reply.numerator, reply.denominator) else {
             continue;
         };
@@ -558,15 +685,23 @@ pub fn unix_millis(now: DateTime<Utc>) -> u64 {
     u64::try_from(now.timestamp_millis()).unwrap_or(0)
 }
 
-/// Selects rows whose `(hour, price_e8)` pair has not been published yet and
-/// records them in `last_published`.
+/// Selects rows whose value changed for their hour and records them in
+/// `last_published`.
+///
+/// The map holds one entry per hour instead of one per observed value, so a
+/// long-running poller does not accumulate an unbounded set. A price that
+/// returns to an earlier value within the same hour is still published.
 pub fn changed_rows<'a>(
     rows: &'a [PricePointRow],
-    last_published: &mut HashSet<(u32, i64)>,
+    last_published: &mut HashMap<u32, i64>,
 ) -> Vec<&'a PricePointRow> {
     let mut changed = Vec::new();
     for row in rows {
-        if last_published.insert((row.hour, row.price_e8)) {
+        let differs = last_published
+            .get(&row.hour)
+            .is_none_or(|price| *price != row.price_e8);
+        if differs {
+            last_published.insert(row.hour, row.price_e8);
             changed.push(row);
         }
     }
@@ -579,7 +714,7 @@ pub async fn persist_series(
     store: &dyn Store,
     hub: Option<&StreamHub>,
     rows: &[PricePointRow],
-    last_published: &mut HashSet<(u32, i64)>,
+    last_published: &mut HashMap<u32, i64>,
 ) -> store::Result<usize> {
     if rows.is_empty() {
         return Ok(0);
@@ -603,25 +738,27 @@ pub async fn run_poller(
     store: Arc<dyn Store>,
     peers: Vec<PeerConfig>,
     hub: Option<Arc<StreamHub>>,
+    market: Arc<MarketCache>,
     interval: Duration,
     cancel: CancellationToken,
 ) {
-    if peers.is_empty() {
-        tracing::warn!("price poller has no QUBIC_PEERS configured; not polling");
-        return;
-    }
-
     let interval = if interval.is_zero() {
         Duration::from_millis(PRICE_POLL_MS)
     } else {
         interval
     };
+    let has_peers = !peers.is_empty();
+    if !has_peers {
+        tracing::warn!(
+            "price poller has no QUBIC_PEERS configured; using external exchange prices only"
+        );
+    }
     let pool = NodePool::new(peers);
-    let mut last_published = HashSet::new();
+    let mut last_published = HashMap::new();
     let mut last_version = 0u64;
     match store.latest_price().await {
         Ok(Some(latest)) => {
-            last_published.insert((latest.hour, latest.price_e8));
+            last_published.insert(latest.hour, latest.price_e8);
             last_version = latest.version;
         }
         Ok(None) => {}
@@ -634,15 +771,41 @@ pub async fn run_poller(
         if cancel.is_cancelled() {
             break;
         }
-        let epoch = match pool.head().await {
-            Ok(head) => head.epoch,
+        let epoch = if has_peers {
+            match pool.head().await {
+                Ok(head) => head.epoch,
+                Err(error) => {
+                    tracing::debug!(%error, "price poller could not read the peer head for the epoch");
+                    0
+                }
+            }
+        } else {
+            0
+        };
+        let onchain = if has_peers {
+            read_price(&pool).await
+        } else {
+            Ok(None)
+        };
+        let mut price = match onchain {
+            Ok(Some(price)) => Some(price),
+            Ok(None) => None,
             Err(error) => {
-                tracing::debug!(%error, "price poller could not read the peer head for the epoch");
-                0
+                tracing::warn!(
+                    %error,
+                    "on-chain QUBIC/USDT price fetch failed; using the external exchange consensus"
+                );
+                None
             }
         };
-        match read_price(&pool).await {
-            Ok(Some(mut price)) => {
+        if price.is_none() {
+            price = market.snapshot().as_ref().map(market_price);
+            if price.is_some() {
+                tracing::debug!("no on-chain QUBIC/USDT price; using external market fallback");
+            }
+        }
+        match price {
+            Some(mut price) => {
                 price.epoch = epoch;
                 let observed_at = Utc::now();
                 let hour = price_hour_at(observed_at);
@@ -667,15 +830,9 @@ pub async fn run_poller(
                     }
                 }
             }
-            Ok(None) => {
+            None => {
                 tracing::warn!(
-                    "no on-chain QUBIC/USDT price is available; will retry next interval"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "QUBIC/USDT price fetch failed; trying the peer pool again next interval"
+                    "no on-chain or external QUBIC/USDT price is available; will retry next interval"
                 );
             }
         }
@@ -697,6 +854,7 @@ mod tests {
     use axum::http::HeaderMap;
     use axum::http::{Request, StatusCode};
     use chrono::TimeZone;
+    use futures_util::StreamExt;
     use qubic::messages::PriceOracleQuery;
     use tower::ServiceExt;
 
@@ -974,6 +1132,41 @@ mod tests {
         (status, body, headers)
     }
 
+    fn stream_app(hub: Arc<StreamHub>) -> Router {
+        let mut state = AppState::new(Arc::new(MockStore::default()));
+        state.hub = Some(hub);
+        Router::new()
+            .merge(router())
+            .merge(crate::stream::router())
+            .with_state(state)
+    }
+
+    async fn open_stream(app: Router, uri: &str) -> axum::response::Response {
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            response.headers()[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/event-stream"),
+            "stream response must be server-sent events"
+        );
+        response
+    }
+
+    async fn next_sse_frame(response: axum::response::Response) -> String {
+        let mut body = response.into_body().into_data_stream();
+        let chunk = tokio::time::timeout(Duration::from_secs(2), body.next())
+            .await
+            .expect("an SSE frame arrives before the test times out")
+            .expect("the SSE body is open")
+            .expect("the SSE frame is readable");
+        String::from_utf8(chunk.to_vec()).expect("the SSE frame is UTF-8")
+    }
+
     async fn seeded_store() -> Arc<MockStore> {
         let store = Arc::new(MockStore::default());
         store
@@ -1101,7 +1294,7 @@ mod tests {
     #[test]
     fn only_changed_hours_are_selected_for_broadcast() {
         let rows = vec![test_row(100, 10, 1), test_row(101, 20, 1)];
-        let mut published = HashSet::new();
+        let mut published = HashMap::new();
         let first: Vec<u32> = changed_rows(&rows, &mut published)
             .into_iter()
             .map(|row| row.hour)
@@ -1114,6 +1307,12 @@ mod tests {
         let changed = changed_rows(&updated, &mut published);
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0].hour, 100);
+
+        // Returning to an earlier value in the same hour is a change too.
+        updated[0].price_e8 = 10;
+        let reverted = changed_rows(&updated, &mut published);
+        assert_eq!(reverted.len(), 1);
+        assert_eq!(reverted[0].price_e8, 10);
     }
 
     #[tokio::test]
@@ -1121,7 +1320,7 @@ mod tests {
         let store = Arc::new(MockStore::default());
         store.fail_write.store(true, Ordering::SeqCst);
         let rows = vec![test_row(100, 10, 1)];
-        let mut published = HashSet::new();
+        let mut published = HashMap::new();
 
         let error = persist_series(store.as_ref(), None, &rows, &mut published).await;
         assert!(error.is_err(), "the write error is reported, not panicked");
@@ -1190,6 +1389,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_defaults_to_the_newest_window() {
+        let store = Arc::new(MockStore::default());
+        let rows: Vec<PricePointRow> = (0..PRICE_WINDOW_DEFAULT + 10)
+            .map(|hour| test_row(hour, i64::from(hour) + 100, u64::from(hour)))
+            .collect();
+        store.write_price_points(&rows).await.unwrap();
+
+        let (status, body, _) = request(store, "/v1/prices").await;
+        assert_eq!(status, StatusCode::OK);
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(data.len(), PRICE_WINDOW_DEFAULT as usize);
+        assert_eq!(data[0]["hour"], 10, "the oldest rows are not pinned first");
+        assert_eq!(data.last().unwrap()["hour"], 177);
+        assert_eq!(body["meta"]["from_hour"], 10);
+        assert_eq!(body["meta"]["latest_hour"], 177);
+    }
+
+    #[tokio::test]
     async fn empty_snapshot_reports_not_ready_with_warning() {
         let (status, body, headers) =
             request(Arc::new(MockStore::default()), "/v1/prices/snapshot").await;
@@ -1207,14 +1424,183 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_poller_without_peers_returns_immediately() {
+    async fn price_endpoints_fall_back_to_external_market() {
+        let cache = Arc::new(MarketCache::default());
+        cache.store(MarketSnapshot {
+            source: "mexc+gate+coingecko".into(),
+            coin_id: "qubic-network".into(),
+            price_usd: 0.000_000_35,
+            price_e8: 35,
+            market_cap_usd: Some(51_000_000.0),
+            volume_24h_usd: Some(1_900_000.0),
+            change_24h_percent: Some(-8.0),
+            last_updated_at: Some(Utc::now()),
+            fetched_at: Utc::now(),
+            sources: Vec::new(),
+        });
+        let mut state = AppState::new(Arc::new(MockStore::default()));
+        state.market = cache;
+        let app = router().with_state(state);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/prices/latest")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["data"]["price_e8"], 35);
+        assert_eq!(body["data"]["source"], PRICE_SOURCE_MARKET);
+        assert_eq!(body["data"]["source_name"], "external_market");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/prices/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["data"]["latest"]["price_e8"], 35);
+        assert_eq!(body["meta"]["onchain"], false);
+        assert!(
+            body["meta"]["warning"]
+                .as_str()
+                .unwrap()
+                .contains("external exchange consensus")
+        );
+    }
+
+    #[tokio::test]
+    async fn history_window_ends_at_the_latest_stored_hour() {
+        let store = seeded_store().await;
+        let (status, body, _) = request(store, "/v1/prices/history?hours=2").await;
+        assert_eq!(status, StatusCode::OK);
+        let data = body["data"].as_array().unwrap();
+        assert_eq!(
+            data.len(),
+            2,
+            "stored points are returned without the clock"
+        );
+        assert_eq!(data[0]["hour"], 100);
+        assert_eq!(data[1]["hour"], 101);
+        assert_eq!(body["meta"]["from_hour"], 100);
+        assert_eq!(body["meta"]["latest_hour"], 101);
+        assert_eq!(body["meta"]["count"], 2);
+    }
+
+    #[tokio::test]
+    async fn price_persistence_publishes_changed_hours_once() {
+        let store = Arc::new(MockStore::default());
+        let hub = Arc::new(StreamHub::new());
+        let mut receiver = hub.subscribe();
+        let mut published = HashMap::new();
+        let rows = vec![test_row(100, 10, 1)];
+
+        let count = persist_series(store.as_ref(), Some(hub.as_ref()), &rows, &mut published)
+            .await
+            .expect("the price row is stored");
+        assert_eq!(count, 1);
+        let event = receiver.recv().await.expect("a price event is published");
+        assert_eq!(event.event, "price");
+        assert_eq!(event.id, "price:100");
+        assert_eq!(event.data["hour"], 100);
+        assert_eq!(event.data["price_e8"], 10);
+
+        let count = persist_series(store.as_ref(), Some(hub.as_ref()), &rows, &mut published)
+            .await
+            .expect("the duplicate write still succeeds");
+        assert_eq!(count, 0, "an unchanged hour must not be republished");
+        assert!(
+            receiver.try_recv().is_err(),
+            "no duplicate price event is queued"
+        );
+    }
+
+    #[tokio::test]
+    async fn price_stream_route_emits_only_price_events() {
+        let hub = Arc::new(StreamHub::new());
+        let response = open_stream(stream_app(hub.clone()), "/v1/stream/prices").await;
+
+        hub.publish_event("market", "market:1".into(), json!({ "price_e8": 1 }));
+        hub.publish_event(
+            "price",
+            "price:100".into(),
+            json!({ "hour": 100, "price_e8": 10 }),
+        );
+
+        let frame = next_sse_frame(response).await;
+        assert!(frame.contains("event: price"), "unexpected frame: {frame}");
+        assert!(frame.contains("id: price:100"), "unexpected frame: {frame}");
+        assert!(
+            !frame.contains("market"),
+            "market events must be filtered: {frame}"
+        );
+    }
+
+    #[tokio::test]
+    async fn price_stream_route_overrides_the_types_filter() {
+        let hub = Arc::new(StreamHub::new());
+        let response = open_stream(stream_app(hub.clone()), "/v1/stream/prices?types=market").await;
+
+        hub.publish_event("market", "market:1".into(), json!({ "price_e8": 1 }));
+        hub.publish_event(
+            "price",
+            "price:101".into(),
+            json!({ "hour": 101, "price_e8": 11 }),
+        );
+
+        let frame = next_sse_frame(response).await;
+        assert!(frame.contains("event: price"), "unexpected frame: {frame}");
+        assert!(!frame.contains("market"), "unexpected frame: {frame}");
+    }
+
+    #[tokio::test]
+    async fn general_stream_honors_the_price_type_filter() {
+        let hub = Arc::new(StreamHub::new());
+        let response = open_stream(stream_app(hub.clone()), "/v1/stream?types=price").await;
+
+        hub.publish_event("transaction", "tx:abc".into(), json!({ "hash": "abc" }));
+        hub.publish_event(
+            "price",
+            "price:102".into(),
+            json!({ "hour": 102, "price_e8": 12 }),
+        );
+
+        let frame = next_sse_frame(response).await;
+        assert!(frame.contains("event: price"), "unexpected frame: {frame}");
+        assert!(
+            !frame.contains("transaction"),
+            "transaction events must be filtered: {frame}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_poller_without_peers_can_cancel() {
         let store: Arc<dyn Store> = Arc::new(MockStore::default());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
         run_poller(
             store,
             Vec::new(),
             None,
+            Arc::new(MarketCache::default()),
             Duration::from_millis(1),
-            CancellationToken::new(),
+            cancel,
         )
         .await;
     }
@@ -1228,6 +1614,7 @@ mod tests {
             store,
             vec![PeerConfig::new("127.0.0.1:1".parse().unwrap())],
             None,
+            Arc::new(MarketCache::default()),
             Duration::from_millis(1),
             cancel,
         )

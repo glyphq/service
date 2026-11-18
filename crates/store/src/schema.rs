@@ -158,6 +158,17 @@ ADD PROJECTION IF NOT EXISTS by_type
 )
 "#;
 
+/// Events produced by one transaction are looked up by hash from the explorer
+/// transaction page. The natural key is `(epoch, log_id)`, so this projection
+/// turns the lookup into a bounded primary-key read.
+pub const CREATE_EVENTS_BY_TX_HASH: &str = r#"
+ALTER TABLE {database}.events
+ADD PROJECTION IF NOT EXISTS by_tx_hash
+(
+    SELECT * ORDER BY (tx_hash, epoch, log_id)
+)
+"#;
+
 /// Normalized `(identity, role)` index over event logs.
 ///
 /// The events table keeps participants inside the JSON `body`, which cannot be
@@ -328,6 +339,7 @@ pub const ALL: &[&str] = &[
     CREATE_EVENTS_BY_TICK,
     CREATE_EVENTS_RECENT,
     CREATE_EVENTS_BY_TYPE,
+    CREATE_EVENTS_BY_TX_HASH,
     CREATE_EVENT_PARTICIPANTS,
     ALTER_EVENT_PARTICIPANTS_SETTINGS,
     CREATE_EVENT_PARTICIPANTS_BY_TICK,

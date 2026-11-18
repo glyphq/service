@@ -9,16 +9,19 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActivityBucket, AssetRow, ComputorRow, EpochRow, EventParticipantRow, EventRow, EventTypeCount,
-    IdentityActivityRow, IdentityRow, PricePointRow, QuorumEvidenceRow, Result, TickRow,
-    TransactionRow,
+    ActivityBucket, AssetRow, AssetTransferRow, ComputorRow, CounterpartyRow, EpochRow,
+    EventParticipantRow, EventRow, EventTypeCount, FlowBucket, IdentityActivityRow, IdentityRow,
+    PricePointRow, QuorumEvidenceRow, Result, TickRow, TransactionRow,
 };
 
 /// RowBinary encodes `FixedString(N)` as N raw bytes. Serde's array impl only
 /// covers lengths up to 32, so serialize byte arrays as fixed-length tuples.
 pub(crate) mod fixed_bytes {
-    use serde::Serializer;
+    use std::marker::PhantomData;
+
+    use serde::de::{SeqAccess, Visitor};
     use serde::ser::SerializeTuple;
+    use serde::{Deserializer, Serializer};
 
     pub fn serialize<const N: usize, S>(bytes: &[u8; N], serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -29,6 +32,36 @@ pub(crate) mod fixed_bytes {
             tuple.serialize_element(byte)?;
         }
         tuple.end()
+    }
+
+    pub fn deserialize<'de, const N: usize, D>(deserializer: D) -> Result<[u8; N], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FixedBytesVisitor<const N: usize>(PhantomData<[u8; N]>);
+
+        impl<'de, const N: usize> Visitor<'de> for FixedBytesVisitor<N> {
+            type Value = [u8; N];
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{N} bytes")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut bytes = [0u8; N];
+                for (index, byte) in bytes.iter_mut().enumerate() {
+                    *byte = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+                }
+                Ok(bytes)
+            }
+        }
+
+        deserializer.deserialize_tuple(N, FixedBytesVisitor(PhantomData))
     }
 }
 
@@ -59,6 +92,27 @@ pub(crate) struct TickSelect {
     pub transaction_count: u32,
     pub event_count: u32,
     pub verification: String,
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct TickFullSelect {
+    pub epoch: u16,
+    pub tick: u32,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+    pub computor_index: u16,
+    pub transaction_count: u32,
+    pub event_count: u32,
+    #[serde(with = "fixed_bytes")]
+    pub signature: [u8; 64],
+    #[serde(with = "fixed_bytes")]
+    pub tick_digest: [u8; 32],
+    pub verification: String,
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct TickNumberSelect {
+    pub tick: u32,
 }
 
 impl From<TickSelect> for TickRow {
@@ -586,6 +640,93 @@ impl From<PricePointSelect> for PricePointRow {
             series_digest: row.series_digest,
             observed_at: row.observed_at,
             version: row.version,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct CounterpartySelect {
+    pub counterparty: String,
+    pub incoming_amount: i64,
+    pub outgoing_amount: i64,
+    pub net_amount: i64,
+    pub transaction_count: u64,
+    pub first_tick: u32,
+    pub last_tick: u32,
+}
+
+impl From<CounterpartySelect> for CounterpartyRow {
+    fn from(row: CounterpartySelect) -> Self {
+        Self {
+            identity: row.counterparty,
+            incoming_amount: row.incoming_amount,
+            outgoing_amount: row.outgoing_amount,
+            net_amount: row.net_amount,
+            transaction_count: row.transaction_count,
+            first_tick: row.first_tick,
+            last_tick: row.last_tick,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct FlowBucketSelect {
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub bucket: DateTime<Utc>,
+    pub incoming_amount: i64,
+    pub outgoing_amount: i64,
+    pub net_amount: i64,
+    pub transaction_count: u64,
+    pub counterparty_count: u64,
+}
+
+impl From<FlowBucketSelect> for FlowBucket {
+    fn from(row: FlowBucketSelect) -> Self {
+        Self {
+            bucket: row.bucket,
+            incoming_amount: row.incoming_amount,
+            outgoing_amount: row.outgoing_amount,
+            net_amount: row.net_amount,
+            transaction_count: row.transaction_count,
+            counterparty_count: row.counterparty_count,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct AssetTransferSelect {
+    pub epoch: u16,
+    pub tick: u32,
+    pub log_id: u64,
+    pub kind: String,
+    pub hash: String,
+    pub tx_index: i16,
+    pub issuer: String,
+    pub name: String,
+    pub from_identity: String,
+    pub to_identity: String,
+    pub shares: i64,
+    pub managing_contract: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+}
+
+impl From<AssetTransferSelect> for AssetTransferRow {
+    fn from(row: AssetTransferSelect) -> Self {
+        Self {
+            epoch: row.epoch,
+            tick: row.tick,
+            log_id: row.log_id,
+            kind: row.kind,
+            hash: row.hash,
+            tx_index: row.tx_index,
+            issuer: row.issuer,
+            name: row.name,
+            from: row.from_identity,
+            to: row.to_identity,
+            shares: row.shares,
+            managing_contract: row.managing_contract,
+            timestamp: row.timestamp,
         }
     }
 }

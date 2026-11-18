@@ -4,7 +4,10 @@
 //! are intentionally separate from the ClickHouse read path so a peer outage
 //! cannot affect indexed history.
 
+use std::time::Duration;
+
 use axum::extract::Query;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
@@ -16,6 +19,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{ApiError, AppState};
+
+/// The qli tx-status request is an optional peer add-on. Peers that do not
+/// run it silently drop the request, so cap how long an optional status probe
+/// can hold a request open instead of paying the full peer retry budget.
+const TX_STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -37,11 +45,38 @@ struct RawQuery {
     section: Option<String>,
 }
 
+fn parse_tick(raw: &str) -> Result<u32, ApiError> {
+    raw.trim().parse::<u32>().map_err(|_| {
+        ApiError::bad_request(format!(
+            "invalid tick {raw:?}: expected an unsigned 32-bit integer"
+        ))
+    })
+}
+
+/// Maps axum body rejections onto the problem+json error envelope so a
+/// malformed request body never falls back to axum's plain-text rejection.
+fn json_body<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
+    payload.map(|Json(value)| value).map_err(|rejection| {
+        let status = rejection.status();
+        let (status, code) = if status == StatusCode::UNSUPPORTED_MEDIA_TYPE {
+            (status, "unsupported_media_type")
+        } else {
+            (StatusCode::BAD_REQUEST, "bad_request")
+        };
+        ApiError {
+            status,
+            code,
+            detail: rejection.body_text(),
+        }
+    })
+}
+
 async fn raw_bundle(
     State(state): State<AppState>,
-    Path(tick): Path<u32>,
+    Path(tick): Path<String>,
     Query(params): Query<RawQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let tick = parse_tick(&tick)?;
     let Some(archive) = state.archive.clone() else {
         return Err(ApiError::unavailable(
             "raw archive is not configured; set S3_BUCKET or ARCHIVE_DIR",
@@ -163,7 +198,7 @@ async fn network_transaction(
     State(state): State<AppState>,
     Path(hash): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let hash = hash.to_ascii_lowercase();
+    let hash = hash.trim().to_ascii_lowercase();
     let digest =
         qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
     let mut peer = connect(&state).await?;
@@ -172,25 +207,31 @@ async fn network_transaction(
         .await
         .map_err(|error| ApiError::unavailable(format!("transaction lookup failed: {error}")))?
         .ok_or_else(|| ApiError::not_found(format!("peer does not retain transaction {hash}")))?;
-    Ok((Json(json!({
-        "data": {
-            "hash": hash,
-            "source": qubic::PublicKey(transaction.source).to_identity(),
-            "destination": qubic::PublicKey(transaction.destination).to_identity(),
-            "amount": transaction.amount,
-            "tick": transaction.tick,
-            "input_type": transaction.input_type,
-            "input_data": hex::encode(&transaction.input),
-        },
-        "meta": { "source": "peer" }
-    })),))
+    Ok((
+        [(
+            axum::http::header::CACHE_CONTROL,
+            "public, max-age=2, stale-while-revalidate=5",
+        )],
+        Json(json!({
+            "data": {
+                "hash": hash,
+                "source": qubic::PublicKey(transaction.source).to_identity(),
+                "destination": qubic::PublicKey(transaction.destination).to_identity(),
+                "amount": transaction.amount,
+                "tick": transaction.tick,
+                "input_type": transaction.input_type,
+                "input_data": hex::encode(&transaction.input),
+            },
+            "meta": { "source": "peer" }
+        })),
+    ))
 }
 
 async fn network_transaction_status(
     State(state): State<AppState>,
     Path(hash): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let hash = hash.to_ascii_lowercase();
+    let hash = hash.trim().to_ascii_lowercase();
     let digest =
         qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
     let mut peer = connect(&state).await?;
@@ -273,7 +314,10 @@ impl ValidationCheck {
 
 /// Local preflight checks for a signed transaction. This never opens a peer
 /// connection and never broadcasts, so it is safe to enable unconditionally.
-async fn validate(Json(body): Json<ValidateBody>) -> Result<impl IntoResponse, ApiError> {
+async fn validate(
+    payload: Result<Json<ValidateBody>, JsonRejection>,
+) -> Result<impl IntoResponse, ApiError> {
+    let body = json_body(payload)?;
     let raw = body.raw.trim();
     let hex_body = raw
         .strip_prefix("0x")
@@ -310,13 +354,21 @@ async fn validate(Json(body): Json<ValidateBody>) -> Result<impl IntoResponse, A
 
 async fn tx_status(
     State(state): State<AppState>,
-    Path(tick): Path<u32>,
+    Path(tick): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let tick = parse_tick(&tick)?;
     let mut peer = connect(&state).await?;
-    let status = peer
-        .tx_status(tick)
-        .await
-        .map_err(|error| ApiError::unavailable(format!("tx status unavailable: {error}")))?;
+    let status = match tokio::time::timeout(TX_STATUS_TIMEOUT, peer.tx_status(tick)).await {
+        Ok(result) => result
+            .map_err(|error| ApiError::unavailable(format!("tx status unavailable: {error}")))?,
+        Err(_) => {
+            return Err(ApiError::unavailable(format!(
+                "peer did not answer tx status for tick {tick} within {}s; \
+                 the peer may not run the tx-status add-on or may have pruned the tick",
+                TX_STATUS_TIMEOUT.as_secs()
+            )));
+        }
+    };
     let transactions: Vec<Value> = status
         .transactions
         .iter()
@@ -354,12 +406,20 @@ struct ContractQuery {
 async fn contract_query(
     State(state): State<AppState>,
     Path(contract_index): Path<u32>,
-    Json(body): Json<ContractQuery>,
+    payload: Result<Json<ContractQuery>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let body = json_body(payload)?;
     let input_type = body.input_type.unwrap_or(0);
     let input = match body.input {
-        Some(value) => hex::decode(value.trim_start_matches("0x"))
-            .map_err(|error| ApiError::bad_request(format!("input is not hex: {error}")))?,
+        Some(value) => {
+            let value = value.trim();
+            let value = value
+                .strip_prefix("0x")
+                .or_else(|| value.strip_prefix("0X"))
+                .unwrap_or(value);
+            hex::decode(value)
+                .map_err(|error| ApiError::bad_request(format!("input is not hex: {error}")))?
+        }
         None => Vec::new(),
     };
     if input.len() > qubic::messages::MAX_INPUT_SIZE {

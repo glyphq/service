@@ -31,10 +31,16 @@ protocol as the source of truth:
 - Raw tick archive as zstd-compressed QBB1 bundles on local disk or any S3-compatible store.
 - REST resources for ticks, transactions, events, identities, wallets, assets, epochs,
   the on-chain QUBIC/USDT price, analytics, search, and network status.
-- SSE and WebSocket streams that follow the verified local head.
+- Explorer-shaped reads that answer a whole page in one request: transaction effects,
+  identity counterparties, bucketed QU flow, and asset transfer history.
+- External QUBIC/USDT market consensus from MEXC and Gate.io, with CoinGecko
+  reference data, cached in memory and exposed beside the verified on-chain series.
+- SSE and WebSocket streams that follow the verified local head, with per-identity
+  and per-asset filters.
 - Optional direct-peer routes for entity lookup, transaction status, contract queries,
   and signed transaction broadcast.
-- A server-rendered status dashboard at `/status` and a Scalar API reference at `/docs`.
+- A server-rendered status dashboard at `/status` and a branded Scalar API reference
+  at `/docs`, with local logo and favicon assets.
 - Docker Compose deployment with ClickHouse, SeaweedFS S3, schema migration, API, and
   indexer, plus a no-Compose runner for Container-Optimized hosts and local scripts for
   development without Docker.
@@ -159,6 +165,9 @@ The most common variables are below. The full list is in
 | `BROADCAST_PEERS` | `3` | Peers per broadcast fan-out, capped at `8` |
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval |
 | `PRICE_POLL_MS` | `60000` | Live price feed refresh interval |
+| `MARKET_ENABLED` | `true` | Set `false` to disable the external market poller |
+| `MARKET_POLL_MS` | `5000` | Market provider round-robin interval |
+| `COINGECKO_API_KEY`, `COINGECKO_URL`, `MEXC_URL`, `GATE_URL` | unset | Market data endpoints and optional key |
 | `ARCHIVE_DIR` | unset | Filesystem raw archive when S3 is unset |
 | `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PREFIX` | unset | Raw archive to any S3-compatible store |
 | `ARCHIVE_FAIL_CLOSED` | `false` | Fail a tick instead of indexing when archiving fails |
@@ -184,20 +193,26 @@ curl -sS 'localhost:8080/v1/ticks?epoch=240&limit=25'
 curl -sS localhost:8080/v1/ticks/91915000
 curl -sS 'localhost:8080/v1/ticks/91915000/events?limit=25'
 curl -sS localhost:8080/v1/transactions/<hash>
+curl -sS localhost:8080/v1/transactions/<hash>/effects
 curl -sS localhost:8080/v1/transactions/<hash>/status
 
 # Identity history, including contract-originated effects
 curl -sS 'localhost:8080/v1/identities/<identity>/activity?limit=25'
 curl -sS 'localhost:8080/v1/identities/<identity>/events?limit=25'
+curl -sS 'localhost:8080/v1/identities/<identity>/counterparties?limit=10'
+curl -sS 'localhost:8080/v1/identities/<identity>/flow?interval=3600&limit=24'
 
 # Wallets and assets
 curl -sS localhost:8080/v1/wallets/<identity>
+curl -sS 'localhost:8080/v1/assets/<issuer>/<name>/transfers?limit=25'
 curl -sS 'localhost:8080/v1/assets/<issuer>/<name>/holders?limit=25'
 
-# Prices, analytics, and streams
+# Prices, market, analytics, and streams
 curl -sS 'localhost:8080/v1/prices/history?hours=24'
+curl -sS localhost:8080/v1/market
 curl -sS 'localhost:8080/v1/analytics/activity?interval=3600&limit=24'
 curl -sS -N 'localhost:8080/v1/stream?types=tick,event'
+curl -sS -N 'localhost:8080/v1/stream?identity=<identity>'
 
 # Validation, broadcast, archive, docs
 curl -sS -X POST localhost:8080/v1/transactions/validate \

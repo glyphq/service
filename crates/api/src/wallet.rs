@@ -28,6 +28,7 @@ use qubic::messages::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::dto::PageParams;
 use crate::{ApiError, AppState};
 
 pub fn router() -> Router<AppState> {
@@ -36,6 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/wallets/{identity}/assets", get(wallet_assets))
         .route("/v1/wallets/{identity}/snapshot", get(wallet_snapshot))
         .route("/v1/assets/{issuer}/{name}/holders", get(asset_holders))
+        .route("/v1/assets/{issuer}/{name}/transfers", get(asset_transfers))
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +50,28 @@ struct WalletAssetsQuery {
 struct HoldersQuery {
     #[serde(default)]
     limit: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TransfersQuery {
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    offset: Option<u64>,
+}
+
+impl TransfersQuery {
+    fn page(&self) -> PageParams {
+        PageParams {
+            limit: self.limit,
+            cursor: self.cursor.clone(),
+            offset: self.offset,
+        }
+    }
 }
 
 /// One ownership holder after ranking and truncation.
@@ -101,13 +125,15 @@ fn normalize_asset_name(input: &str) -> Result<String, ApiError> {
 
 /// Encodes a validated 1..=7 character asset name exactly like core.
 ///
-/// Core stores each character as `char - '0'` in the corresponding
-/// little-endian byte of the `u64` asset name, zero-padding the remainder.
+/// Core packs the raw ASCII bytes of the name into the little-endian bytes of
+/// the `u64` asset name, zero-padding the remainder. The bytes are the
+/// characters themselves, not an offset from `'0'`; decoding a peer record
+/// yields the same ASCII bytes.
 fn encode_asset_name(name: &str) -> Result<u64, ApiError> {
     let name = normalize_asset_name(name)?;
     let mut encoded = 0u64;
     for (index, byte) in name.bytes().enumerate() {
-        encoded |= u64::from(byte - b'0') << (index * 8);
+        encoded |= u64::from(byte) << (index * 8);
     }
     Ok(encoded)
 }
@@ -224,7 +250,10 @@ fn rank_holders(
 ) -> (Vec<Holder>, bool) {
     let mut totals: HashMap<String, i64> = HashMap::new();
     for (identity, shares) in entries {
-        *totals.entry(identity).or_insert(0) += shares;
+        // Peer records are untrusted, so repeated ownership rows must not be
+        // able to overflow the accumulator and panic the request.
+        let total = totals.entry(identity).or_insert(0);
+        *total = total.saturating_add(shares);
     }
     let mut holders: Vec<Holder> = totals
         .into_iter()
@@ -476,6 +505,68 @@ async fn asset_holders(
     ))
 }
 
+/// Ownership and possession transfers for one asset, newest first.
+///
+/// The local index records every decoded `asset_ownership_change` and
+/// `asset_possession_change` log, so this works even when no peer is
+/// configured and without rebuilding the full holder set.
+async fn asset_transfers(
+    State(state): State<AppState>,
+    Path((issuer, name)): Path<(String, String)>,
+    Query(params): Query<TransfersQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let (issuer, _) = parse_identity(&issuer)?;
+    let name = normalize_asset_name(&name)?;
+    let kind = match params.kind.as_deref() {
+        None | Some("") | Some("all") => "all",
+        Some("ownership") => "ownership",
+        Some("possession") => "possession",
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown transfer kind {other:?}; expected ownership, possession, or all"
+            )));
+        }
+    };
+    let page = params
+        .page()
+        .resolve(&format!("assets/{issuer}/{name}/transfers?kind={kind}"))?;
+    let mut rows = state
+        .store
+        .asset_transfers(
+            &issuer,
+            &name,
+            (kind != "all").then_some(kind),
+            page.fetch_limit(),
+            page.offset,
+        )
+        .await?;
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
+    Ok((
+        [(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=5, stale-while-revalidate=10"),
+        )],
+        Json(json!({
+            "data": rows,
+            "meta": {
+                "issuer": issuer,
+                "name": name,
+                "kind": kind,
+                "source": "index",
+                "limit": page.limit,
+                "offset": page.offset,
+                "count": rows.len(),
+                "has_more": has_more,
+                "next_cursor": has_more.then(|| crate::dto::encode_cursor(
+                    &format!("assets/{issuer}/{name}/transfers?kind={kind}"),
+                    page.offset + rows.len() as u64,
+                )),
+            }
+        })),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,21 +598,24 @@ mod tests {
 
     #[test]
     fn asset_name_encoding_matches_core() {
-        assert_eq!(encode_asset_name("0").unwrap(), 0);
-        assert_eq!(encode_asset_name("A").unwrap(), 0x11);
-        assert_eq!(encode_asset_name("QX").unwrap(), 0x28_21);
+        assert_eq!(encode_asset_name("0").unwrap(), 0x30);
+        assert_eq!(encode_asset_name("A").unwrap(), 0x41);
+        assert_eq!(encode_asset_name("QX").unwrap(), 0x5851);
         assert_eq!(
             encode_asset_name("ABCDEFG").unwrap(),
-            (0x11u64)
-                | (0x12u64 << 8)
-                | (0x13u64 << 16)
-                | (0x14u64 << 24)
-                | (0x15u64 << 32)
-                | (0x16u64 << 40)
-                | (0x17u64 << 48)
+            (0x41u64)
+                | (0x42u64 << 8)
+                | (0x43u64 << 16)
+                | (0x44u64 << 24)
+                | (0x45u64 << 32)
+                | (0x46u64 << 40)
+                | (0x47u64 << 48)
         );
+        // The packed name is the ASCII bytes a peer decodes back into a name.
+        let name = encode_asset_name("QCAP").unwrap().to_le_bytes();
+        assert_eq!(qubic::messages::asset_name_string(&name), "QCAP");
         // Lower-case input is normalised before encoding.
-        assert_eq!(encode_asset_name("qx").unwrap(), 0x28_21);
+        assert_eq!(encode_asset_name("qx").unwrap(), 0x5851);
     }
 
     #[test]
@@ -657,5 +751,22 @@ mod tests {
         assert_eq!(holders.len(), 1);
         assert_eq!(holders[0].identity, "A");
         assert!(truncated);
+    }
+
+    #[test]
+    fn holders_saturate_instead_of_overflowing() {
+        let (holders, _) = rank_holders(
+            vec![
+                ("A".to_string(), i64::MAX),
+                ("A".to_string(), 1),
+                ("B".to_string(), i64::MIN),
+                ("B".to_string(), -1),
+            ],
+            10,
+        );
+        assert_eq!(holders[0].identity, "A");
+        assert_eq!(holders[0].shares, i64::MAX);
+        assert_eq!(holders[1].identity, "B");
+        assert_eq!(holders[1].shares, i64::MIN);
     }
 }

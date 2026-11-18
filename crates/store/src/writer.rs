@@ -303,7 +303,11 @@ async fn advance_ingest(store: &ClickHouseStore, batch: &TickBatch) -> Result<()
     store.set_ingest_cursor(&cursor).await
 }
 
-async fn insert_all<T>(client: &clickhouse::Client, table: &str, rows: &[T]) -> Result<()>
+pub(crate) async fn insert_all<T>(
+    client: &clickhouse::Client,
+    table: &str,
+    rows: &[T],
+) -> Result<()>
 where
     T: clickhouse::Row + Serialize,
 {

@@ -8,9 +8,10 @@ use axum::response::IntoResponse;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 use store::{
-    ActivityBucket, AssetRow, ComputorRow, EpochRow, EventFilter, EventRow, EventTypeCount,
-    IdentityRow, IngestCursor, NetworkStats, QuorumEvidenceRow, Result as StoreResult, Store,
-    TickBatch, TickRow, TransactionFilter, TransactionRow, WriteOutcome,
+    ActivityBucket, AssetRow, AssetTransferRow, ComputorRow, CounterpartyRow, EpochRow,
+    EventFilter, EventRow, EventTypeCount, FlowBucket, IdentityRow, IngestCursor, NetworkStats,
+    QuorumEvidenceRow, Result as StoreResult, Store, TickBatch, TickRow, TransactionFilter,
+    TransactionRow, WriteOutcome,
 };
 use tower::ServiceExt;
 
@@ -71,7 +72,7 @@ impl MockStore {
                 })
             })
             .collect();
-        let events = [7u32, 6, 5]
+        let mut events: Vec<EventRow> = [7u32, 6, 5]
             .into_iter()
             .map(|tick| EventRow {
                 epoch: if tick == 5 { 2 } else { 1 },
@@ -86,6 +87,32 @@ impl MockStore {
                 timestamp: timestamp(),
             })
             .collect();
+        events.push(EventRow {
+            epoch: 1,
+            tick: 7,
+            log_id: 71,
+            log_type: 0,
+            type_name: "qu_transfer".into(),
+            tx_hash: hash_for(7, 0),
+            tx_index: 0,
+            body: format!(r#"{{"from":"{IDENTITY}","to":"{OTHER}","amount":"5"}}"#),
+            log_digest: 71,
+            timestamp: timestamp(),
+        });
+        events.push(EventRow {
+            epoch: 1,
+            tick: 7,
+            log_id: 72,
+            log_type: 2,
+            type_name: "asset_ownership_change".into(),
+            tx_hash: hash_for(7, 0),
+            tx_index: 0,
+            body: format!(
+                r#"{{"from":"{IDENTITY}","to":"{OTHER}","issuer":"{IDENTITY}","name":"QX","managingContract":1,"shares":"10"}}"#
+            ),
+            log_digest: 72,
+            timestamp: timestamp(),
+        });
         let identities = vec![
             IdentityRow {
                 identity: IDENTITY.into(),
@@ -231,6 +258,157 @@ impl Store for MockStore {
             .iter()
             .filter(|row| row.tick == tick)
             .cloned()
+            .collect();
+        Ok(page(&rows, limit, offset))
+    }
+
+    async fn events_for_transaction(&self, hash: &str) -> StoreResult<Vec<EventRow>> {
+        Ok(self
+            .events
+            .iter()
+            .filter(|row| row.tx_hash == hash)
+            .cloned()
+            .collect())
+    }
+
+    async fn counterparties(
+        &self,
+        identity: &str,
+        direction: Option<&str>,
+        limit: u32,
+    ) -> StoreResult<Vec<CounterpartyRow>> {
+        let mut totals: std::collections::HashMap<String, CounterpartyRow> =
+            std::collections::HashMap::new();
+        for row in &self.transactions {
+            let (counterparty, incoming) = if row.source == identity {
+                (row.destination.clone(), false)
+            } else if row.destination == identity {
+                (row.source.clone(), true)
+            } else {
+                continue;
+            };
+            if counterparty == identity {
+                continue;
+            }
+            if direction == Some("incoming") && !incoming {
+                continue;
+            }
+            if direction == Some("outgoing") && incoming {
+                continue;
+            }
+            let entry = totals
+                .entry(counterparty.clone())
+                .or_insert(CounterpartyRow {
+                    identity: counterparty,
+                    incoming_amount: 0,
+                    outgoing_amount: 0,
+                    net_amount: 0,
+                    transaction_count: 0,
+                    first_tick: row.tick,
+                    last_tick: row.tick,
+                });
+            if incoming {
+                entry.incoming_amount = entry.incoming_amount.saturating_add(row.amount);
+            } else {
+                entry.outgoing_amount = entry.outgoing_amount.saturating_add(row.amount);
+            }
+            entry.net_amount = entry.incoming_amount - entry.outgoing_amount;
+            entry.transaction_count += 1;
+            entry.first_tick = entry.first_tick.min(row.tick);
+            entry.last_tick = entry.last_tick.max(row.tick);
+        }
+        let mut rows: Vec<_> = totals.into_values().collect();
+        rows.sort_by(|a, b| {
+            (b.incoming_amount + b.outgoing_amount)
+                .cmp(&(a.incoming_amount + a.outgoing_amount))
+                .then_with(|| b.transaction_count.cmp(&a.transaction_count))
+        });
+        rows.truncate(limit as usize);
+        Ok(rows)
+    }
+
+    async fn identity_flow(
+        &self,
+        identity: &str,
+        _interval_seconds: u32,
+        _from: chrono::DateTime<Utc>,
+        limit: u32,
+    ) -> StoreResult<Vec<FlowBucket>> {
+        let mut incoming = 0i64;
+        let mut outgoing = 0i64;
+        let mut count = 0u64;
+        for row in &self.transactions {
+            if row.source == identity {
+                outgoing = outgoing.saturating_add(row.amount);
+                count += 1;
+            } else if row.destination == identity {
+                incoming = incoming.saturating_add(row.amount);
+                count += 1;
+            }
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        Ok(vec![FlowBucket {
+            bucket: timestamp(),
+            incoming_amount: incoming,
+            outgoing_amount: outgoing,
+            net_amount: incoming - outgoing,
+            transaction_count: count,
+            counterparty_count: 1,
+        }])
+    }
+
+    async fn asset_transfers(
+        &self,
+        issuer: &str,
+        name: &str,
+        kind: Option<&str>,
+        limit: u32,
+        offset: u64,
+    ) -> StoreResult<Vec<AssetTransferRow>> {
+        let rows: Vec<_> = self
+            .events
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row.type_name.as_str(),
+                    "asset_ownership_change" | "asset_possession_change"
+                )
+            })
+            .filter(|row| match kind {
+                Some("ownership") => row.type_name == "asset_ownership_change",
+                Some("possession") => row.type_name == "asset_possession_change",
+                _ => true,
+            })
+            .filter_map(|row| {
+                let body: Value = serde_json::from_str(&row.body).ok()?;
+                if body.get("issuer")?.as_str()? != issuer || body.get("name")?.as_str()? != name {
+                    return None;
+                }
+                Some(AssetTransferRow {
+                    epoch: row.epoch,
+                    tick: row.tick,
+                    log_id: row.log_id,
+                    kind: if row.type_name == "asset_ownership_change" {
+                        "ownership".into()
+                    } else {
+                        "possession".into()
+                    },
+                    hash: row.tx_hash.clone(),
+                    tx_index: row.tx_index,
+                    issuer: issuer.into(),
+                    name: name.into(),
+                    from: body.get("from")?.as_str()?.into(),
+                    to: body.get("to")?.as_str()?.into(),
+                    shares: body.get("shares")?.as_str()?.parse().ok()?,
+                    managing_contract: body
+                        .get("managingContract")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0),
+                    timestamp: row.timestamp,
+                })
+            })
             .collect();
         Ok(page(&rows, limit, offset))
     }
@@ -1073,4 +1251,82 @@ async fn raw_archive_serves_a_section() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn transaction_effects_combine_events_and_summary() {
+    let hash = hash_for(7, 0);
+    let (status, body) = get(&format!("/v1/transactions/{hash}/effects")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["transaction"]["hash"], hash);
+    assert_eq!(body["data"]["tick"]["tick"], 7);
+    assert_eq!(body["data"]["summary"]["qu_transfer_count"], 1);
+    assert_eq!(body["data"]["summary"]["qu_transfer_amount"], 5);
+    assert_eq!(body["data"]["summary"]["asset_ownership_change_count"], 1);
+    assert_eq!(body["data"]["effects"][0]["kind"], "qu_transfer");
+    assert_eq!(body["data"]["effects"][0]["amount"], 5);
+}
+
+#[tokio::test]
+async fn identity_counterparties_and_flow_are_aggregated() {
+    let (status, body) = get(&format!("/v1/identities/{IDENTITY}/counterparties?limit=5")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["meta"]["count"], 1);
+    assert_eq!(body["data"][0]["identity"], OTHER);
+    assert_eq!(body["data"][0]["incoming_amount"], 144);
+    assert_eq!(body["data"][0]["outgoing_amount"], 144);
+    assert_eq!(body["data"][0]["net_amount"], 0);
+    assert_eq!(body["data"][0]["transaction_count"], 6);
+
+    let (status, body) = get(&format!(
+        "/v1/identities/{IDENTITY}/flow?interval=3600&limit=3"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"].as_array().unwrap().len(), 3);
+    assert_eq!(body["meta"]["totals"]["incoming_amount"], 144);
+    assert_eq!(body["meta"]["totals"]["outgoing_amount"], 144);
+    assert_eq!(body["meta"]["totals"]["net_amount"], 0);
+    assert_eq!(body["meta"]["totals"]["transaction_count"], 6);
+}
+
+#[tokio::test]
+async fn asset_transfers_are_paged_locally() {
+    let (status, body) = get(&format!("/v1/assets/{IDENTITY}/QX/transfers?limit=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(body["data"][0]["kind"], "ownership");
+    assert_eq!(body["data"][0]["from"], IDENTITY);
+    assert_eq!(body["data"][0]["to"], OTHER);
+    assert_eq!(body["data"][0]["shares"], 10);
+    assert_eq!(body["meta"]["issuer"], IDENTITY);
+    assert_eq!(body["meta"]["name"], "QX");
+}
+
+#[tokio::test]
+async fn search_returns_every_matching_resource_type() {
+    let (status, body) = get("/v1/search?q=7").await;
+    assert_eq!(status, StatusCode::OK);
+    let types: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["type"].as_str())
+        .collect();
+    assert!(types.contains(&"tick"));
+
+    let (status, body) = get("/v1/search?q=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let types: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|item| item["type"].as_str())
+        .collect();
+    assert!(types.contains(&"epoch"));
+
+    let (status, body) = get(&format!("/v1/search?q={IDENTITY}/QX")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["type"], "asset");
+    assert_eq!(body["data"][0]["value"]["name"], "QX");
 }

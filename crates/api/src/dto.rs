@@ -122,9 +122,66 @@ pub fn decode_cursor(token: &str, fingerprint: &str) -> Result<u64, ApiError> {
 pub fn event_value(row: EventRow) -> Value {
     let mut value = serde_json::to_value(row).expect("EventRow is serializable");
     if let Some(body) = value.get("body").and_then(Value::as_str) {
-        if let Ok(parsed) = serde_json::from_str::<Value>(body) {
+        if let Ok(mut parsed) = serde_json::from_str::<Value>(body) {
+            normalize_event_body(&mut parsed);
             value["body"] = parsed;
         }
+    }
+    value
+}
+
+/// Older event rows were written with camelCase keys and string-encoded
+/// amounts. Both are normalized on read so the public JSON keeps the documented
+/// snake_case and integer conventions without a full re-index.
+fn normalize_event_body(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let entries = std::mem::take(map);
+            for (key, mut value) in entries {
+                normalize_event_body(&mut value);
+                let key = snake_case_key(&key);
+                map.insert(key.clone(), normalize_event_scalar(&key, value));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_event_body(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn snake_case_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len() + 4);
+    for (index, ch) in key.char_indices() {
+        if ch.is_ascii_uppercase() {
+            if index > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn normalize_event_scalar(key: &str, value: Value) -> Value {
+    if !matches!(key, "amount" | "shares") {
+        return value;
+    }
+    let Value::String(text) = &value else {
+        return value;
+    };
+    // Only convert canonical decimal integers; leave hex data and hashes alone.
+    if !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'-')
+        && let Ok(number) = text.parse::<i64>()
+    {
+        return json!(number);
     }
     value
 }

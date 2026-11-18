@@ -263,11 +263,12 @@ fn render(view: &StatusView) -> String {
     html.push_str("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">");
     html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">");
     html.push_str("<meta http-equiv=\"refresh\" content=\"5\">");
-    html.push_str("<title>Glyph API status</title><style>");
+    html.push_str("<link rel=\"icon\" href=\"/favicon.png\">");
+    html.push_str("<title>Glyph API Status</title><style>");
     html.push_str(STYLE);
     html.push_str("</style></head><body><main>");
 
-    html.push_str("<header><div><h1>Glyph API status</h1>");
+    html.push_str("<header><div><h1>Glyph API Status</h1>");
     html.push_str(
         "<p class=\"muted\">Server-rendered dashboard, refreshes every 5 seconds.</p></div>",
     );
@@ -380,11 +381,14 @@ fn render(view: &StatusView) -> String {
     html.push_str("</tbody></table></section>");
 
     html.push_str("</div><nav aria-label=\"Related endpoints\">");
+    html.push_str("<a href=\"/healthz\">GET /healthz</a>");
     html.push_str("<a href=\"/v1/status\">GET /v1/status</a>");
     html.push_str("<a href=\"/v1/network/stats\">GET /v1/network/stats</a>");
     html.push_str("<a href=\"/openapi.json\">GET /openapi.json</a>");
     html.push_str("<a href=\"/docs\">GET /docs</a>");
-    html.push_str("</nav><footer>Times are UTC. Health endpoints remain JSON.</footer>");
+    html.push_str(
+        "</nav><footer>Times are UTC. /healthz and the /v1 JSON routes remain machine-readable.</footer>",
+    );
     html.push_str("</main></body></html>");
     html
 }
@@ -436,6 +440,9 @@ mod tests {
         assert!(html.contains(env!("CARGO_PKG_VERSION")));
         assert!(html.contains("<meta http-equiv=\"refresh\" content=\"5\">"));
         assert!(html.contains("href=\"/v1/network/stats\""));
+        assert!(html.contains("href=\"/healthz\""));
+        assert!(html.contains("href=\"/docs\""));
+        assert!(html.contains("remain machine-readable"));
     }
 
     #[test]
