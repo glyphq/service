@@ -1,0 +1,16 @@
+# Keep the build context to manifests, sources, and the container entrypoint.
+.git
+.github
+.gitignore
+.data
+data
+target
+docs
+fixtures
+scripts
+README.md
+*.log
+.env
+.env.*
+!.env.example
+deploy/clickhouse
