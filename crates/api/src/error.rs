@@ -50,6 +50,22 @@ impl ApiError {
             detail: detail.into(),
         }
     }
+
+    pub fn invalid_cursor(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_cursor",
+            detail: detail.into(),
+        }
+    }
+
+    pub fn too_many_requests(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "rate_limited",
+            detail: detail.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {

@@ -101,6 +101,72 @@ pub struct IdentityRow {
     pub last_seen_tick: u32,
 }
 
+/// Aggregated view of one epoch derived from the `ticks` table.
+///
+/// Epochs are not stored separately yet, so the summary is computed on read.
+/// `closed` is true when a later epoch exists in the index; the last indexed
+/// epoch may still be receiving ticks.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochRow {
+    pub epoch: u16,
+    pub first_tick: u32,
+    pub last_tick: u32,
+    pub first_timestamp: DateTime<Utc>,
+    pub last_timestamp: DateTime<Utc>,
+    pub tick_count: u64,
+    pub transaction_count: u64,
+    pub event_count: u64,
+    pub closed: bool,
+}
+
+/// Asset issuance metadata derived from `asset_issuance` events.
+///
+/// The planned `assets` table does not exist yet, so reads aggregate the
+/// decoded issuance logs. `issued_tick` and `log_id` identify the latest
+/// issuance observed for the `(issuer, name)` pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetRow {
+    pub issuer: String,
+    pub name: String,
+    pub decimals: u8,
+    pub unit: String,
+    pub managing_contract: i64,
+    pub shares: i64,
+    pub issued_tick: u32,
+    pub log_id: u64,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Index-wide counts and progress for the network stats endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkStats {
+    pub head: Option<TickRow>,
+    pub epochs: u64,
+    pub ticks: u64,
+    pub transactions: u64,
+    pub events: u64,
+    pub identities: u64,
+    pub latest_timestamp: Option<DateTime<Utc>>,
+    pub ingest: IngestCursor,
+}
+
+/// Filters accepted by the transaction collection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TransactionFilter {
+    pub epoch: Option<u16>,
+    pub tick: Option<u32>,
+    /// Canonical uppercase identity matched against source or destination.
+    pub identity: Option<String>,
+}
+
+/// Filters accepted by the event collection.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventFilter {
+    pub epoch: Option<u16>,
+    pub tick: Option<u32>,
+    pub type_name: Option<String>,
+}
+
 /// A verified tick and everything derived from it.
 ///
 /// Identity rows are absolute snapshots as of `tick`, not deltas, so replaying
@@ -185,6 +251,32 @@ pub trait Store: Send + Sync {
     async fn events_for_tick(&self, tick: u32, limit: u32, offset: u64) -> Result<Vec<EventRow>>;
     async fn identity(&self, identity: &str) -> Result<Option<IdentityRow>>;
     async fn stats(&self) -> Result<Value>;
+
+    /// Newest ticks first, optionally restricted to one epoch.
+    async fn ticks(&self, epoch: Option<u16>, limit: u32, offset: u64) -> Result<Vec<TickRow>>;
+    /// Epoch summaries newest first, derived from `ticks`.
+    async fn epochs(&self, limit: u32, offset: u64) -> Result<Vec<EpochRow>>;
+    async fn epoch(&self, epoch: u16) -> Result<Option<EpochRow>>;
+    /// Identities ordered by most recent activity, then canonical identity.
+    async fn identities(&self, limit: u32, offset: u64) -> Result<Vec<IdentityRow>>;
+    /// Assets ordered by `(issuer, name)`, optionally filtered by issuer.
+    async fn assets(&self, issuer: Option<&str>, limit: u32, offset: u64) -> Result<Vec<AssetRow>>;
+    async fn asset(&self, issuer: &str, name: &str) -> Result<Option<AssetRow>>;
+    /// Filtered transaction collection ordered by `(tick DESC, tx_index ASC)`.
+    async fn transactions_page(
+        &self,
+        filter: &TransactionFilter,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<TransactionRow>>;
+    /// Filtered event collection ordered by `(tick DESC, log_id DESC)`.
+    async fn events_page(
+        &self,
+        filter: &EventFilter,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<EventRow>>;
+    async fn network_stats(&self) -> Result<NetworkStats>;
 
     /// Persist a fully verified tick and advance the head cursor.
     async fn write_tick(&self, batch: &TickBatch) -> Result<WriteOutcome>;
@@ -452,6 +544,299 @@ LIMIT ? OFFSET ?
             "cursor": cursor,
             "ingest": ingest,
         }))
+    }
+
+    async fn ticks(&self, epoch: Option<u16>, limit: u32, offset: u64) -> Result<Vec<TickRow>> {
+        let rows = match epoch {
+            Some(epoch) => {
+                self.client
+                    .query(
+                        "SELECT ?fields FROM (\
+                             SELECT * FROM ticks WHERE epoch = ? \
+                             ORDER BY version DESC LIMIT 1 BY epoch, tick\
+                         ) ORDER BY tick DESC LIMIT ? OFFSET ?",
+                    )
+                    .bind(epoch)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all::<rows::TickSelect>()
+                    .await?
+            }
+            None => {
+                self.client
+                    .query(
+                        "SELECT ?fields FROM (\
+                             SELECT * FROM ticks \
+                             ORDER BY version DESC LIMIT 1 BY epoch, tick\
+                         ) ORDER BY tick DESC LIMIT ? OFFSET ?",
+                    )
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all::<rows::TickSelect>()
+                    .await?
+            }
+        };
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn epochs(&self, limit: u32, offset: u64) -> Result<Vec<EpochRow>> {
+        let head_epoch = self.head().await?.map(|row| row.epoch);
+        let rows = self
+            .client
+            .query(
+                "SELECT epoch, min(tick) AS first_tick, max(tick) AS last_tick, \
+                     min(timestamp) AS first_timestamp, max(timestamp) AS last_timestamp, \
+                     count() AS tick_count, sum(transaction_count) AS transaction_count, \
+                     sum(event_count) AS event_count \
+                 FROM (\
+                     SELECT * FROM ticks \
+                     ORDER BY version DESC LIMIT 1 BY epoch, tick\
+                 ) GROUP BY epoch ORDER BY epoch DESC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all::<rows::EpochSelect>()
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.into_row(head_epoch))
+            .collect())
+    }
+
+    async fn epoch(&self, epoch: u16) -> Result<Option<EpochRow>> {
+        let head_epoch = self.head().await?.map(|row| row.epoch);
+        let row = self
+            .client
+            .query(
+                "SELECT epoch, min(tick) AS first_tick, max(tick) AS last_tick, \
+                     min(timestamp) AS first_timestamp, max(timestamp) AS last_timestamp, \
+                     count() AS tick_count, sum(transaction_count) AS transaction_count, \
+                     sum(event_count) AS event_count \
+                 FROM (\
+                     SELECT * FROM ticks WHERE epoch = ? \
+                     ORDER BY version DESC LIMIT 1 BY epoch, tick\
+                 ) GROUP BY epoch LIMIT 1",
+            )
+            .bind(epoch)
+            .fetch_optional::<rows::EpochSelect>()
+            .await?;
+        Ok(row.map(|row| row.into_row(head_epoch)))
+    }
+
+    async fn identities(&self, limit: u32, offset: u64) -> Result<Vec<IdentityRow>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM (\
+                     SELECT * FROM identities \
+                     ORDER BY version DESC LIMIT 1 BY identity\
+                 ) ORDER BY last_seen_tick DESC, identity ASC LIMIT ? OFFSET ?",
+            )
+            .bind(limit)
+            .bind(offset)
+            .fetch_all::<rows::IdentitySelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn assets(&self, issuer: Option<&str>, limit: u32, offset: u64) -> Result<Vec<AssetRow>> {
+        const ASSET_SELECT: &str = "\
+            SELECT issuer, name, decimals, unit, managing_contract, shares, \
+                   issued_tick, log_id, timestamp \
+            FROM (\
+                SELECT JSONExtractString(body, 'issuer') AS issuer, \
+                       JSONExtractString(body, 'name') AS name, \
+                       toUInt8(JSONExtractUInt(body, 'decimals')) AS decimals, \
+                       JSONExtractString(body, 'unit') AS unit, \
+                       JSONExtractInt(body, 'managingContract') AS managing_contract, \
+                       toInt64OrZero(JSONExtractString(body, 'shares')) AS shares, \
+                       tick AS issued_tick, \
+                       log_id AS log_id, \
+                       timestamp AS timestamp \
+                FROM (\
+                    SELECT * FROM events WHERE type_name = 'asset_issuance' \
+                    ORDER BY version DESC LIMIT 1 BY epoch, log_id\
+                )\
+            ) WHERE issuer != ''";
+        let rows = match issuer {
+            Some(issuer) => {
+                let sql = format!(
+                    "{ASSET_SELECT} AND issuer = ? \
+                     ORDER BY issuer ASC, name ASC, issued_tick DESC, log_id DESC \
+                     LIMIT 1 BY issuer, name LIMIT ? OFFSET ?"
+                );
+                self.client
+                    .query(&sql)
+                    .bind(issuer)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all::<rows::AssetSelect>()
+                    .await?
+            }
+            None => {
+                let sql = format!(
+                    "{ASSET_SELECT} \
+                     ORDER BY issuer ASC, name ASC, issued_tick DESC, log_id DESC \
+                     LIMIT 1 BY issuer, name LIMIT ? OFFSET ?"
+                );
+                self.client
+                    .query(&sql)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all::<rows::AssetSelect>()
+                    .await?
+            }
+        };
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn asset(&self, issuer: &str, name: &str) -> Result<Option<AssetRow>> {
+        let sql = "\
+            SELECT issuer, name, decimals, unit, managing_contract, shares, \
+                   issued_tick, log_id, timestamp \
+            FROM (\
+                SELECT JSONExtractString(body, 'issuer') AS issuer, \
+                       JSONExtractString(body, 'name') AS name, \
+                       toUInt8(JSONExtractUInt(body, 'decimals')) AS decimals, \
+                       JSONExtractString(body, 'unit') AS unit, \
+                       JSONExtractInt(body, 'managingContract') AS managing_contract, \
+                       toInt64OrZero(JSONExtractString(body, 'shares')) AS shares, \
+                       tick AS issued_tick, \
+                       log_id AS log_id, \
+                       timestamp AS timestamp \
+                FROM (\
+                    SELECT * FROM events WHERE type_name = 'asset_issuance' \
+                    ORDER BY version DESC LIMIT 1 BY epoch, log_id\
+                )\
+            ) WHERE issuer = ? AND name = ? \
+            ORDER BY issued_tick DESC, log_id DESC \
+            LIMIT 1 BY issuer, name LIMIT 1";
+        let row = self
+            .client
+            .query(sql)
+            .bind(issuer)
+            .bind(name)
+            .fetch_optional::<rows::AssetSelect>()
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn transactions_page(
+        &self,
+        filter: &TransactionFilter,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<TransactionRow>> {
+        let mut sql = String::from("SELECT ?fields FROM (SELECT * FROM transactions");
+        let mut conditions = Vec::new();
+        if filter.epoch.is_some() {
+            conditions.push("epoch = ?");
+        }
+        if filter.tick.is_some() {
+            conditions.push("tick = ?");
+        }
+        if filter.identity.is_some() {
+            conditions.push("(source = ? OR destination = ?)");
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        sql.push_str(
+            " ORDER BY version DESC LIMIT 1 BY tick, tx_index\
+             ) ORDER BY tick DESC, tx_index ASC LIMIT ? OFFSET ?",
+        );
+
+        let mut query = self.client.query(&sql);
+        if let Some(epoch) = filter.epoch {
+            query = query.bind(epoch);
+        }
+        if let Some(tick) = filter.tick {
+            query = query.bind(tick);
+        }
+        if let Some(identity) = &filter.identity {
+            query = query.bind(identity.as_str()).bind(identity.as_str());
+        }
+        let rows = query
+            .bind(limit)
+            .bind(offset)
+            .fetch_all::<rows::TransactionSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn events_page(
+        &self,
+        filter: &EventFilter,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<EventRow>> {
+        let mut sql = String::from("SELECT ?fields FROM (SELECT * FROM events");
+        let mut conditions = Vec::new();
+        if filter.epoch.is_some() {
+            conditions.push("epoch = ?");
+        }
+        if filter.tick.is_some() {
+            conditions.push("tick = ?");
+        }
+        if filter.type_name.is_some() {
+            conditions.push("type_name = ?");
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        sql.push_str(
+            " ORDER BY version DESC LIMIT 1 BY epoch, log_id\
+             ) ORDER BY tick DESC, log_id DESC LIMIT ? OFFSET ?",
+        );
+
+        let mut query = self.client.query(&sql);
+        if let Some(epoch) = filter.epoch {
+            query = query.bind(epoch);
+        }
+        if let Some(tick) = filter.tick {
+            query = query.bind(tick);
+        }
+        if let Some(type_name) = &filter.type_name {
+            query = query.bind(type_name.as_str());
+        }
+        let rows = query
+            .bind(limit)
+            .bind(offset)
+            .fetch_all::<rows::EventSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn network_stats(&self) -> Result<NetworkStats> {
+        let head = self.head().await?;
+        let epochs = self
+            .count("SELECT uniqExact(epoch) AS n FROM ticks")
+            .await?;
+        let ticks = self
+            .count("SELECT uniqExact(epoch, tick) AS n FROM ticks")
+            .await?;
+        let transactions = self
+            .count("SELECT uniqExact(tick, tx_index) AS n FROM transactions")
+            .await?;
+        let events = self
+            .count("SELECT uniqExact(epoch, log_id) AS n FROM events")
+            .await?;
+        let identities = self
+            .count("SELECT uniqExact(identity) AS n FROM identities")
+            .await?;
+        let ingest = self.ingest_cursor().await?;
+        Ok(NetworkStats {
+            latest_timestamp: head.as_ref().map(|row| row.timestamp),
+            head,
+            epochs,
+            ticks,
+            transactions,
+            events,
+            identities,
+            ingest,
+        })
     }
 
     async fn write_tick(&self, batch: &TickBatch) -> Result<WriteOutcome> {

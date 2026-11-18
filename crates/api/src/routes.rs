@@ -1,29 +1,140 @@
+use std::collections::HashMap;
+
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{Html, IntoResponse};
 use axum::routing::get;
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::{Value, json};
+use store::{EventFilter, TransactionFilter};
 
-use crate::dto::{PageParams, event_value, page_meta};
+use crate::dto::{PageParams, event_value};
 use crate::{ApiError, AppState};
+
+const IMMUTABLE: &str = "public, max-age=31536000, immutable";
+const RECENT: &str = "public, max-age=2, stale-while-revalidate=5";
+const AGGREGATE: &str = "public, max-age=30, stale-while-revalidate=60";
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/status", get(status))
+        .route("/v1/network/stats", get(network_stats))
+        .route("/v1/epochs", get(epochs))
+        .route("/v1/epochs/{epoch}", get(epoch))
+        .route("/v1/ticks", get(ticks))
         .route("/v1/ticks/{tick}", get(tick))
         .route("/v1/ticks/{tick}/transactions", get(tick_transactions))
         .route("/v1/ticks/{tick}/events", get(tick_events))
-        .route("/v1/transactions", get(recent_transactions))
+        .route("/v1/transactions", get(transactions))
         .route("/v1/transactions/{hash}", get(transaction))
-        .route("/v1/events", get(recent_events))
+        .route("/v1/events", get(events))
+        .route("/v1/identities", get(identities))
         .route(
             "/v1/identities/{identity}/transactions",
             get(identity_transactions),
         )
         .route("/v1/identities/{identity}", get(identity))
+        .route("/v1/assets", get(assets))
+        .route("/v1/assets/{issuer}/{name}", get(asset))
         .route("/v1/search", get(search))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TickListQuery {
+    #[serde(default)]
+    epoch: Option<u16>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    offset: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TransactionQuery {
+    #[serde(default)]
+    epoch: Option<u16>,
+    #[serde(default)]
+    tick: Option<u32>,
+    #[serde(default)]
+    identity: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    offset: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct EventQuery {
+    #[serde(default)]
+    epoch: Option<u16>,
+    #[serde(default)]
+    tick: Option<u32>,
+    #[serde(default, rename = "type")]
+    event_type: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    offset: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AssetQuery {
+    #[serde(default)]
+    issuer: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    cursor: Option<String>,
+    #[serde(default)]
+    offset: Option<u64>,
+}
+
+impl TickListQuery {
+    fn page(&self) -> PageParams {
+        PageParams {
+            limit: self.limit,
+            cursor: self.cursor.clone(),
+            offset: self.offset,
+        }
+    }
+}
+
+impl TransactionQuery {
+    fn page(&self) -> PageParams {
+        PageParams {
+            limit: self.limit,
+            cursor: self.cursor.clone(),
+            offset: self.offset,
+        }
+    }
+}
+
+impl EventQuery {
+    fn page(&self) -> PageParams {
+        PageParams {
+            limit: self.limit,
+            cursor: self.cursor.clone(),
+            offset: self.offset,
+        }
+    }
+}
+
+impl AssetQuery {
+    fn page(&self) -> PageParams {
+        PageParams {
+            limit: self.limit,
+            cursor: self.cursor.clone(),
+            offset: self.offset,
+        }
+    }
 }
 
 async fn healthz() -> Json<Value> {
@@ -46,6 +157,70 @@ async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiE
     ))
 }
 
+async fn network_stats(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let stats = state.store.network_stats().await?;
+    Ok((
+        [(header::CACHE_CONTROL, RECENT)],
+        Json(json!({
+            "data": stats,
+            "meta": { "source": "direct-qubic-peers" },
+        })),
+    ))
+}
+
+async fn epochs(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let page = params.resolve("epochs")?;
+    let mut rows = state.store.epochs(page.fetch_limit(), page.offset).await?;
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({
+            "data": rows,
+            "meta": page.meta(rows.len(), has_more),
+        })),
+    ))
+}
+
+async fn epoch(
+    State(state): State<AppState>,
+    Path(epoch): Path<u16>,
+) -> Result<impl IntoResponse, ApiError> {
+    let row = state
+        .store
+        .epoch(epoch)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("epoch {epoch} is not indexed")))?;
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({ "data": row })),
+    ))
+}
+
+async fn ticks(
+    State(state): State<AppState>,
+    Query(params): Query<TickListQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let fingerprint = format!("ticks?epoch={:?}", params.epoch);
+    let page = params.page().resolve(&fingerprint)?;
+    let mut rows = state
+        .store
+        .ticks(params.epoch, page.fetch_limit(), page.offset)
+        .await?;
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
+    Ok((
+        [(header::CACHE_CONTROL, RECENT)],
+        Json(json!({
+            "data": rows,
+            "meta": page.meta(rows.len(), has_more),
+        })),
+    ))
+}
+
 pub async fn not_found() -> ApiError {
     ApiError::not_found("route not found")
 }
@@ -60,7 +235,7 @@ async fn tick(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("tick {tick} is not indexed")))?;
     Ok((
-        [(header::CACHE_CONTROL, "public, max-age=31536000, immutable")],
+        [(header::CACHE_CONTROL, IMMUTABLE)],
         Json(json!({ "data": row })),
     ))
 }
@@ -68,50 +243,50 @@ async fn tick(
 async fn tick_transactions(
     State(state): State<AppState>,
     Path(tick): Path<u32>,
-    Query(page): Query<PageParams>,
-) -> Result<Json<Value>, ApiError> {
+    Query(params): Query<PageParams>,
+) -> Result<impl IntoResponse, ApiError> {
     if state.store.tick(tick).await?.is_none() {
         return Err(ApiError::not_found(format!("tick {tick} is not indexed")));
     }
-    let limit = page.limit();
-    let offset = page.offset();
+    let page = params.resolve(&format!("ticks/{tick}/transactions"))?;
     let mut rows = state
         .store
-        .transactions_for_tick(tick, limit.saturating_add(1), offset)
+        .transactions_for_tick(tick, page.fetch_limit(), page.offset)
         .await?;
-    let has_more = rows.len() > limit as usize;
-    if has_more {
-        rows.truncate(limit as usize);
-    }
-    Ok(Json(json!({
-        "data": rows,
-        "meta": page_meta(limit, offset, rows.len(), has_more),
-    })))
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
+    Ok((
+        [(header::CACHE_CONTROL, IMMUTABLE)],
+        Json(json!({
+            "data": rows,
+            "meta": page.meta(rows.len(), has_more),
+        })),
+    ))
 }
 
 async fn tick_events(
     State(state): State<AppState>,
     Path(tick): Path<u32>,
-    Query(page): Query<PageParams>,
-) -> Result<Json<Value>, ApiError> {
+    Query(params): Query<PageParams>,
+) -> Result<impl IntoResponse, ApiError> {
     if state.store.tick(tick).await?.is_none() {
         return Err(ApiError::not_found(format!("tick {tick} is not indexed")));
     }
-    let limit = page.limit();
-    let offset = page.offset();
+    let page = params.resolve(&format!("ticks/{tick}/events"))?;
     let mut rows = state
         .store
-        .events_for_tick(tick, limit.saturating_add(1), offset)
+        .events_for_tick(tick, page.fetch_limit(), page.offset)
         .await?;
-    let has_more = rows.len() > limit as usize;
-    if has_more {
-        rows.truncate(limit as usize);
-    }
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
     let rows: Vec<Value> = rows.into_iter().map(event_value).collect();
-    Ok(Json(json!({
-        "data": rows,
-        "meta": page_meta(limit, offset, rows.len(), has_more),
-    })))
+    Ok((
+        [(header::CACHE_CONTROL, IMMUTABLE)],
+        Json(json!({
+            "data": rows,
+            "meta": page.meta(rows.len(), has_more),
+        })),
+    ))
 }
 
 async fn transaction(
@@ -127,60 +302,95 @@ async fn transaction(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("transaction {hash} is not indexed")))?;
     Ok((
-        [(header::CACHE_CONTROL, "public, max-age=31536000, immutable")],
+        [(header::CACHE_CONTROL, IMMUTABLE)],
         Json(json!({ "data": row })),
     ))
 }
 
-async fn recent_transactions(
+async fn transactions(
     State(state): State<AppState>,
-    Query(page): Query<PageParams>,
+    Query(params): Query<TransactionQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let limit = page.limit();
-    let offset = page.offset();
+    let identity = match params.identity.as_deref() {
+        Some(value) => {
+            let value = value.trim().to_ascii_uppercase();
+            qubic::PublicKey::from_identity(&value)
+                .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
+            Some(value)
+        }
+        None => None,
+    };
+    let filter = TransactionFilter {
+        epoch: params.epoch,
+        tick: params.tick,
+        identity: identity.clone(),
+    };
+    let fingerprint = format!(
+        "transactions?epoch={:?}&tick={:?}&identity={:?}",
+        params.epoch, params.tick, identity
+    );
+    let page = params.page().resolve(&fingerprint)?;
     let mut rows = state
         .store
-        .recent_transactions(limit.saturating_add(1), offset)
+        .transactions_page(&filter, page.fetch_limit(), page.offset)
         .await?;
-    let has_more = rows.len() > limit as usize;
-    if has_more {
-        rows.truncate(limit as usize);
-    }
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
     Ok((
-        [(
-            header::CACHE_CONTROL,
-            "public, max-age=2, stale-while-revalidate=5",
-        )],
+        [(header::CACHE_CONTROL, RECENT)],
         Json(json!({
             "data": rows,
-            "meta": page_meta(limit, offset, rows.len(), has_more),
+            "meta": page.meta(rows.len(), has_more),
         })),
     ))
 }
 
-async fn recent_events(
+async fn events(
     State(state): State<AppState>,
-    Query(page): Query<PageParams>,
+    Query(params): Query<EventQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let limit = page.limit();
-    let offset = page.offset();
+    let filter = EventFilter {
+        epoch: params.epoch,
+        tick: params.tick,
+        type_name: params.event_type.clone(),
+    };
+    let fingerprint = format!(
+        "events?epoch={:?}&tick={:?}&type={:?}",
+        params.epoch, params.tick, params.event_type
+    );
+    let page = params.page().resolve(&fingerprint)?;
     let mut rows = state
         .store
-        .recent_events(limit.saturating_add(1), offset)
+        .events_page(&filter, page.fetch_limit(), page.offset)
         .await?;
-    let has_more = rows.len() > limit as usize;
-    if has_more {
-        rows.truncate(limit as usize);
-    }
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
     let rows: Vec<Value> = rows.into_iter().map(event_value).collect();
     Ok((
-        [(
-            header::CACHE_CONTROL,
-            "public, max-age=2, stale-while-revalidate=5",
-        )],
+        [(header::CACHE_CONTROL, RECENT)],
         Json(json!({
             "data": rows,
-            "meta": page_meta(limit, offset, rows.len(), has_more),
+            "meta": page.meta(rows.len(), has_more),
+        })),
+    ))
+}
+
+async fn identities(
+    State(state): State<AppState>,
+    Query(params): Query<PageParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let page = params.resolve("identities")?;
+    let mut rows = state
+        .store
+        .identities(page.fetch_limit(), page.offset)
+        .await?;
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({
+            "data": rows,
+            "meta": page.meta(rows.len(), has_more),
         })),
     ))
 }
@@ -188,31 +398,31 @@ async fn recent_events(
 async fn identity_transactions(
     State(state): State<AppState>,
     Path(identity): Path<String>,
-    Query(page): Query<PageParams>,
-) -> Result<Json<Value>, ApiError> {
+    Query(params): Query<PageParams>,
+) -> Result<impl IntoResponse, ApiError> {
     let identity = identity.to_ascii_uppercase();
     let _ = qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
-    let limit = page.limit();
-    let offset = page.offset();
+    let page = params.resolve(&format!("identities/{identity}/transactions"))?;
     let mut rows = state
         .store
-        .transactions_for_identity(&identity, limit.saturating_add(1), offset)
+        .transactions_for_identity(&identity, page.fetch_limit(), page.offset)
         .await?;
-    let has_more = rows.len() > limit as usize;
-    if has_more {
-        rows.truncate(limit as usize);
-    }
-    Ok(Json(json!({
-        "data": rows,
-        "meta": page_meta(limit, offset, rows.len(), has_more),
-    })))
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({
+            "data": rows,
+            "meta": page.meta(rows.len(), has_more),
+        })),
+    ))
 }
 
 async fn identity(
     State(state): State<AppState>,
     Path(identity): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<impl IntoResponse, ApiError> {
     let identity = identity.to_ascii_uppercase();
     let _ = qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
@@ -221,18 +431,69 @@ async fn identity(
         .identity(&identity)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("identity {identity} is not indexed")))?;
-    Ok(Json(json!({
-        "data": row,
-        "meta": {
-            "notice": "balance is the net QU flow observed in the indexed epoch range"
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({
+            "data": row,
+            "meta": {
+                "notice": "balance is the net QU flow observed in the indexed epoch range"
+            }
+        })),
+    ))
+}
+
+async fn assets(
+    State(state): State<AppState>,
+    Query(params): Query<AssetQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let issuer = match params.issuer.as_deref() {
+        Some(value) => {
+            let value = value.trim().to_ascii_uppercase();
+            qubic::PublicKey::from_identity(&value)
+                .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
+            Some(value)
         }
-    })))
+        None => None,
+    };
+    let fingerprint = format!("assets?issuer={issuer:?}");
+    let page = params.page().resolve(&fingerprint)?;
+    let mut rows = state
+        .store
+        .assets(issuer.as_deref(), page.fetch_limit(), page.offset)
+        .await?;
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({
+            "data": rows,
+            "meta": page.meta(rows.len(), has_more),
+        })),
+    ))
+}
+
+async fn asset(
+    State(state): State<AppState>,
+    Path((issuer, name)): Path<(String, String)>,
+) -> Result<impl IntoResponse, ApiError> {
+    let issuer = issuer.to_ascii_uppercase();
+    let _ = qubic::PublicKey::from_identity(&issuer)
+        .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
+    let row = state
+        .store
+        .asset(&issuer, &name)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("asset {issuer}/{name} is not indexed")))?;
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({ "data": row })),
+    ))
 }
 
 async fn search(
     State(state): State<AppState>,
-    Query(params): Query<std::collections::HashMap<String, String>>,
-) -> Result<Json<Value>, ApiError> {
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<impl IntoResponse, ApiError> {
     let query = params
         .get("q")
         .map(|value| value.trim())
@@ -280,14 +541,21 @@ pub async fn docs() -> Html<&'static str> {
 <p>Direct-peer Qubic index. The OpenAPI 3.1 document is at <a href="/openapi.json"><code>/openapi.json</code></a>.</p>
 <ul>
 <li><code>GET /v1/status</code></li>
+<li><code>GET /v1/network/stats</code></li>
+<li><code>GET /v1/epochs?limit=&amp;cursor=</code></li>
+<li><code>GET /v1/epochs/{epoch}</code></li>
+<li><code>GET /v1/ticks?epoch=&amp;limit=&amp;cursor=</code></li>
 <li><code>GET /v1/ticks/{tick}</code></li>
-<li><code>GET /v1/ticks/{tick}/transactions</code></li>
-<li><code>GET /v1/ticks/{tick}/events</code></li>
-<li><code>GET /v1/transactions?limit=&amp;offset=</code></li>
+<li><code>GET /v1/ticks/{tick}/transactions?limit=&amp;cursor=</code></li>
+<li><code>GET /v1/ticks/{tick}/events?limit=&amp;cursor=</code></li>
+<li><code>GET /v1/transactions?epoch=&amp;tick=&amp;identity=&amp;limit=&amp;cursor=</code></li>
 <li><code>GET /v1/transactions/{hash}</code></li>
-<li><code>GET /v1/events?limit=&amp;offset=</code></li>
+<li><code>GET /v1/events?epoch=&amp;tick=&amp;type=&amp;limit=&amp;cursor=</code></li>
+<li><code>GET /v1/identities?limit=&amp;cursor=</code></li>
 <li><code>GET /v1/identities/{identity}</code></li>
-<li><code>GET /v1/identities/{identity}/transactions</code></li>
+<li><code>GET /v1/identities/{identity}/transactions?limit=&amp;cursor=</code></li>
+<li><code>GET /v1/assets?issuer=&amp;limit=&amp;cursor=</code></li>
+<li><code>GET /v1/assets/{issuer}/{name}</code></li>
 <li><code>GET /v1/search?q=</code></li>
 </ul>
 </body></html>"#,
