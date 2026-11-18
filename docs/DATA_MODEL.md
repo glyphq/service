@@ -559,8 +559,8 @@ This is the only rebuild path today. The raw archive is planned but not implemen
 4. Re-fetch from peers if the tick is still within their retention window. An archive replay
    path does not exist yet.
 
-Replay never goes below epoch 240. A request to replay a lower epoch returns a configuration
-error. The data model has no rows for pre-240 history and no compatibility path for older
+Replay never goes below the epoch present at first start. A request to replay a lower epoch returns a configuration
+error. The data model has no rows before that epoch and no compatibility path for older
 layouts.
 
 ## Migrations

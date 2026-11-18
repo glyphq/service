@@ -4,8 +4,8 @@ Glyph is a from-scratch Rust indexer and read API for the Qubic network. It talk
 to Qubic peers over TCP, verifies ticks and votes, stores normalized history in ClickHouse,
 and serves a resource-oriented HTTP API.
 
-The index starts at the current epoch and moves forward. There is no pre-epoch-240
-backfill and no compatibility layer for core-bob or the official RPC.
+The index starts at the epoch that is current on first run and moves forward. There is no
+backfill before that epoch and no compatibility layer for core-bob or the official RPC.
 
 ## The no-hosted-RPC promise
 
@@ -26,13 +26,29 @@ same boundary a Qubic node already has.
 
 ## Status
 
-The project is in the bootstrap phase. The wire codecs, identity encoding, log decoding,
-ClickHouse schema, HTTP skeleton, CLI skeleton, and documentation set are in place. Peer
-transport, full verification, the sync loop, and the complete API surface are being
-implemented in the order described in [docs/ROADMAP.md](docs/ROADMAP.md).
+The core loop is implemented and has been exercised against live peers:
 
-Run `scripts/smoke.sh` to see which parts work on your host. The dev stack keeps the API
-up if the indexer exits, because the sync loop may still be in progress.
+- Direct TCP transport, `ExchangePublicPeers` handshake, current head, computors, tick
+  data, quorum votes, transactions, log ranges, and log bodies.
+- In-repo K12 and SchnorrQ. Live tick data and 451+ vote signatures verify.
+- Quorum and data verification tiers. Every stored tick records the tier it reached.
+- ClickHouse persistence with idempotent replay, cursor resume, and per-tick rows for
+  transactions, typed events, and identity flow.
+- Resource API with typed event bodies, offset pagination, problem-details errors,
+  OpenAPI, recent activity feeds, and identity transaction history.
+
+Current limits are deliberate:
+
+- Ingestion starts at the current epoch on first run. Earlier history is not fetched.
+- Identity `balance` is net QU flow over the indexed range, not a spectrum snapshot.
+- The `state` verification tier is reserved; ticks reach `quorum` or `data`.
+- The peer pool reconnects across configured seeds. `glyph peers` exposes addresses
+  learned through `ExchangePublicPeers`, but the indexer does not merge them into its
+  candidate set yet.
+- Pagination is offset-based. Asset, epoch, and computor endpoints, batch lookup, SSE,
+  and WebSocket streaming are not implemented.
+
+Run `scripts/smoke.sh` to exercise the stack on your host.
 
 ## Requirements
 
@@ -103,14 +119,13 @@ The API listens on `127.0.0.1:8080` by default.
 
 Peer selection rules:
 
-- Start with one or more configured seeds. The indexer learns additional peers through
-  `ExchangePublicPeers` and keeps a bounded, deduplicated set.
-- Prefer a peer whose `CurrentTickInfo` is at or above the local head. A stale peer is
-  demoted, not trusted.
-- Never request a tick above a peer's advertised head.
-- A peer that returns malformed packets, wrong fixed sizes, or invalid signatures is
-  closed and quarantined. It is not trusted for another request until it is retried and
-  passes verification.
+- Start with one or more configured seeds. `NodePool::connect_best` chooses the peer with
+  the fastest handshake; the indexer reconnects across the configured seeds on failure.
+- `glyph peers` prints the addresses a seed advertises through `ExchangePublicPeers`.
+- Never request a tick above a peer's advertised head. The peer rejects it and the
+  indexer retries after refreshing the head.
+- A peer that returns malformed packets, wrong fixed sizes, or invalid signatures fails
+  bundle verification. The indexer does not persist that tick and reconnects.
 - Do not put a hosted RPC URL in the peer list. The CLI expects a socket address.
 
 ## Workspace map
@@ -146,8 +161,8 @@ cargo run -p cli --bin glyph -- sync --peer 157.180.10.49:21841
 # Apply ClickHouse schema
 cargo run -p cli --bin glyph -- db-init
 
-# Serve the API directly (the CLI `serve` command points at the binary)
-cargo run -p api --bin glyph-api
+# Serve the API (equivalently: cargo run -p api --bin glyph-api)
+cargo run -p cli --bin glyph -- serve
 ```
 
 ## Environment

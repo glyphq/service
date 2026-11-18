@@ -252,7 +252,7 @@ These items are tracked in every phase, not deferred to the end.
 - Transaction submission or wallet features.
 - Consensus participation or voting.
 - Hosted multi-tenant service with billing.
-- Full historical backfill before epoch 240.
+- Full historical backfill before the epoch present at first start.
 - Compatibility endpoints for core-bob or the official RPC.
 - Smart contract execution or state simulation.
 - Price or oracle services beyond indexed log data.

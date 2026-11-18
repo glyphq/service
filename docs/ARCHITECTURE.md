@@ -1,16 +1,18 @@
 # Architecture
 
-This document describes the intended architecture of the Glyph Qubic indexer and API.
+This document describes the target architecture of the Glyph Qubic indexer and API.
 It covers the boundaries of the system, the decisions that shape it, and the operational
-model. Protocol details live in [PROTOCOL.md](./PROTOCOL.md), the HTTP contract lives in
+model. Some robustness features described here are still roadmap work; the implemented
+surface is tracked in [ROADMAP.md](./ROADMAP.md) and [README](../README.md). Protocol
+details live in [PROTOCOL.md](./PROTOCOL.md), the HTTP contract lives in
 [API.md](./API.md), and storage lives in [DATA_MODEL.md](./DATA_MODEL.md).
 
 ## Goals
 
 1. Index the live Qubic chain from direct peer connections, with no hosted RPC in the
    runtime path.
-2. Start at the current epoch and move forward. No backfill before epoch 240 and no
-   compatibility layer for core-bob or the official RPC.
+2. Start at the epoch that is current on first run and move forward. No backfill before
+   that epoch and no compatibility layer for core-bob or the official RPC.
 3. Produce a resource-oriented HTTP API that is easier to consume than peer responses:
    stable identifiers, typed events, offset pagination, RFC 9457 errors, OpenAPI, and
    identity and search lookups.
@@ -22,7 +24,7 @@ model. Protocol details live in [PROTOCOL.md](./PROTOCOL.md), the HTTP contract 
 
 ## Non-goals
 
-- Historical backfill before epoch 240.
+- Historical backfill before the epoch present at first start.
 - Wallet functionality, signing, or transaction submission.
 - Consensus participation. Glyph verifies votes, it does not vote.
 - Serving as a general purpose Qubic core replacement.
@@ -220,7 +222,7 @@ tick is not written.
   cursor, it resumes at `last_indexed_tick + 1`, clamped to the current epoch range.
 - An end-of-epoch virtual tick is described in the protocol document but is not
   implemented. The indexer does not synthesize one.
-- Log IDs are scoped to an epoch. A log ID from epoch 240 is not comparable to the same
+- Log IDs are scoped to an epoch. A log ID from one epoch is not comparable to the same
   numeric ID in epoch 241. Events are keyed by `(epoch, log_id)`.
 - The computor set is per epoch. It is cached by epoch and re-fetched on rollover. Votes
   are never validated against the previous epoch's keys.
