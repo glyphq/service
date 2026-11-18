@@ -92,22 +92,30 @@ impl ProgressSampler {
     pub fn observe(&self, indexed: Option<u32>, network: Option<u32>) -> ProgressRates {
         let now = Instant::now();
         let mut previous = self.previous.lock().expect("progress sampler lock");
-        let rates = previous.map_or_else(ProgressRates::default, |sample| {
+        if let Some(sample) = *previous {
             let elapsed = now.duration_since(sample.at).as_secs_f64();
             if elapsed < 1.0 {
+                // Do not replace the baseline: frequent pollers would keep
+                // resetting the window and every rate would read as zero.
                 return ProgressRates::default();
             }
-            ProgressRates {
+            let rates = ProgressRates {
                 ingest: rate(sample.indexed, indexed, elapsed),
                 network: rate(sample.network, network, elapsed),
-            }
-        });
+            };
+            *previous = Some(ProgressSample {
+                at: now,
+                indexed,
+                network,
+            });
+            return rates;
+        }
         *previous = Some(ProgressSample {
             at: now,
             indexed,
             network,
         });
-        rates
+        ProgressRates::default()
     }
 }
 
