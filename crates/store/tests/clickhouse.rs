@@ -11,7 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use store::{
-    CURSOR_HEAD, CURSOR_INGEST, ClickHouseStore, Error, EventRow, IdentityRow, IngestCursor, Store,
+    CURSOR_HEAD, CURSOR_INGEST, ClickHouseStore, ComputorRow, Error, EventParticipantRow, EventRow,
+    IdentityActivityRow, IdentityRow, IngestCursor, PricePointRow, QuorumEvidenceRow, Store,
     TickBatch, TickRow, TransactionRow,
 };
 
@@ -121,6 +122,25 @@ fn identity_with_transfers(
     }
 }
 
+fn participant(
+    epoch: u16,
+    tick: u32,
+    log_id: u64,
+    identity: &str,
+    role: &str,
+) -> EventParticipantRow {
+    EventParticipantRow {
+        epoch,
+        tick,
+        log_id,
+        identity: identity.into(),
+        role: role.into(),
+        tx_hash: format!("hash-{log_id}"),
+        tx_index: log_id as i16,
+        timestamp: timestamp(),
+    }
+}
+
 fn batch(epoch: u16, tick: u32) -> TickBatch {
     let mut batch = TickBatch::new(epoch, tick, timestamp(), 7, "quorum");
     batch.signature = [0x11; 64];
@@ -135,6 +155,83 @@ fn batch(epoch: u16, tick: u32) -> TickBatch {
     ];
     batch.identities = vec![identity("AAAA", 100, tick), identity("BBBB", 200, tick)];
     batch
+}
+
+#[derive(Debug, clickhouse::Row, Deserialize)]
+struct ParticipantDbRow {
+    role: String,
+    log_id: u64,
+}
+
+fn price_point(hour: u32, price_e8: i64, version: u64) -> PricePointRow {
+    PricePointRow {
+        hour,
+        append_tick: 1000 + hour,
+        source_tick: 900 + hour,
+        epoch: 3,
+        flags: 0b101,
+        price_e8,
+        source: 7,
+        synced: 1,
+        bound: 1,
+        series_digest: [0x33; 32],
+        observed_at: timestamp(),
+        version,
+    }
+}
+
+fn computor_message(epoch: u16, seed: u8) -> qubic::messages::Computors {
+    let public_keys = (0..qubic::messages::COMPUTOR_COUNT)
+        .map(|index| {
+            let bytes = u32::try_from(index)
+                .expect("computor index fits u32")
+                .to_le_bytes();
+            let mut key = [0u8; 32];
+            key[..4].copy_from_slice(&bytes);
+            key[4] = seed;
+            key
+        })
+        .collect();
+    qubic::messages::Computors {
+        epoch,
+        public_keys,
+        signature: [0; 64],
+    }
+}
+
+fn computor_row(epoch: u16, index: u16, seed: u8) -> ComputorRow {
+    let bytes = u32::from(index).to_le_bytes();
+    let mut key = [0u8; 32];
+    key[..4].copy_from_slice(&bytes);
+    key[4] = seed;
+    let public_key = qubic::PublicKey::new(key);
+    ComputorRow {
+        epoch,
+        computor_index: index,
+        public_key: public_key.to_hex(),
+        identity: public_key.to_identity(),
+        version: 0,
+        timestamp: timestamp(),
+    }
+}
+
+fn quorum_evidence(epoch: u16, tick: u32, version: u64) -> QuorumEvidenceRow {
+    QuorumEvidenceRow {
+        epoch,
+        tick,
+        quorum_digest: [0xAA; 32],
+        tick_data_digest: [0xBB; 32],
+        required_votes: 451,
+        aligned_votes: 500,
+        fetched_votes: 600,
+        unique_votes: 550,
+        verified_votes: 480,
+        verification: "data".into(),
+        warning_count: 1,
+        warnings: r#"["lagging peer"]"#.into(),
+        timestamp: timestamp(),
+        version,
+    }
 }
 
 #[derive(Debug, clickhouse::Row, Deserialize)]
@@ -287,6 +384,76 @@ async fn round_trip_is_idempotent_and_cursor_never_regresses() {
     let page = store.transactions_for_tick(100, 1, 1).await.unwrap();
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].tx_index, 1);
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn batched_ticks_write_once_and_advance_to_the_newest() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    let mut first = batch(1, 100);
+    first.transactions.truncate(1);
+    first.identities = vec![identity("AAAA", 100, 100)];
+    let mut second = batch(1, 101);
+    second.transactions.clear();
+    second.events.clear();
+    second.identities = vec![identity("AAAA", 150, 101)];
+    let mut third = batch(1, 102);
+    third.identities = vec![identity("AAAA", 200, 102)];
+
+    let outcomes = store
+        .write_ticks(&[first, second, third])
+        .await
+        .expect("batched write");
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.tick)
+            .collect::<Vec<_>>(),
+        [100, 101, 102]
+    );
+    assert_eq!(outcomes[0].transactions, 1);
+    assert_eq!(outcomes[1].transactions, 0);
+    assert_eq!(outcomes[2].transactions, 2);
+
+    assert_eq!(
+        scalar_count(&store, "SELECT count() AS n FROM ticks FINAL").await,
+        3
+    );
+    assert_eq!(
+        scalar_count(&store, "SELECT count() AS n FROM transactions FINAL").await,
+        3
+    );
+    assert_eq!(
+        store.head().await.unwrap().expect("head").tick,
+        102,
+        "head is the newest batch"
+    );
+    assert_eq!(
+        store.identity("AAAA").await.unwrap().unwrap().balance,
+        200,
+        "the newest identity snapshot wins within one insert"
+    );
+    assert_eq!(
+        store.ingest_cursor().await.unwrap().last_indexed_tick,
+        Some(102)
+    );
+
+    // Empty batches are a no-op, and replaying the range is idempotent.
+    assert!(store.write_ticks(&[]).await.unwrap().is_empty());
+    store
+        .write_ticks(&[batch(1, 100), batch(1, 101), batch(1, 102)])
+        .await
+        .expect("replay");
+    assert_eq!(
+        scalar_count(&store, "SELECT count() AS n FROM ticks FINAL").await,
+        3
+    );
+    assert_eq!(store.head().await.unwrap().unwrap().tick, 102);
 
     store.drop_database().await.expect("drop test database");
 }
@@ -669,9 +836,14 @@ async fn initializes_the_real_glyph_database() {
     assert_eq!(
         tables,
         vec![
+            "btc_price_points",
+            "computors",
+            "event_participants",
             "events",
             "identities",
             "ingest_state",
+            "price_points",
+            "quorum_evidence",
             "ticks",
             "transactions"
         ]
@@ -686,6 +858,307 @@ async fn initializes_the_real_glyph_database() {
         .expect("system.projections");
     assert!(projections.contains(&"by_hash".to_string()));
     assert!(projections.contains(&"by_tick".to_string()));
+}
+
+#[tokio::test]
+async fn price_points_dedupe_order_limit_and_report_snapshot() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    // An empty series has no latest point and no snapshot.
+    assert!(store.price_points(0, 10).await.unwrap().is_empty());
+    assert!(store.latest_price().await.unwrap().is_none());
+    assert!(store.price_snapshot().await.unwrap().is_none());
+    store.write_price_points(&[]).await.expect("empty write");
+
+    // Duplicate hours inside one batch collapse to the highest version. The
+    // stale lower-version row for hour 100 is ignored.
+    store
+        .write_price_points(&[
+            price_point(100, 100_00000000, 1),
+            price_point(100, 1, 0),
+            price_point(101, 200_00000000, 1),
+            price_point(101, 250_00000000, 2),
+            price_point(102, 300_00000000, 1),
+        ])
+        .await
+        .expect("write first batch");
+
+    let points = store.price_points(0, 10).await.expect("all points");
+    assert_eq!(
+        points.iter().map(|row| row.hour).collect::<Vec<_>>(),
+        vec![100, 101, 102]
+    );
+    assert_eq!(
+        points.iter().map(|row| row.price_e8).collect::<Vec<_>>(),
+        vec![100_00000000, 250_00000000, 300_00000000]
+    );
+    assert_eq!(points[0].series_digest, [0x33; 32]);
+    assert_eq!(points[0].observed_at, timestamp());
+    assert_eq!(points[0].synced, 1);
+    assert_eq!(points[0].bound, 1);
+
+    // Replaying the first batch cannot overwrite the newer hour 101 revision,
+    // and a later write for hour 103 becomes the latest point.
+    store
+        .write_price_points(&[
+            price_point(101, 250_00000000, 2),
+            price_point(102, 300_00000000, 1),
+            price_point(100, 100_00000000, 1),
+        ])
+        .await
+        .expect("replay first batch");
+    store
+        .write_price_points(&[
+            price_point(101, 260_00000000, 3),
+            price_point(103, 400_00000000, 1),
+        ])
+        .await
+        .expect("write newer revisions");
+
+    let latest = store.latest_price().await.unwrap().expect("latest price");
+    assert_eq!(latest.hour, 103);
+    assert_eq!(latest.price_e8, 400_00000000);
+
+    let all = store.price_points(0, 10).await.unwrap();
+    assert_eq!(
+        all.iter()
+            .map(|row| (row.hour, row.price_e8))
+            .collect::<Vec<_>>(),
+        vec![
+            (100, 100_00000000),
+            (101, 260_00000000),
+            (102, 300_00000000),
+            (103, 400_00000000),
+        ]
+    );
+
+    // `from_hour` is inclusive and the limit is clamped to 1..=1000.
+    assert_eq!(
+        store
+            .price_points(102, 10)
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.hour)
+            .collect::<Vec<_>>(),
+        vec![102, 103]
+    );
+    assert_eq!(store.price_points(0, 0).await.unwrap().len(), 1);
+    assert_eq!(store.price_points(0, 2).await.unwrap().len(), 2);
+    assert_eq!(store.price_points(0, 10_000).await.unwrap().len(), 4);
+
+    let snapshot = store
+        .price_snapshot()
+        .await
+        .expect("snapshot")
+        .expect("non-empty snapshot");
+    assert_eq!(snapshot.points, 4);
+    assert!(snapshot.synced);
+    assert!(snapshot.bound);
+    assert_eq!(snapshot.source, 7);
+    assert_eq!(snapshot.series_digest, [0x33; 32]);
+    assert_eq!(snapshot.epoch, 3);
+    assert_eq!(snapshot.append_tick, 1000 + 103);
+    assert_eq!(snapshot.source_tick, 900 + 103);
+    assert_eq!(snapshot.observed_at, timestamp());
+    assert_eq!(snapshot.latest.as_ref().map(|row| row.hour), Some(103));
+    assert_eq!(
+        snapshot.latest.as_ref().map(|row| row.price_e8),
+        Some(400_00000000)
+    );
+
+    let json = serde_json::to_value(&snapshot).expect("serialize snapshot");
+    assert_eq!(json["series_digest"].as_array().map(Vec::len), Some(32));
+    assert_eq!(json["latest"]["price_e8"], 400_00000000_i64);
+    assert!(json["observed_at"].is_string(), "{json}");
+
+    assert!(store.price_points(104, 10).await.unwrap().is_empty());
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn computors_round_trip_and_keep_the_newest_version() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    assert!(
+        store
+            .computors(1)
+            .await
+            .expect("empty computors")
+            .is_empty()
+    );
+    store
+        .write_computors(
+            1,
+            &qubic::messages::Computors {
+                epoch: 1,
+                public_keys: Vec::new(),
+                signature: [0; 64],
+            },
+            timestamp(),
+        )
+        .await
+        .expect("empty computor write");
+    assert!(
+        store
+            .computors(1)
+            .await
+            .expect("empty computors")
+            .is_empty()
+    );
+
+    let first_timestamp = timestamp();
+    store
+        .write_computors(1, &computor_message(1, 7), first_timestamp)
+        .await
+        .expect("write computors");
+
+    let rows = store.computors(1).await.expect("computors");
+    assert_eq!(rows.len(), qubic::messages::COMPUTOR_COUNT);
+    let expected_first = computor_row(1, 0, 7);
+    assert_eq!(rows[0].epoch, 1);
+    assert_eq!(rows[0].computor_index, 0);
+    assert_eq!(rows[0].public_key, expected_first.public_key);
+    assert_eq!(rows[0].identity, expected_first.identity);
+    assert_eq!(rows[0].timestamp, first_timestamp);
+    let expected_last = computor_row(1, 675, 7);
+    assert_eq!(rows[675].computor_index, 675);
+    assert_eq!(rows[675].identity, expected_last.identity);
+
+    // A later timestamp replaces the same epoch's set in place.
+    let later = first_timestamp + chrono::Duration::seconds(1);
+    store
+        .write_computors(1, &computor_message(1, 9), later)
+        .await
+        .expect("replace computors");
+    let replaced = store.computors(1).await.expect("replaced computors");
+    assert_eq!(replaced.len(), qubic::messages::COMPUTOR_COUNT);
+    assert_eq!(replaced[0].identity, computor_row(1, 0, 9).identity);
+    assert_eq!(replaced[0].timestamp, later);
+
+    // A stale replay never wins over the newer set.
+    store
+        .write_computors(
+            1,
+            &computor_message(1, 7),
+            first_timestamp - chrono::Duration::seconds(1),
+        )
+        .await
+        .expect("stale computor replay");
+    let stable = store.computors(1).await.expect("stable computors");
+    assert_eq!(stable[0].identity, computor_row(1, 0, 9).identity);
+    assert!(store.computors(2).await.expect("unknown epoch").is_empty());
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn evidence_is_written_with_the_tick_and_round_trips() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    assert!(
+        store
+            .evidence_for_tick(100)
+            .await
+            .expect("missing evidence")
+            .is_none()
+    );
+
+    let mut first = TickBatch::new(1, 100, timestamp(), 7, "data");
+    first.evidence = Some(quorum_evidence(1, 100, 1));
+    store.write_tick(&first).await.expect("write tick");
+
+    let evidence = store
+        .evidence_for_tick(100)
+        .await
+        .expect("evidence lookup")
+        .expect("evidence row");
+    assert_eq!(evidence.epoch, 1);
+    assert_eq!(evidence.tick, 100);
+    assert_eq!(evidence.quorum_digest, [0xAA; 32]);
+    assert_eq!(evidence.tick_data_digest, [0xBB; 32]);
+    assert_eq!(evidence.required_votes, 451);
+    assert_eq!(evidence.aligned_votes, 500);
+    assert_eq!(evidence.fetched_votes, 600);
+    assert_eq!(evidence.unique_votes, 550);
+    assert_eq!(evidence.verified_votes, 480);
+    assert_eq!(evidence.verification, "data");
+    assert_eq!(evidence.warning_count, 1);
+    assert_eq!(evidence.warnings, r#"["lagging peer"]"#);
+    // An explicit evidence version is preserved.
+    assert_eq!(evidence.version, 1);
+
+    // The batched path writes one evidence row per batch, before the ticks.
+    let mut second = TickBatch::new(1, 101, timestamp(), 7, "quorum");
+    second.evidence = Some(quorum_evidence(1, 101, 0));
+    let mut third = TickBatch::new(1, 102, timestamp(), 7, "quorum");
+    third.evidence = Some(quorum_evidence(1, 102, 0));
+    let outcomes = store
+        .write_ticks(&[second, third])
+        .await
+        .expect("batched write");
+    assert_eq!(outcomes.len(), 2);
+    assert!(
+        store
+            .evidence_for_tick(101)
+            .await
+            .expect("evidence 101")
+            .is_some()
+    );
+    assert!(
+        store
+            .evidence_for_tick(102)
+            .await
+            .expect("evidence 102")
+            .is_some()
+    );
+
+    // Replaying a tick with a newer version replaces the evidence.
+    first.version = 150;
+    let mut updated = quorum_evidence(1, 100, 0);
+    updated.verification = "quorum".into();
+    updated.warnings = "[]".into();
+    updated.warning_count = 0;
+    updated.version = 150;
+    first.evidence = Some(updated);
+    store.write_tick(&first).await.expect("replace evidence");
+    let replaced = store
+        .evidence_for_tick(100)
+        .await
+        .expect("replaced evidence")
+        .expect("evidence row");
+    assert_eq!(replaced.version, 150);
+    assert_eq!(replaced.verification, "quorum");
+    assert_eq!(replaced.warnings, "[]");
+    assert_eq!(replaced.warning_count, 0);
+
+    // Evidence for another tick rejects the batch before anything is written.
+    let mut bad = TickBatch::new(1, 110, timestamp(), 7, "data");
+    bad.evidence = Some(quorum_evidence(1, 111, 0));
+    let err = store
+        .write_tick(&bad)
+        .await
+        .expect_err("mismatched evidence");
+    assert!(
+        matches!(err, Error::InvalidBatch(_)),
+        "unexpected error: {err:?}"
+    );
+    assert!(
+        store
+            .evidence_for_tick(110)
+            .await
+            .expect("missing evidence")
+            .is_none()
+    );
+
+    store.drop_database().await.expect("drop test database");
 }
 
 #[tokio::test]
@@ -716,10 +1189,552 @@ async fn schema_creates_named_read_projections() {
     assert!(events.contains("by_recent"));
     assert!(events.contains("by_type"));
     assert!(
+        show_create(&store, "event_participants")
+            .await
+            .contains("by_tick")
+    );
+    assert!(
         show_create(&store, "identities")
             .await
             .contains("by_activity")
     );
 
     store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn event_participants_collapse_duplicates_and_keep_roles() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    // Empty writes are a no-op rather than an error.
+    store
+        .write_event_participants(&[])
+        .await
+        .expect("empty participant write");
+
+    let rows = vec![
+        participant(1, 100, 10, "AAAA", "from"),
+        participant(1, 100, 10, "AAAA", "from"),
+        participant(1, 100, 12, "AAAA", "to"),
+        participant(1, 100, 11, "BBBB", "to"),
+    ];
+    store
+        .write_event_participants(&rows)
+        .await
+        .expect("write participants");
+    assert_eq!(
+        scalar_count(
+            &store,
+            "SELECT uniqExact(epoch, log_id, identity, role) AS n FROM event_participants"
+        )
+        .await,
+        3
+    );
+
+    // Replaying the same participant rows is idempotent.
+    store
+        .write_event_participants(&rows)
+        .await
+        .expect("replay participants");
+    assert_eq!(
+        scalar_count(
+            &store,
+            "SELECT uniqExact(epoch, log_id, identity, role) AS n FROM event_participants"
+        )
+        .await,
+        3
+    );
+
+    let stored: Vec<ParticipantDbRow> = store
+        .client
+        .query(
+            "SELECT role, log_id FROM ( \
+                 SELECT * FROM event_participants WHERE identity = ? \
+                 ORDER BY version DESC LIMIT 1 BY epoch, log_id, identity, role \
+             ) ORDER BY log_id ASC, role ASC",
+        )
+        .bind("AAAA")
+        .fetch_all()
+        .await
+        .expect("participant rows");
+    assert_eq!(
+        stored
+            .iter()
+            .map(|row| (row.log_id, row.role.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(10, "from"), (12, "to")]
+    );
+
+    // Only AAAA and BBBB are indexed.
+    let unknown: Vec<ParticipantDbRow> = store
+        .client
+        .query("SELECT role, log_id FROM event_participants WHERE identity = ?")
+        .bind("NOBODY")
+        .fetch_all()
+        .await
+        .expect("unknown participant rows");
+    assert!(unknown.is_empty());
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn events_for_identity_joins_participants_newest_first() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    let mut tick = TickBatch::new(1, 100, timestamp(), 7, "quorum");
+    tick.events = vec![
+        event(1, 100, 10, "event-a"),
+        event(1, 100, 11, "event-b"),
+        event(1, 100, 12, "event-c"),
+    ];
+    tick.event_participants = vec![
+        participant(1, 100, 10, "LOOKUP", "from"),
+        participant(1, 100, 11, "LOOKUP", "to"),
+        participant(1, 100, 12, "LOOKUP", "to"),
+        participant(1, 100, 10, "OTHER", "to"),
+        // Duplicate inside the batch is collapsed by the writer.
+        participant(1, 100, 10, "LOOKUP", "from"),
+    ];
+    store.write_tick(&tick).await.expect("write tick");
+
+    let events = store
+        .events_for_identity("LOOKUP", 10, 0)
+        .await
+        .expect("events by identity");
+    assert_eq!(
+        events.iter().map(|event| event.log_id).collect::<Vec<_>>(),
+        vec![12, 11, 10]
+    );
+    assert_eq!(events[0].type_name, "qu_transfer");
+    assert_eq!(events[0].body, "event-c");
+
+    let events = store
+        .events_for_identity("OTHER", 10, 0)
+        .await
+        .expect("events by other identity");
+    assert_eq!(
+        events.iter().map(|event| event.log_id).collect::<Vec<_>>(),
+        vec![10]
+    );
+
+    // The limit is clamped to at least one row.
+    assert_eq!(
+        store
+            .events_for_identity("LOOKUP", 0, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let page = store
+        .events_for_identity("LOOKUP", 1, 1)
+        .await
+        .expect("events page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].log_id, 11);
+
+    assert!(
+        store
+            .events_for_identity("NOBODY", 10, 0)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Roles are preserved in the index and queryable directly.
+    let roles = store
+        .client
+        .query(
+            "SELECT role, log_id FROM ( \
+                 SELECT * FROM event_participants WHERE identity = ? \
+                 ORDER BY version DESC LIMIT 1 BY epoch, log_id, identity, role \
+             ) ORDER BY log_id ASC",
+        )
+        .bind("LOOKUP")
+        .fetch_all::<ParticipantDbRow>()
+        .await
+        .expect("participant roles");
+    assert_eq!(
+        roles
+            .iter()
+            .map(|row| (row.log_id, row.role.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(10, "from"), (11, "to"), (12, "to")]
+    );
+
+    // A replayed tick must not duplicate the identity event view.
+    store.write_tick(&tick).await.expect("replay tick");
+    assert_eq!(
+        store
+            .events_for_identity("LOOKUP", 10, 0)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn activity_merges_direct_and_contract_originated_rows() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    let mut direct = TickBatch::new(1, 100, timestamp(), 7, "quorum");
+    direct.transactions = vec![transfer(100, 0, "tx-100", "LOOKUP", "DST")];
+    direct.transactions[0].amount = 7;
+    store.write_tick(&direct).await.expect("write direct tick");
+
+    let mut contract = TickBatch::new(1, 101, timestamp(), 7, "quorum");
+    contract.events = vec![event(
+        1,
+        101,
+        20,
+        r#"{"from":"CONTRACT","to":"LOOKUP","amount":"500"}"#,
+    )];
+    contract.event_participants = vec![
+        participant(1, 101, 20, "CONTRACT", "from"),
+        participant(1, 101, 20, "LOOKUP", "to"),
+    ];
+    store
+        .write_tick(&contract)
+        .await
+        .expect("write contract tick");
+
+    let activity = store
+        .activity_for_identity("LOOKUP", 10, 0)
+        .await
+        .expect("identity activity");
+    assert_eq!(activity.len(), 2);
+
+    // Contract-originated transfer event first: newer tick, populated role and
+    // transfer fields read from the event body.
+    assert_eq!(activity[0].kind, "event");
+    assert_eq!(activity[0].epoch, 1);
+    assert_eq!(activity[0].tick, 101);
+    assert_eq!(activity[0].log_id, Some(20));
+    assert_eq!(activity[0].tx_index, Some(20));
+    assert_eq!(activity[0].hash, "hash-20");
+    assert_eq!(activity[0].source, "CONTRACT");
+    assert_eq!(activity[0].destination, "LOOKUP");
+    assert_eq!(activity[0].amount, 500);
+    assert_eq!(activity[0].type_name, "qu_transfer");
+    assert_eq!(activity[0].role, "to");
+    assert_eq!(activity[0].status, "");
+    assert!(activity[0].body.contains("\"amount\":\"500\""));
+    let event_json = serde_json::to_value(&activity[0]).expect("serialize event");
+    assert_eq!(event_json["kind"], "event");
+    assert!(event_json.get("status").is_none());
+    assert!(event_json.get("input_data").is_none());
+    assert!(event_json.get("input_type").is_none());
+    assert_eq!(event_json["role"], "to");
+    assert_eq!(event_json["type_name"], "qu_transfer");
+
+    // Direct transaction second, with transaction-only fields populated.
+    assert_eq!(activity[1].kind, "transaction");
+    assert_eq!(activity[1].tick, 100);
+    assert_eq!(activity[1].log_id, None);
+    assert_eq!(activity[1].tx_index, Some(0));
+    assert_eq!(activity[1].hash, "tx-100");
+    assert_eq!(activity[1].source, "LOOKUP");
+    assert_eq!(activity[1].destination, "DST");
+    assert_eq!(activity[1].amount, 7);
+    assert_eq!(activity[1].status, "success");
+    let transaction_json = serde_json::to_value(&activity[1]).expect("serialize transaction");
+    assert_eq!(transaction_json["kind"], "transaction");
+    assert_eq!(transaction_json["input_type"], 0);
+    assert_eq!(transaction_json["status"], "success");
+    assert!(transaction_json.get("log_id").is_none());
+    assert!(transaction_json.get("type_name").is_none());
+    assert!(transaction_json.get("body").is_none());
+    assert!(transaction_json.get("role").is_none());
+    assert_eq!(activity[1].role, "");
+    assert_eq!(activity[1].timestamp, timestamp());
+
+    // The event view sees the same contract log.
+    let events = store
+        .events_for_identity("LOOKUP", 10, 0)
+        .await
+        .expect("events by identity");
+    assert_eq!(
+        events.iter().map(|event| event.log_id).collect::<Vec<_>>(),
+        vec![20]
+    );
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn activity_pagination_is_stable_and_has_no_duplicates() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    let mut tick_100 = TickBatch::new(1, 100, timestamp(), 7, "quorum");
+    tick_100.transactions = vec![transfer(100, 0, "tx-100", "LOOKUP", "B")];
+    store.write_tick(&tick_100).await.expect("write tick 100");
+
+    let mut tick_101 = TickBatch::new(1, 101, timestamp(), 7, "quorum");
+    tick_101.transactions = vec![transfer(101, 0, "tx-101", "A", "LOOKUP")];
+    tick_101.events = vec![
+        event(1, 101, 5, r#"{"from":"LOOKUP","to":"C","amount":"1"}"#),
+        event(
+            1,
+            101,
+            6,
+            r#"{"from":"CONTRACT","to":"LOOKUP","amount":"2"}"#,
+        ),
+    ];
+    tick_101.event_participants = vec![
+        participant(1, 101, 5, "LOOKUP", "from"),
+        participant(1, 101, 6, "LOOKUP", "to"),
+    ];
+    store.write_tick(&tick_101).await.expect("write tick 101");
+
+    let mut tick_102 = TickBatch::new(1, 102, timestamp(), 7, "quorum");
+    tick_102.transactions = vec![transfer(102, 0, "tx-102", "LOOKUP", "D")];
+    store.write_tick(&tick_102).await.expect("write tick 102");
+
+    let key = |row: &IdentityActivityRow| {
+        (
+            row.kind.clone(),
+            row.tick,
+            row.log_id,
+            row.tx_index,
+            row.hash.clone(),
+        )
+    };
+    let all = store
+        .activity_for_identity("LOOKUP", 100, 0)
+        .await
+        .expect("all activity");
+    assert_eq!(all.len(), 5);
+    // tick DESC, then log_id DESC with nulls last (transactions have no log
+    // and sort after events on the same tick), then tx_index DESC.
+    assert_eq!(
+        all.iter()
+            .map(|row| (row.tick, row.log_id, row.kind.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (102, None, "transaction"),
+            (101, Some(6), "event"),
+            (101, Some(5), "event"),
+            (101, None, "transaction"),
+            (100, None, "transaction"),
+        ]
+    );
+
+    let mut paged = Vec::new();
+    for offset in [0_u64, 2, 4] {
+        let page = store
+            .activity_for_identity("LOOKUP", 2, offset)
+            .await
+            .expect("activity page");
+        assert!(!page.is_empty() && page.len() <= 2);
+        paged.extend(page);
+    }
+    assert_eq!(
+        paged.iter().map(key).collect::<Vec<_>>(),
+        all.iter().map(key).collect::<Vec<_>>()
+    );
+
+    // The limit clamp still yields at least one row.
+    assert_eq!(
+        store
+            .activity_for_identity("LOOKUP", 0, 0)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn activity_for_empty_and_unknown_identity_is_empty() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    let mut tick = TickBatch::new(1, 100, timestamp(), 7, "quorum");
+    tick.transactions = vec![transfer(100, 0, "tx-100", "LOOKUP", "DST")];
+    tick.events = vec![event(1, 100, 10, "event-a")];
+    tick.event_participants = vec![participant(1, 100, 10, "LOOKUP", "from")];
+    store.write_tick(&tick).await.expect("write tick");
+
+    assert!(
+        store
+            .activity_for_identity("", 10, 0)
+            .await
+            .expect("empty identity activity")
+            .is_empty()
+    );
+    assert!(
+        store
+            .activity_for_identity("NOBODY", 10, 0)
+            .await
+            .expect("unknown identity activity")
+            .is_empty()
+    );
+    assert!(
+        store
+            .events_for_identity("", 10, 0)
+            .await
+            .expect("empty identity events")
+            .is_empty()
+    );
+    assert!(
+        store
+            .events_for_identity("NOBODY", 10, 0)
+            .await
+            .expect("unknown identity events")
+            .is_empty()
+    );
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn tick_writer_persists_event_participants_before_the_tick() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    let mut tick = TickBatch::new(1, 400, timestamp(), 7, "quorum");
+    tick.events = vec![event(1, 400, 10, "event-a"), event(1, 400, 11, "event-b")];
+    tick.event_participants = vec![
+        participant(1, 400, 10, "WRITER", "from"),
+        participant(1, 400, 11, "WRITER", "to"),
+        participant(1, 400, 11, "WRITER", "to"),
+        participant(1, 400, 11, "OTHER", "from"),
+    ];
+    store.write_tick(&tick).await.expect("write tick");
+
+    // The head is only written after the participant insert succeeded.
+    assert_eq!(store.head().await.unwrap().expect("head").tick, 400);
+    assert_eq!(
+        show_create(&store, "event_participants")
+            .await
+            .matches("by_tick")
+            .count(),
+        1
+    );
+    assert_eq!(
+        scalar_count(
+            &store,
+            "SELECT uniqExact(epoch, log_id, identity, role) AS n FROM event_participants"
+        )
+        .await,
+        3
+    );
+    let events = store
+        .events_for_identity("WRITER", 10, 0)
+        .await
+        .expect("writer events");
+    assert_eq!(
+        events.iter().map(|event| event.log_id).collect::<Vec<_>>(),
+        vec![11, 10]
+    );
+
+    // A participant for another tick rejects the whole batch.
+    let mut bad = TickBatch::new(1, 401, timestamp(), 7, "quorum");
+    bad.event_participants = vec![participant(1, 402, 12, "WRITER", "to")];
+    let err = store.write_tick(&bad).await.expect_err("mismatched tick");
+    assert!(
+        matches!(err, Error::InvalidBatch(_)),
+        "unexpected error: {err:?}"
+    );
+
+    // An empty identity is rejected before anything is inserted.
+    let mut blank = TickBatch::new(1, 401, timestamp(), 7, "quorum");
+    blank.event_participants = vec![participant(1, 401, 13, "", "to")];
+    let err = store.write_tick(&blank).await.expect_err("blank identity");
+    assert!(
+        matches!(err, Error::InvalidBatch(_)),
+        "unexpected error: {err:?}"
+    );
+
+    store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+async fn activity_rows_serialize_to_a_stable_json_shape() {
+    let participant = participant(1, 100, 10, "AAAA", "from");
+    let json = serde_json::to_value(&participant).expect("serialize participant");
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "epoch": 1,
+            "tick": 100,
+            "log_id": 10,
+            "identity": "AAAA",
+            "role": "from",
+            "tx_hash": "hash-10",
+            "tx_index": 10,
+            "timestamp": "2026-11-18T12:34:56Z",
+        })
+    );
+    let decoded: EventParticipantRow =
+        serde_json::from_value(json).expect("deserialize participant");
+    assert_eq!(decoded, participant);
+
+    let activity = IdentityActivityRow {
+        kind: "event".into(),
+        epoch: 1,
+        tick: 101,
+        timestamp: timestamp(),
+        tx_index: Some(3),
+        log_id: Some(20),
+        hash: "hash-20".into(),
+        source: "CONTRACT".into(),
+        destination: "AAAA".into(),
+        amount: 500,
+        input_type: None,
+        input_data: String::new(),
+        status: String::new(),
+        type_name: "qu_transfer".into(),
+        body: "{\"amount\":\"500\"}".into(),
+        role: "to".into(),
+    };
+    let json = serde_json::to_value(&activity).expect("serialize activity");
+    assert_eq!(json["kind"], "event");
+    assert_eq!(json["epoch"], 1);
+    assert_eq!(json["tick"], 101);
+    assert_eq!(json["timestamp"], "2026-11-18T12:34:56Z");
+    assert_eq!(json["tx_index"], 3);
+    assert_eq!(json["log_id"], 20);
+    assert_eq!(json["hash"], "hash-20");
+    assert_eq!(json["source"], "CONTRACT");
+    assert_eq!(json["destination"], "AAAA");
+    assert_eq!(json["amount"], 500);
+    assert!(json.get("input_type").is_none());
+    assert!(json.get("input_data").is_none());
+    assert!(json.get("status").is_none());
+    assert_eq!(json["type_name"], "qu_transfer");
+    assert_eq!(json["body"], "{\"amount\":\"500\"}");
+    assert_eq!(json["role"], "to");
+    let decoded: IdentityActivityRow = serde_json::from_value(json).expect("deserialize activity");
+    assert_eq!(decoded, activity);
+
+    // A transaction row leaves event-only fields empty and null.
+    let transaction = IdentityActivityRow {
+        kind: "transaction".into(),
+        log_id: None,
+        input_type: Some(0),
+        status: "success".into(),
+        ..activity
+    };
+    let json = serde_json::to_value(&transaction).expect("serialize transaction");
+    assert_eq!(json["kind"], "transaction");
+    assert!(json.get("log_id").is_none());
+    assert_eq!(json["input_type"], 0);
+    assert_eq!(json["status"], "success");
 }

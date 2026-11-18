@@ -10,12 +10,86 @@ use std::collections::{BTreeMap, HashMap};
 
 use serde::Serialize;
 
-use crate::rows::{self, EventInsert, IdentityInsert, TickInsert, TransactionInsert};
+use crate::rows::{
+    self, EventInsert, IdentityInsert, QuorumEvidenceInsert, TickInsert, TransactionInsert,
+};
 use crate::{
-    CURSOR_HEAD, ClickHouseStore, Error, HeadCursor, Result, Store, TickBatch, WriteOutcome,
+    CURSOR_HEAD, ClickHouseStore, Error, EventParticipantRow, HeadCursor, Result, Store, TickBatch,
+    WriteOutcome,
 };
 
+struct PreparedTick {
+    tick: TickInsert,
+    transactions: Vec<TransactionInsert>,
+    events: Vec<EventInsert>,
+    participants: Vec<EventParticipantRow>,
+    identities: Vec<IdentityInsert>,
+    evidence: Option<QuorumEvidenceInsert>,
+    outcome: WriteOutcome,
+}
+
 pub async fn write_tick(store: &ClickHouseStore, batch: &TickBatch) -> Result<WriteOutcome> {
+    let mut outcomes = write_ticks(store, std::slice::from_ref(batch)).await?;
+    outcomes
+        .pop()
+        .ok_or_else(|| Error::InvalidBatch("tick batch produced no outcome".into()))
+}
+
+/// Persists many ordered ticks with one insert per table and one cursor
+/// advance. This is the backfill path: per-tick inserts and cursor reads are
+/// the dominant cost when catching up an epoch.
+pub async fn write_ticks(
+    store: &ClickHouseStore,
+    batches: &[TickBatch],
+) -> Result<Vec<WriteOutcome>> {
+    if batches.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut transactions = Vec::new();
+    let mut events = Vec::new();
+    let mut participants = Vec::new();
+    let mut identities = Vec::new();
+    let mut evidence = Vec::new();
+    let mut ticks = Vec::with_capacity(batches.len());
+    let mut outcomes = Vec::with_capacity(batches.len());
+
+    for batch in batches {
+        let prepared = prepare_tick(batch)?;
+        transactions.extend(prepared.transactions);
+        events.extend(prepared.events);
+        participants.extend(prepared.participants);
+        identities.extend(prepared.identities);
+        if let Some(row) = prepared.evidence {
+            evidence.push(row);
+        }
+        ticks.push(prepared.tick);
+        outcomes.push(prepared.outcome);
+    }
+
+    insert_all(&store.client, "transactions", &transactions).await?;
+    insert_all(&store.client, "events", &events).await?;
+    // Participants are written before the tick rows so a visible head always
+    // has a complete identity index.
+    store.write_event_participants(&participants).await?;
+    insert_all(&store.client, "identities", &identities).await?;
+    // Evidence is written before the tick row so a visible head always has its
+    // audit row. It shares the batch version, so a replay replaces it.
+    insert_all(&store.client, "quorum_evidence", &evidence).await?;
+    insert_all(&store.client, "ticks", &ticks).await?;
+
+    // Batches are ordered by the caller. The cursor only advances to the last
+    // one, so a crash before this point replays the range idempotently.
+    let newest = batches
+        .last()
+        .expect("non-empty batches checked at function entry");
+    advance_head(store, newest).await?;
+    advance_ingest(store, newest).await?;
+
+    Ok(outcomes)
+}
+
+fn prepare_tick(batch: &TickBatch) -> Result<PreparedTick> {
     // Deduplicate by natural key. A single tick can mention the same identity
     // more than once and a retry can redeliver the same rows.
     let mut transactions = BTreeMap::new();
@@ -37,6 +111,34 @@ pub async fn write_tick(store: &ClickHouseStore, batch: &TickBatch) -> Result<Wr
         }
         identities.insert(identity.identity.as_str(), identity);
     }
+
+    // The participant index is keyed by the event key plus identity and role.
+    // Collapsing here keeps the pre-insert batch small; the store also
+    // deduplicates defensively.
+    let mut participant_map = BTreeMap::new();
+    for participant in &batch.event_participants {
+        validate_row(
+            batch,
+            participant.epoch,
+            participant.tick,
+            "event participant",
+        )?;
+        if participant.identity.is_empty() {
+            return Err(Error::InvalidBatch("participant identity is empty".into()));
+        }
+        participant_map.insert(
+            (
+                participant.log_id,
+                participant.identity.as_str(),
+                participant.role.as_str(),
+            ),
+            participant,
+        );
+    }
+    let participants = participant_map
+        .into_values()
+        .cloned()
+        .collect::<Vec<EventParticipantRow>>();
 
     let version = batch.version;
     let transaction_rows = transactions
@@ -89,37 +191,65 @@ pub async fn write_tick(store: &ClickHouseStore, batch: &TickBatch) -> Result<Wr
         })
         .collect::<Vec<_>>();
 
-    insert_all(&store.client, "transactions", &transaction_rows).await?;
-    insert_all(&store.client, "events", &event_rows).await?;
-    insert_all(&store.client, "identities", &identity_rows).await?;
+    let evidence = match &batch.evidence {
+        Some(row) => {
+            validate_row(batch, row.epoch, row.tick, "quorum evidence")?;
+            Some(QuorumEvidenceInsert {
+                epoch: batch.epoch,
+                tick: batch.tick,
+                quorum_digest: row.quorum_digest,
+                tick_data_digest: row.tick_data_digest,
+                required_votes: row.required_votes,
+                aligned_votes: row.aligned_votes,
+                fetched_votes: row.fetched_votes,
+                unique_votes: row.unique_votes,
+                verified_votes: row.verified_votes,
+                verification: row.verification.clone(),
+                warning_count: row.warning_count,
+                warnings: row.warnings.clone(),
+                timestamp: row.timestamp,
+                // Callers that construct evidence usually leave `version` at
+                // its default; those rows inherit the tick version. An explicit
+                // version is preserved so a caller can rewrite evidence
+                // independently.
+                version: if row.version == 0 {
+                    batch.version
+                } else {
+                    row.version
+                },
+            })
+        }
+        None => None,
+    };
 
-    insert_all(
-        &store.client,
-        "ticks",
-        &[TickInsert {
-            epoch: batch.epoch,
-            tick: batch.tick,
-            timestamp: batch.timestamp,
-            computor_index: batch.computor_index,
-            transaction_count: u32::try_from(transaction_rows.len()).unwrap_or(u32::MAX),
-            event_count: u32::try_from(event_rows.len()).unwrap_or(u32::MAX),
-            signature: batch.signature,
-            tick_digest: batch.tick_digest,
-            verification: batch.verification.clone(),
-            version,
-        }],
-    )
-    .await?;
-
-    advance_head(store, batch).await?;
-    advance_ingest(store, batch).await?;
-
-    Ok(WriteOutcome {
+    let outcome = WriteOutcome {
         tick: batch.tick,
         version,
         transactions: transaction_rows.len(),
         events: event_rows.len(),
         identities: identity_rows.len(),
+    };
+    let tick = TickInsert {
+        epoch: batch.epoch,
+        tick: batch.tick,
+        timestamp: batch.timestamp,
+        computor_index: batch.computor_index,
+        transaction_count: u32::try_from(transaction_rows.len()).unwrap_or(u32::MAX),
+        event_count: u32::try_from(event_rows.len()).unwrap_or(u32::MAX),
+        signature: batch.signature,
+        tick_digest: batch.tick_digest,
+        verification: batch.verification.clone(),
+        version,
+    };
+
+    Ok(PreparedTick {
+        tick,
+        transactions: transaction_rows,
+        events: event_rows,
+        participants,
+        identities: identity_rows,
+        evidence,
+        outcome,
     })
 }
 

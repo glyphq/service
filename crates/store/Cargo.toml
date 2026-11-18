@@ -9,6 +9,7 @@ license.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
 clickhouse.workspace = true
+qubic = { path = "../qubic" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

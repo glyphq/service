@@ -9,7 +9,8 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActivityBucket, AssetRow, EpochRow, EventRow, EventTypeCount, IdentityRow, Result, TickRow,
+    ActivityBucket, AssetRow, ComputorRow, EpochRow, EventParticipantRow, EventRow, EventTypeCount,
+    IdentityActivityRow, IdentityRow, PricePointRow, QuorumEvidenceRow, Result, TickRow,
     TransactionRow,
 };
 
@@ -174,6 +175,216 @@ impl From<EventSelect> for EventRow {
 }
 
 #[derive(Debug, Row, Serialize)]
+pub(crate) struct EventParticipantInsert {
+    pub epoch: u16,
+    pub tick: u32,
+    pub log_id: u64,
+    pub identity: String,
+    pub role: String,
+    pub tx_hash: String,
+    pub tx_index: i16,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+    pub version: u64,
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct EventParticipantSelect {
+    pub epoch: u16,
+    pub tick: u32,
+    pub log_id: u64,
+    pub identity: String,
+    pub role: String,
+    pub tx_hash: String,
+    pub tx_index: i16,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+}
+
+impl From<EventParticipantSelect> for EventParticipantRow {
+    fn from(row: EventParticipantSelect) -> Self {
+        Self {
+            epoch: row.epoch,
+            tick: row.tick,
+            log_id: row.log_id,
+            identity: row.identity,
+            role: row.role,
+            tx_hash: row.tx_hash,
+            tx_index: row.tx_index,
+            timestamp: row.timestamp,
+        }
+    }
+}
+
+#[derive(Debug, Row, Serialize)]
+pub(crate) struct ComputorInsert {
+    pub epoch: u16,
+    pub computor_index: u16,
+    pub public_key: String,
+    pub identity: String,
+    pub version: u64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct ComputorSelect {
+    pub epoch: u16,
+    pub computor_index: u16,
+    pub public_key: String,
+    pub identity: String,
+    pub version: u64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+}
+
+impl From<ComputorSelect> for ComputorRow {
+    fn from(row: ComputorSelect) -> Self {
+        Self {
+            epoch: row.epoch,
+            computor_index: row.computor_index,
+            public_key: row.public_key,
+            identity: row.identity,
+            version: row.version,
+            timestamp: row.timestamp,
+        }
+    }
+}
+
+#[derive(Debug, Row, Serialize)]
+pub(crate) struct QuorumEvidenceInsert {
+    pub epoch: u16,
+    pub tick: u32,
+    #[serde(with = "fixed_bytes")]
+    pub quorum_digest: [u8; 32],
+    #[serde(with = "fixed_bytes")]
+    pub tick_data_digest: [u8; 32],
+    pub required_votes: u32,
+    pub aligned_votes: u32,
+    pub fetched_votes: u32,
+    pub unique_votes: u32,
+    pub verified_votes: u32,
+    pub verification: String,
+    pub warning_count: u32,
+    pub warnings: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+    pub version: u64,
+}
+
+impl From<&QuorumEvidenceRow> for QuorumEvidenceInsert {
+    fn from(row: &QuorumEvidenceRow) -> Self {
+        Self {
+            epoch: row.epoch,
+            tick: row.tick,
+            quorum_digest: row.quorum_digest,
+            tick_data_digest: row.tick_data_digest,
+            required_votes: row.required_votes,
+            aligned_votes: row.aligned_votes,
+            fetched_votes: row.fetched_votes,
+            unique_votes: row.unique_votes,
+            verified_votes: row.verified_votes,
+            verification: row.verification.clone(),
+            warning_count: row.warning_count,
+            warnings: row.warnings.clone(),
+            timestamp: row.timestamp,
+            version: row.version,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct QuorumEvidenceSelect {
+    pub epoch: u16,
+    pub tick: u32,
+    pub quorum_digest: [u8; 32],
+    pub tick_data_digest: [u8; 32],
+    pub required_votes: u32,
+    pub aligned_votes: u32,
+    pub fetched_votes: u32,
+    pub unique_votes: u32,
+    pub verified_votes: u32,
+    pub verification: String,
+    pub warning_count: u32,
+    pub warnings: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+    pub version: u64,
+}
+
+impl From<QuorumEvidenceSelect> for QuorumEvidenceRow {
+    fn from(row: QuorumEvidenceSelect) -> Self {
+        Self {
+            epoch: row.epoch,
+            tick: row.tick,
+            quorum_digest: row.quorum_digest,
+            tick_data_digest: row.tick_data_digest,
+            required_votes: row.required_votes,
+            aligned_votes: row.aligned_votes,
+            fetched_votes: row.fetched_votes,
+            unique_votes: row.unique_votes,
+            verified_votes: row.verified_votes,
+            verification: row.verification,
+            warning_count: row.warning_count,
+            warnings: row.warnings,
+            timestamp: row.timestamp,
+            version: row.version,
+        }
+    }
+}
+
+/// Union shape of a direct transaction and an event-derived activity row.
+///
+/// `kind` selects which side produced the row. Transaction rows leave
+/// `log_id`, `type_name`, `body`, and `role` empty; event rows leave
+/// `input_*` and `status` empty. `source`, `destination`, and `amount` are
+/// populated from the event body when it carries transfer fields.
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct IdentityActivitySelect {
+    pub kind: String,
+    pub epoch: u16,
+    pub tick: u32,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+    pub tx_index: Option<i16>,
+    pub log_id: Option<u64>,
+    pub hash: String,
+    pub source: String,
+    pub destination: String,
+    pub amount: i64,
+    pub input_type: u16,
+    pub input_data: String,
+    pub status: String,
+    pub type_name: String,
+    pub body: String,
+    pub role: String,
+}
+
+impl From<IdentityActivitySelect> for IdentityActivityRow {
+    fn from(row: IdentityActivitySelect) -> Self {
+        let is_transaction = row.kind == "transaction";
+        Self {
+            kind: row.kind,
+            epoch: row.epoch,
+            tick: row.tick,
+            timestamp: row.timestamp,
+            tx_index: row.tx_index,
+            log_id: row.log_id,
+            hash: row.hash,
+            source: row.source,
+            destination: row.destination,
+            amount: row.amount,
+            input_type: is_transaction.then_some(row.input_type),
+            input_data: row.input_data,
+            status: row.status,
+            type_name: row.type_name,
+            body: row.body,
+            role: row.role,
+        }
+    }
+}
+
+#[derive(Debug, Row, Serialize)]
 pub(crate) struct IdentityInsert {
     pub identity: String,
     pub public_key: String,
@@ -322,6 +533,61 @@ pub(crate) struct CursorInsert {
 #[derive(Debug, Row, Deserialize)]
 pub(crate) struct CursorSelect {
     pub value: String,
+}
+
+#[derive(Debug, Row, Serialize)]
+pub(crate) struct PricePointInsert {
+    pub hour: u32,
+    pub append_tick: u32,
+    pub source_tick: u32,
+    pub epoch: u16,
+    pub flags: u32,
+    pub price_e8: i64,
+    pub source: u32,
+    pub synced: u8,
+    pub bound: u8,
+    /// `[u8; 32]` serializes as a fixed tuple of 32 bytes, matching
+    /// `FixedString(32)` in RowBinary.
+    pub series_digest: [u8; 32],
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub observed_at: DateTime<Utc>,
+    pub version: u64,
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct PricePointSelect {
+    pub hour: u32,
+    pub append_tick: u32,
+    pub source_tick: u32,
+    pub epoch: u16,
+    pub flags: u32,
+    pub price_e8: i64,
+    pub source: u32,
+    pub synced: u8,
+    pub bound: u8,
+    pub series_digest: [u8; 32],
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub observed_at: DateTime<Utc>,
+    pub version: u64,
+}
+
+impl From<PricePointSelect> for PricePointRow {
+    fn from(row: PricePointSelect) -> Self {
+        Self {
+            hour: row.hour,
+            append_tick: row.append_tick,
+            source_tick: row.source_tick,
+            epoch: row.epoch,
+            flags: row.flags,
+            price_e8: row.price_e8,
+            source: row.source,
+            synced: row.synced,
+            bound: row.bound,
+            series_digest: row.series_digest,
+            observed_at: row.observed_at,
+            version: row.version,
+        }
+    }
 }
 
 #[derive(Debug, Row, Deserialize)]

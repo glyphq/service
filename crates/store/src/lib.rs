@@ -1,6 +1,6 @@
 //! ClickHouse-backed storage for the glyph indexer and API.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -103,6 +103,101 @@ pub struct IdentityRow {
     pub last_seen_tick: u32,
 }
 
+/// One `(event log, identity, role)` pair extracted from a decoded event body.
+///
+/// The events table stores participants inside the JSON `body`; this row is the
+/// normalized index that makes per-identity event lookups a primary-key read.
+/// Rows are keyed by `(identity, tick, log_id)` and versioned like the rest of
+/// the store, so re-indexing a tick is idempotent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventParticipantRow {
+    pub epoch: u16,
+    pub tick: u32,
+    pub log_id: u64,
+    pub identity: String,
+    pub role: String,
+    pub tx_hash: String,
+    pub tx_index: i16,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// One elected computor for an epoch.
+///
+/// `public_key` is the 0x-prefixed hex form of the raw 32-byte key and
+/// `identity` is the canonical uppercase base-26 form. `computor_index` is the
+/// position in the epoch's computor message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputorRow {
+    pub epoch: u16,
+    pub computor_index: u16,
+    pub public_key: String,
+    pub identity: String,
+    pub version: u64,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Vote evidence behind a verified tick.
+///
+/// `quorum_digest` is the digest the winning vote group agreed on and
+/// `tick_data_digest` is the digest of the tick data that was persisted. Vote
+/// counts describe how the quorum was assembled. `warnings` is the producer's
+/// serialized warning list; `warning_count` is its length.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuorumEvidenceRow {
+    pub epoch: u16,
+    pub tick: u32,
+    pub quorum_digest: [u8; 32],
+    pub tick_data_digest: [u8; 32],
+    pub required_votes: u32,
+    pub aligned_votes: u32,
+    pub fetched_votes: u32,
+    pub unique_votes: u32,
+    pub verified_votes: u32,
+    pub verification: String,
+    pub warning_count: u32,
+    pub warnings: String,
+    pub timestamp: DateTime<Utc>,
+    pub version: u64,
+}
+
+/// One row of a per-identity history.
+///
+/// Direct transactions (`kind = "transaction"`) carry the transaction fields
+/// and leave `log_id`, `type_name`, `body`, and `role` empty. Event-derived rows
+/// (`kind = "event"`) carry the event identity and the participant `role`, and
+/// leave the transaction input/status fields empty. Transfer-shaped event
+/// bodies (`from`, `to`, `amount`) also populate `source`, `destination`, and
+/// `amount` so callers can render both kinds with the same code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityActivityRow {
+    pub kind: String,
+    pub epoch: u16,
+    pub tick: u32,
+    pub timestamp: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_index: Option<i16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_id: Option<u64>,
+    pub hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub destination: String,
+    pub amount: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<u16>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub input_data: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub type_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub role: String,
+}
+
 /// Aggregated view of one epoch derived from the `ticks` table.
 ///
 /// Epochs are not stored separately yet, so the summary is computed on read.
@@ -174,6 +269,46 @@ pub struct EventTypeCount {
     pub count: u64,
 }
 
+/// One hour of the QUBIC/USDT oracle price.
+///
+/// `hour` is the logical key: a later `version` for the same hour replaces the
+/// earlier row. `price_e8` is the price scaled by 1e8, and `series_digest` is
+/// the raw K12 digest of the series state that produced the value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PricePointRow {
+    pub hour: u32,
+    pub append_tick: u32,
+    pub source_tick: u32,
+    pub epoch: u16,
+    pub flags: u32,
+    pub price_e8: i64,
+    pub source: u32,
+    pub synced: u8,
+    pub bound: u8,
+    pub series_digest: [u8; 32],
+    pub observed_at: DateTime<Utc>,
+    pub version: u64,
+}
+
+/// Latest stored price alongside the series metadata callers display.
+///
+/// `points` counts distinct hours, not physical rows, so replayed writes do not
+/// inflate it. The metadata fields mirror `latest` and default to zero when the
+/// series is empty, but [`Store::price_snapshot`] returns `None` in that case.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PriceSnapshot {
+    pub latest: Option<PricePointRow>,
+    pub points: u64,
+    pub synced: bool,
+    pub bound: bool,
+    pub source: u32,
+    pub series_digest: [u8; 32],
+    pub epoch: u16,
+    pub append_tick: u32,
+    pub source_tick: u32,
+    pub observed_at: DateTime<Utc>,
+}
+
 /// Filters accepted by the transaction collection.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransactionFilter {
@@ -212,7 +347,13 @@ pub struct TickBatch {
     pub tick_digest: [u8; 32],
     pub transactions: Vec<TransactionRow>,
     pub events: Vec<EventRow>,
+    /// Normalized participants of `events`. Empty when the producer does not
+    /// publish participant identities.
+    pub event_participants: Vec<EventParticipantRow>,
     pub identities: Vec<IdentityRow>,
+    /// Optional quorum evidence for this tick. Written in the same batch,
+    /// before the tick row, so a visible tick always has its audit row.
+    pub evidence: Option<QuorumEvidenceRow>,
 }
 
 impl TickBatch {
@@ -234,7 +375,9 @@ impl TickBatch {
             tick_digest: [0; 32],
             transactions: Vec::new(),
             events: Vec::new(),
+            event_participants: Vec::new(),
             identities: Vec::new(),
+            evidence: None,
         }
     }
 }
@@ -296,6 +439,40 @@ pub trait Store: Send + Sync {
     /// Most recent transactions across all epochs, newest tick first.
     async fn recent_transactions(&self, limit: u32, offset: u64) -> Result<Vec<TransactionRow>>;
     async fn events_for_tick(&self, tick: u32, limit: u32, offset: u64) -> Result<Vec<EventRow>>;
+    /// Events where `identity` is a participant, newest tick and log first.
+    ///
+    /// `limit` is clamped to `1..=500`. The default implementation reports the
+    /// capability as unsupported.
+    async fn events_for_identity(
+        &self,
+        identity: &str,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<EventRow>> {
+        let _ = (identity, limit, offset);
+        Err(Error::Config("activity storage unsupported".into()))
+    }
+    /// Linear per-identity history: direct transactions and event-derived rows
+    /// in one shape, newest tick first.
+    ///
+    /// `limit` is clamped to `1..=200`. The default implementation reports the
+    /// capability as unsupported.
+    async fn activity_for_identity(
+        &self,
+        identity: &str,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<IdentityActivityRow>> {
+        let _ = (identity, limit, offset);
+        Err(Error::Config("activity storage unsupported".into()))
+    }
+    /// Upsert normalized event participants. Duplicates inside one call
+    /// collapse by `(epoch, log_id, identity, role)`. The tick writer calls
+    /// this between the event insert and the tick row.
+    async fn write_event_participants(&self, rows: &[EventParticipantRow]) -> Result<()> {
+        let _ = rows;
+        Err(Error::Config("activity storage unsupported".into()))
+    }
     async fn identity(&self, identity: &str) -> Result<Option<IdentityRow>>;
     /// Identities with the highest transfer counts, then highest balance,
     /// then canonical identity.
@@ -362,8 +539,69 @@ pub trait Store: Send + Sync {
     }
     async fn network_stats(&self) -> Result<NetworkStats>;
 
+    /// Persist the elected computor set for `epoch`. Replaying the same epoch
+    /// replaces its rows; later timestamps win. The default implementation
+    /// reports the capability as unsupported.
+    async fn write_computors(
+        &self,
+        epoch: u16,
+        computors: &qubic::messages::Computors,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
+        let _ = (epoch, computors, timestamp);
+        Err(Error::Config("computor storage unsupported".into()))
+    }
+    /// The elected computor set for `epoch`, ordered by `computor_index`.
+    /// Unknown epochs return an empty list. The default implementation reports
+    /// the capability as unsupported.
+    async fn computors(&self, epoch: u16) -> Result<Vec<ComputorRow>> {
+        let _ = epoch;
+        Err(Error::Config("computor storage unsupported".into()))
+    }
+    /// Quorum evidence for a stored tick. `None` when the tick has no evidence
+    /// or is not indexed. The default implementation reports the capability as
+    /// unsupported.
+    async fn evidence_for_tick(&self, tick: u32) -> Result<Option<QuorumEvidenceRow>> {
+        let _ = tick;
+        Err(Error::Config("evidence storage unsupported".into()))
+    }
+
+    /// Upsert price points keyed by `hour`. Later versions win, and duplicate
+    /// hours inside one batch collapse to the highest version. Writes are
+    /// idempotent, so replaying a batch is safe.
+    async fn write_price_points(&self, points: &[PricePointRow]) -> Result<()> {
+        let _ = points;
+        Err(Error::Config("price storage unsupported".into()))
+    }
+    /// Distinct price points with `hour >= from_hour`, oldest hour first.
+    /// `limit` is clamped to `1..=1000`.
+    async fn price_points(&self, from_hour: u32, limit: u32) -> Result<Vec<PricePointRow>> {
+        let _ = (from_hour, limit);
+        Err(Error::Config("price storage unsupported".into()))
+    }
+    /// Highest stored hour after per-hour version resolution.
+    async fn latest_price(&self) -> Result<Option<PricePointRow>> {
+        Err(Error::Config("price storage unsupported".into()))
+    }
+    /// Latest point plus series metadata. `None` when no points are stored.
+    async fn price_snapshot(&self) -> Result<Option<PriceSnapshot>> {
+        Err(Error::Config("price storage unsupported".into()))
+    }
+
     /// Persist a fully verified tick and advance the head cursor.
     async fn write_tick(&self, batch: &TickBatch) -> Result<WriteOutcome>;
+    /// Persist ordered ticks with one insert per table and one cursor advance.
+    ///
+    /// The default implementation calls [`Store::write_tick`] for each batch.
+    /// Stores that can batch should override it; backfill throughput depends on
+    /// it because per-tick inserts are the dominant cost.
+    async fn write_ticks(&self, batches: &[TickBatch]) -> Result<Vec<WriteOutcome>> {
+        let mut outcomes = Vec::with_capacity(batches.len());
+        for batch in batches {
+            outcomes.push(self.write_tick(batch).await?);
+        }
+        Ok(outcomes)
+    }
     /// Read an ingest cursor. Values are opaque strings owned by the caller.
     async fn cursor(&self, key: &str) -> Result<Option<String>>;
     async fn set_cursor(&self, key: &str, value: &str) -> Result<()>;
@@ -415,6 +653,13 @@ impl ClickHouseStore {
             .await?;
         Ok(row.n)
     }
+
+    /// Derive a `ReplacingMergeTree` version from the observation timestamp.
+    /// Microseconds keep two writes in the same millisecond ordered while the
+    /// value stays small enough for `UInt64`.
+    fn timestamp_version(timestamp: DateTime<Utc>) -> u64 {
+        u64::try_from(timestamp.timestamp_micros()).unwrap_or(0)
+    }
 }
 
 #[async_trait]
@@ -424,6 +669,36 @@ impl Store for ClickHouseStore {
             .query(&schema::create_database(&self.database))
             .execute()
             .await?;
+        // Early deployments stored the BTC/USDT mining series in
+        // `price_points`. Keep that history under a distinct table and create a
+        // fresh table for QUBIC/USDT instead of serving BTC numbers as QUBIC.
+        let legacy_table = format!("EXISTS TABLE {}.price_points", self.database);
+        let backup_table = format!("EXISTS TABLE {}.btc_price_points", self.database);
+        let has_legacy = self
+            .client
+            .query(&legacy_table)
+            .fetch_one::<u8>()
+            .await
+            .unwrap_or(0);
+        let has_backup = self
+            .client
+            .query(&backup_table)
+            .fetch_one::<u8>()
+            .await
+            .unwrap_or(0);
+        if has_legacy != 0 && has_backup == 0 {
+            self.client
+                .query(&format!(
+                    "RENAME TABLE {}.price_points TO {}.btc_price_points",
+                    self.database, self.database
+                ))
+                .execute()
+                .await?;
+            tracing::warn!(
+                database = %self.database,
+                "moved legacy BTC price series to btc_price_points; starting a fresh QUBIC/USDT series"
+            );
+        }
         let statements = schema::statements(&self.database).map_err(Error::Config)?;
         for statement in statements {
             self.client.query(&statement).execute().await?;
@@ -605,6 +880,189 @@ LIMIT ? OFFSET ?
             .fetch_all::<rows::EventSelect>()
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn events_for_identity(
+        &self,
+        identity: &str,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<EventRow>> {
+        // Both sides of the join read a version-deduped subquery instead of
+        // scanning with FINAL. The participant primary key starts with
+        // `identity`, so the left side is a bounded key read. An identity can
+        // hold several roles on one log, hence the final `LIMIT 1 BY` on the
+        // event key.
+        let limit = limit.clamp(1, 500);
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT ?fields FROM (
+    SELECT e.epoch AS epoch,
+           e.tick AS tick,
+           e.log_id AS log_id,
+           e.log_type AS log_type,
+           e.type_name AS type_name,
+           e.tx_hash AS tx_hash,
+           e.tx_index AS tx_index,
+           e.body AS body,
+           e.log_digest AS log_digest,
+           e.timestamp AS timestamp
+    FROM (
+        SELECT * FROM event_participants
+        WHERE identity = ?
+        ORDER BY version DESC
+        LIMIT 1 BY epoch, log_id, identity, role
+    ) AS p
+    INNER JOIN (
+        SELECT * FROM events
+        ORDER BY version DESC
+        LIMIT 1 BY epoch, log_id
+    ) AS e ON e.epoch = p.epoch AND e.log_id = p.log_id
+    ORDER BY e.tick DESC, e.log_id DESC, p.role DESC
+    LIMIT 1 BY e.epoch, e.log_id
+)
+ORDER BY tick DESC, log_id DESC
+LIMIT ? OFFSET ?
+"#,
+            )
+            .bind(identity)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all::<rows::EventSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn activity_for_identity(
+        &self,
+        identity: &str,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<IdentityActivityRow>> {
+        // One linear history over two sources: direct transfers and events the
+        // identity participated in. Both branches are version-deduped before
+        // the union so replayed ticks contribute once. The union columns have a
+        // common type and order; `kind` tells callers which source produced the
+        // row. For event rows the transfer-shaped fields are read from the
+        // decoded JSON body and default to empty/zero for other event types.
+        let limit = limit.clamp(1, 200);
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT kind, epoch, tick, timestamp, tx_index, log_id, hash, source,
+       destination, amount, input_type, input_data, status, type_name, body, role
+FROM (
+    SELECT
+        'transaction' AS kind,
+        t.epoch AS epoch,
+        t.tick AS tick,
+        t.timestamp AS timestamp,
+        toNullable(toInt16(t.tx_index)) AS tx_index,
+        CAST(NULL AS Nullable(UInt64)) AS log_id,
+        t.hash AS hash,
+        t.source AS source,
+        t.destination AS destination,
+        t.amount AS amount,
+        t.input_type AS input_type,
+        t.input_data AS input_data,
+        t.status AS status,
+        '' AS type_name,
+        '' AS body,
+        '' AS role
+    FROM (
+        SELECT * FROM transactions
+        WHERE source = ? OR destination = ?
+        ORDER BY version DESC
+        LIMIT 1 BY tick, tx_index
+    ) AS t
+    UNION ALL
+    SELECT
+        'event' AS kind,
+        e.epoch AS epoch,
+        e.tick AS tick,
+        e.timestamp AS timestamp,
+        toNullable(e.tx_index) AS tx_index,
+        toNullable(e.log_id) AS log_id,
+        e.tx_hash AS hash,
+        JSONExtractString(e.body, 'from') AS source,
+        JSONExtractString(e.body, 'to') AS destination,
+        toInt64OrZero(JSONExtractString(e.body, 'amount')) AS amount,
+        toUInt16(0) AS input_type,
+        '' AS input_data,
+        '' AS status,
+        e.type_name AS type_name,
+        e.body AS body,
+        p.role AS role
+    FROM (
+        SELECT * FROM event_participants
+        WHERE identity = ?
+        ORDER BY version DESC
+        LIMIT 1 BY epoch, log_id, identity, role
+    ) AS p
+    INNER JOIN (
+        SELECT * FROM events
+        ORDER BY version DESC
+        LIMIT 1 BY epoch, log_id
+    ) AS e ON e.epoch = p.epoch AND e.log_id = p.log_id
+)
+ORDER BY tick DESC, log_id DESC NULLS LAST, tx_index DESC, hash DESC
+LIMIT ? OFFSET ?
+"#,
+            )
+            .bind(identity)
+            .bind(identity)
+            .bind(identity)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all::<rows::IdentityActivitySelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn write_event_participants(&self, participants: &[EventParticipantRow]) -> Result<()> {
+        if participants.is_empty() {
+            return Ok(());
+        }
+        // The natural batch key includes the role, so one event can contribute
+        // several rows for the same identity. The table's sort key omits the
+        // role, so a merge keeps the highest version per
+        // `(identity, tick, log_id)`.
+        let mut seen = HashSet::with_capacity(participants.len());
+        let mut rows = Vec::with_capacity(participants.len());
+        for participant in participants {
+            if !seen.insert((
+                participant.epoch,
+                participant.log_id,
+                participant.identity.as_str(),
+                participant.role.as_str(),
+            )) {
+                continue;
+            }
+            rows.push(rows::EventParticipantInsert {
+                epoch: participant.epoch,
+                tick: participant.tick,
+                log_id: participant.log_id,
+                identity: participant.identity.clone(),
+                role: participant.role.clone(),
+                tx_hash: participant.tx_hash.clone(),
+                tx_index: participant.tx_index,
+                timestamp: participant.timestamp,
+                // Participants carry no version of their own. The tick number
+                // is the store-wide default and matches `TickBatch::new`.
+                version: u64::from(participant.tick),
+            });
+        }
+        let mut insert = self
+            .client
+            .insert::<rows::EventParticipantInsert>("event_participants")?;
+        for row in &rows {
+            insert.write(row).await?;
+        }
+        insert.end().await?;
+        Ok(())
     }
 
     async fn identity(&self, identity: &str) -> Result<Option<IdentityRow>> {
@@ -1059,8 +1517,172 @@ LIMIT ?
         })
     }
 
+    async fn write_computors(
+        &self,
+        epoch: u16,
+        computors: &qubic::messages::Computors,
+        timestamp: DateTime<Utc>,
+    ) -> Result<()> {
+        if computors.epoch != epoch {
+            return Err(Error::InvalidBatch(format!(
+                "computor message is for epoch {}, not {epoch}",
+                computors.epoch
+            )));
+        }
+        if computors.public_keys.is_empty() {
+            return Ok(());
+        }
+        let version = Self::timestamp_version(timestamp);
+        let mut insert = self.client.insert::<rows::ComputorInsert>("computors")?;
+        for (index, key) in computors.public_keys.iter().enumerate() {
+            let index = u16::try_from(index)
+                .map_err(|_| Error::InvalidBatch("computor index does not fit in UInt16".into()))?;
+            let public_key = qubic::PublicKey::new(*key);
+            insert
+                .write(&rows::ComputorInsert {
+                    epoch,
+                    computor_index: index,
+                    public_key: public_key.to_hex(),
+                    identity: public_key.to_identity(),
+                    version,
+                    timestamp,
+                })
+                .await?;
+        }
+        insert.end().await?;
+        Ok(())
+    }
+
+    async fn computors(&self, epoch: u16) -> Result<Vec<ComputorRow>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM (\
+                     SELECT * FROM computors WHERE epoch = ? \
+                     ORDER BY version DESC LIMIT 1 BY epoch, computor_index\
+                 ) ORDER BY computor_index ASC",
+            )
+            .bind(epoch)
+            .fetch_all::<rows::ComputorSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn evidence_for_tick(&self, tick: u32) -> Result<Option<QuorumEvidenceRow>> {
+        let row = self
+            .client
+            .query(
+                "SELECT ?fields FROM quorum_evidence WHERE tick = ? \
+                 ORDER BY version DESC LIMIT 1",
+            )
+            .bind(tick)
+            .fetch_optional::<rows::QuorumEvidenceSelect>()
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn write_price_points(&self, points: &[PricePointRow]) -> Result<()> {
+        if points.is_empty() {
+            return Ok(());
+        }
+        // Collapse duplicate hours inside the batch before writing. A higher
+        // version always wins; equal versions keep the later occurrence so the
+        // last item in the batch is authoritative.
+        let mut by_hour: HashMap<u32, &PricePointRow> = HashMap::with_capacity(points.len());
+        for point in points {
+            let replaced = by_hour
+                .get(&point.hour)
+                .is_none_or(|existing| existing.version <= point.version);
+            if replaced {
+                by_hour.insert(point.hour, point);
+            }
+        }
+        let mut rows: Vec<&PricePointRow> = by_hour.into_values().collect();
+        rows.sort_by_key(|point| point.hour);
+
+        let mut insert = self
+            .client
+            .insert::<rows::PricePointInsert>("price_points")?;
+        for point in rows {
+            insert
+                .write(&rows::PricePointInsert {
+                    hour: point.hour,
+                    append_tick: point.append_tick,
+                    source_tick: point.source_tick,
+                    epoch: point.epoch,
+                    flags: point.flags,
+                    price_e8: point.price_e8,
+                    source: point.source,
+                    synced: point.synced,
+                    bound: point.bound,
+                    series_digest: point.series_digest,
+                    observed_at: point.observed_at,
+                    version: point.version,
+                })
+                .await?;
+        }
+        insert.end().await?;
+        Ok(())
+    }
+
+    async fn price_points(&self, from_hour: u32, limit: u32) -> Result<Vec<PricePointRow>> {
+        let limit = limit.clamp(1, 1000);
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM (\
+                     SELECT * FROM price_points WHERE hour >= ? \
+                     ORDER BY version DESC LIMIT 1 BY hour\
+                 ) ORDER BY hour ASC LIMIT ?",
+            )
+            .bind(from_hour)
+            .bind(limit)
+            .fetch_all::<rows::PricePointSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn latest_price(&self) -> Result<Option<PricePointRow>> {
+        let row = self
+            .client
+            .query(
+                "SELECT ?fields FROM (\
+                     SELECT * FROM price_points \
+                     ORDER BY version DESC LIMIT 1 BY hour\
+                 ) ORDER BY hour DESC LIMIT 1",
+            )
+            .fetch_optional::<rows::PricePointSelect>()
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn price_snapshot(&self) -> Result<Option<PriceSnapshot>> {
+        let Some(latest) = self.latest_price().await? else {
+            return Ok(None);
+        };
+        let points = self
+            .count("SELECT uniqExact(hour) AS n FROM price_points")
+            .await?;
+        Ok(Some(PriceSnapshot {
+            synced: latest.synced != 0,
+            bound: latest.bound != 0,
+            source: latest.source,
+            series_digest: latest.series_digest,
+            epoch: latest.epoch,
+            append_tick: latest.append_tick,
+            source_tick: latest.source_tick,
+            observed_at: latest.observed_at,
+            latest: Some(latest),
+            points,
+        }))
+    }
+
     async fn write_tick(&self, batch: &TickBatch) -> Result<WriteOutcome> {
         writer::write_tick(self, batch).await
+    }
+
+    async fn write_ticks(&self, batches: &[TickBatch]) -> Result<Vec<WriteOutcome>> {
+        writer::write_ticks(self, batches).await
     }
 
     async fn cursor(&self, key: &str) -> Result<Option<String>> {

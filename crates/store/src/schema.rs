@@ -158,6 +158,48 @@ ADD PROJECTION IF NOT EXISTS by_type
 )
 "#;
 
+/// Normalized `(identity, role)` index over event logs.
+///
+/// The events table keeps participants inside the JSON `body`, which cannot be
+/// used as a primary key. This table duplicates each participant pair so that
+/// per-identity history can be answered with a bounded primary-key read instead
+/// of scanning every event. `role` is not part of the sort key, so a merge keeps
+/// the highest `version` for one `(identity, tick, log_id)` triple.
+pub const CREATE_EVENT_PARTICIPANTS: &str = r#"
+CREATE TABLE IF NOT EXISTS {database}.event_participants
+(
+    epoch UInt16,
+    tick UInt32,
+    log_id UInt64,
+    identity String,
+    role LowCardinality(String),
+    tx_hash String,
+    tx_index Int16,
+    timestamp DateTime64(3, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY epoch
+ORDER BY (identity, tick, log_id)
+SETTINGS deduplicate_merge_projection_mode = 'rebuild'
+"#;
+
+pub const ALTER_EVENT_PARTICIPANTS_SETTINGS: &str = r#"
+ALTER TABLE {database}.event_participants
+MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild'
+"#;
+
+/// Tick-scoped reads (`epoch, tick, log_id`) in tick order. The natural key
+/// starts with `identity`, so without this projection a tick lookup scans the
+/// whole partition.
+pub const CREATE_EVENT_PARTICIPANTS_BY_TICK: &str = r#"
+ALTER TABLE {database}.event_participants
+ADD PROJECTION IF NOT EXISTS by_tick
+(
+    SELECT * ORDER BY (epoch, tick, log_id)
+)
+"#;
+
 pub const CREATE_IDENTITIES: &str = r#"
 CREATE TABLE IF NOT EXISTS {database}.identities
 (
@@ -204,6 +246,73 @@ ENGINE = ReplacingMergeTree(version)
 ORDER BY key
 "#;
 
+/// The elected computor set for one epoch. Rows are keyed by
+/// `(epoch, computor_index)` so replaying an epoch's computor message replaces
+/// the previous set instead of appending duplicates.
+pub const CREATE_COMPUTORS: &str = r#"
+CREATE TABLE IF NOT EXISTS {database}.computors
+(
+    epoch UInt16,
+    computor_index UInt16,
+    public_key String,
+    identity String,
+    version UInt64,
+    timestamp DateTime64(3, 'UTC')
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY (epoch, computor_index)
+"#;
+
+/// Vote evidence behind a stored tick. The digests are raw K12 values; vote
+/// counts describe how the winning quorum was assembled. `warnings` is the
+/// producer's serialized warning list, kept as one string so the row stays
+/// flat for ClickHouse.
+pub const CREATE_QUORUM_EVIDENCE: &str = r#"
+CREATE TABLE IF NOT EXISTS {database}.quorum_evidence
+(
+    epoch UInt16,
+    tick UInt32,
+    quorum_digest FixedString(32),
+    tick_data_digest FixedString(32),
+    required_votes UInt32,
+    aligned_votes UInt32,
+    fetched_votes UInt32,
+    unique_votes UInt32,
+    verified_votes UInt32,
+    verification LowCardinality(String),
+    warning_count UInt32,
+    warnings String,
+    timestamp DateTime64(3, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY epoch
+ORDER BY (epoch, tick)
+"#;
+
+/// Hourly QUBIC/USDT oracle price points. Each `hour` is a logical row, so the
+/// `ReplacingMergeTree(version)` sort key is the hour itself and reads use
+/// `ORDER BY version DESC LIMIT 1 BY hour` to see the newest revision.
+pub const CREATE_PRICE_POINTS: &str = r#"
+CREATE TABLE IF NOT EXISTS {database}.price_points
+(
+    hour UInt32,
+    append_tick UInt32,
+    source_tick UInt32,
+    epoch UInt16,
+    flags UInt32,
+    price_e8 Int64,
+    source UInt32,
+    synced UInt8,
+    bound UInt8,
+    series_digest FixedString(32) DEFAULT '',
+    observed_at DateTime64(3, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY hour
+"#;
+
 pub const ALL: &[&str] = &[
     CREATE_DATABASE,
     CREATE_TICKS,
@@ -219,10 +328,16 @@ pub const ALL: &[&str] = &[
     CREATE_EVENTS_BY_TICK,
     CREATE_EVENTS_RECENT,
     CREATE_EVENTS_BY_TYPE,
+    CREATE_EVENT_PARTICIPANTS,
+    ALTER_EVENT_PARTICIPANTS_SETTINGS,
+    CREATE_EVENT_PARTICIPANTS_BY_TICK,
     CREATE_IDENTITIES,
     ALTER_IDENTITIES_SETTINGS,
     CREATE_IDENTITIES_BY_ACTIVITY,
     CREATE_INGEST_STATE,
+    CREATE_COMPUTORS,
+    CREATE_QUORUM_EVIDENCE,
+    CREATE_PRICE_POINTS,
 ];
 
 /// Validates a database name before it is interpolated into DDL.
