@@ -42,14 +42,15 @@ Run `scripts/smoke.sh` to exercise the stack on your host.
 | Rust | 1.85 | The exact channel is pinned in `rust-toolchain.toml`. |
 | ClickHouse | 26.x | Tested with 26.11. A local binary is used, no Docker required. |
 | Memory | 2 GB RAM | 4 GB or more recommended when ClickHouse and the indexer share a host. |
-| Disk | 10 GB free | Roughly 10 GB per epoch at current activity, so size for the epochs you retain. |
+| Disk | 20 GB free | Roughly 16 GB per epoch at current activity, so size for the epochs you retain. |
 | Network | Outbound TCP | Qubic core peers on `21841`, Bob peers on `21842`. |
 | Local ports | `8080`, `8123`, `9000` | API, ClickHouse HTTP, ClickHouse native. All are configurable. |
 | Tools | `cargo`, `bash`, `curl` | `jq` is optional and improves the smoke output. |
 
-An epoch is 604,800 ticks. At current Qubic activity the compressed ClickHouse index
-grows by approximately **10 GB per epoch**. Budget about 12 GB per retained epoch for
-headroom; actual growth scales with transaction, event, and identity volume.
+An epoch is 604,800 ticks. A sizing run with 1,000 synthetic ticks at current activity
+(6.5 transactions and 13 events per tick) measured about 26 MB per 1,000 ticks with the
+schema and its projections. That is approximately **16 GB per epoch**. Budget about
+**20 GB per retained epoch** for headroom; payload sizes and activity move the number.
 
 ## Quick start
 
