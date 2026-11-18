@@ -1,13 +1,21 @@
 //! ClickHouse schema. Kept as SQL so migrations are reviewable and replayable.
+//!
+//! Every table is a `ReplacingMergeTree` with an explicit `version` column so
+//! that re-indexing the same logical row is idempotent. The projections are
+//! read paths used by the API and are added with `IF NOT EXISTS`, which makes
+//! [`statements`] safe to run on every startup.
 
 pub const DATABASE: &str = "glyph";
 
+/// Bumped whenever the DDL changes in a backwards-incompatible way.
+pub const VERSION: &str = "1";
+
 pub const CREATE_DATABASE: &str = r#"
-CREATE DATABASE IF NOT EXISTS glyph
+CREATE DATABASE IF NOT EXISTS {database}
 "#;
 
 pub const CREATE_TICKS: &str = r#"
-CREATE TABLE IF NOT EXISTS glyph.ticks
+CREATE TABLE IF NOT EXISTS {database}.ticks
 (
     epoch UInt16,
     tick UInt32,
@@ -15,18 +23,34 @@ CREATE TABLE IF NOT EXISTS glyph.ticks
     computor_index UInt16,
     transaction_count UInt32,
     event_count UInt32,
-    signature FixedString(64),
-    tick_digest FixedString(32),
+    signature FixedString(64) DEFAULT '',
+    tick_digest FixedString(32) DEFAULT '',
     verification LowCardinality(String),
     version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
 PARTITION BY epoch
 ORDER BY (epoch, tick)
+SETTINGS deduplicate_merge_projection_mode = 'rebuild'
+"#;
+
+/// Projections on `ReplacingMergeTree` require a non-default dedup mode.
+/// Kept separate from `CREATE_TICKS` so pre-existing tables are migrated too.
+pub const ALTER_TICKS_SETTINGS: &str = r#"
+ALTER TABLE {database}.ticks
+MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild'
+"#;
+
+pub const CREATE_TICKS_BY_TICK: &str = r#"
+ALTER TABLE {database}.ticks
+ADD PROJECTION IF NOT EXISTS by_tick
+(
+    SELECT * ORDER BY tick
+)
 "#;
 
 pub const CREATE_TRANSACTIONS: &str = r#"
-CREATE TABLE IF NOT EXISTS glyph.transactions
+CREATE TABLE IF NOT EXISTS {database}.transactions
 (
     epoch UInt16,
     tick UInt32,
@@ -44,10 +68,16 @@ CREATE TABLE IF NOT EXISTS glyph.transactions
 ENGINE = ReplacingMergeTree(version)
 PARTITION BY epoch
 ORDER BY (tick, tx_index)
+SETTINGS deduplicate_merge_projection_mode = 'rebuild'
+"#;
+
+pub const ALTER_TRANSACTIONS_SETTINGS: &str = r#"
+ALTER TABLE {database}.transactions
+MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild'
 "#;
 
 pub const CREATE_TRANSACTIONS_BY_HASH: &str = r#"
-ALTER TABLE glyph.transactions
+ALTER TABLE {database}.transactions
 ADD PROJECTION IF NOT EXISTS by_hash
 (
     SELECT * ORDER BY hash
@@ -55,7 +85,7 @@ ADD PROJECTION IF NOT EXISTS by_hash
 "#;
 
 pub const CREATE_EVENTS: &str = r#"
-CREATE TABLE IF NOT EXISTS glyph.events
+CREATE TABLE IF NOT EXISTS {database}.events
 (
     epoch UInt16,
     tick UInt32,
@@ -72,10 +102,16 @@ CREATE TABLE IF NOT EXISTS glyph.events
 ENGINE = ReplacingMergeTree(version)
 PARTITION BY epoch
 ORDER BY (epoch, log_id)
+SETTINGS deduplicate_merge_projection_mode = 'rebuild'
+"#;
+
+pub const ALTER_EVENTS_SETTINGS: &str = r#"
+ALTER TABLE {database}.events
+MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild'
 "#;
 
 pub const CREATE_EVENTS_BY_TICK: &str = r#"
-ALTER TABLE glyph.events
+ALTER TABLE {database}.events
 ADD PROJECTION IF NOT EXISTS by_tick
 (
     SELECT * ORDER BY (epoch, tick, log_id)
@@ -83,7 +119,7 @@ ADD PROJECTION IF NOT EXISTS by_tick
 "#;
 
 pub const CREATE_IDENTITIES: &str = r#"
-CREATE TABLE IF NOT EXISTS glyph.identities
+CREATE TABLE IF NOT EXISTS {database}.identities
 (
     identity String,
     public_key String,
@@ -99,24 +135,92 @@ ENGINE = ReplacingMergeTree(version)
 ORDER BY identity
 "#;
 
+/// Generic key/value cursor storage. Cursors are read with `ORDER BY version
+/// DESC LIMIT 1 BY key`, so the latest write always wins without `FINAL`.
 pub const CREATE_INGEST_STATE: &str = r#"
-CREATE TABLE IF NOT EXISTS glyph.ingest_state
+CREATE TABLE IF NOT EXISTS {database}.ingest_state
 (
     key String,
     value String,
-    updated_at DateTime64(3, 'UTC')
+    updated_at DateTime64(3, 'UTC'),
+    version UInt64
 )
-ENGINE = ReplacingMergeTree(updated_at)
+ENGINE = ReplacingMergeTree(version)
 ORDER BY key
 "#;
 
 pub const ALL: &[&str] = &[
     CREATE_DATABASE,
     CREATE_TICKS,
+    ALTER_TICKS_SETTINGS,
+    CREATE_TICKS_BY_TICK,
     CREATE_TRANSACTIONS,
+    ALTER_TRANSACTIONS_SETTINGS,
     CREATE_TRANSACTIONS_BY_HASH,
     CREATE_EVENTS,
+    ALTER_EVENTS_SETTINGS,
     CREATE_EVENTS_BY_TICK,
     CREATE_IDENTITIES,
     CREATE_INGEST_STATE,
 ];
+
+/// Validates a database name before it is interpolated into DDL.
+pub fn validate_database(database: &str) -> std::result::Result<(), String> {
+    if database.is_empty() {
+        return Err("database name is empty".into());
+    }
+    let mut chars = database.chars();
+    let first = chars.next().expect("non-empty");
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err(format!(
+            "database name must start with a letter or underscore: {database}"
+        ));
+    }
+    if let Some(bad) = chars.find(|c| !(c.is_ascii_alphanumeric() || *c == '_')) {
+        return Err(format!(
+            "database name contains an invalid character {bad:?}: {database}"
+        ));
+    }
+    if database.len() > 128 {
+        return Err("database name is longer than 128 bytes".into());
+    }
+    Ok(())
+}
+
+/// Renders every schema statement for `database`, in execution order.
+pub fn statements(database: &str) -> std::result::Result<Vec<String>, String> {
+    validate_database(database)?;
+    Ok(ALL
+        .iter()
+        .map(|sql| sql.replace("{database}", database))
+        .collect())
+}
+
+pub fn create_database(database: &str) -> String {
+    CREATE_DATABASE.replace("{database}", database)
+}
+
+pub fn drop_database(database: &str) -> String {
+    format!("DROP DATABASE IF EXISTS {database}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_all_statements() {
+        let statements = statements("glyph").expect("valid database");
+        assert_eq!(statements.len(), ALL.len());
+        assert!(statements.iter().all(|sql| !sql.contains("{database}")));
+        assert!(statements[0].contains("glyph"));
+    }
+
+    #[test]
+    fn rejects_injection_attempts() {
+        assert!(validate_database("glyph; DROP DATABASE default").is_err());
+        assert!(validate_database("1glyph").is_err());
+        assert!(validate_database("").is_err());
+        assert!(validate_database("glyph_2").is_ok());
+    }
+}
