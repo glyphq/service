@@ -76,6 +76,14 @@ impl StreamHub {
         let _ = self.sender.send(event);
     }
 
+    /// Publishes a typed event from another service, such as a price update.
+    /// Returns the number of active subscribers that received it.
+    pub fn publish_event(&self, event: &'static str, id: String, data: Value) -> usize {
+        self.sender
+            .send(StreamEvent { event, id, data })
+            .unwrap_or(0)
+    }
+
     /// Polls the index head until `cancel` is triggered.
     pub async fn run(
         self: Arc<Self>,
@@ -120,8 +128,8 @@ impl StreamHub {
                     event: "catchup",
                     id: format!("catchup:{}", head.tick),
                     data: json!({
-                        "lastPublishedTick": last_batch,
-                        "headTick": head.tick,
+                        "last_published_tick": last_batch,
+                        "head_tick": head.tick,
                         "pending": head.tick - last_batch,
                     }),
                 });

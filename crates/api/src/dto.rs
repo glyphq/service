@@ -68,13 +68,13 @@ impl Page {
             "limit": self.limit,
             "offset": self.offset,
             "count": returned,
-            "nextOffset": if has_more { Some(self.offset + returned as u64) } else { None },
-            "nextCursor": if has_more {
+            "next_offset": if has_more { Some(self.offset + returned as u64) } else { None },
+            "next_cursor": if has_more {
                 Some(encode_cursor(&self.fingerprint, self.offset + returned as u64))
             } else {
                 None
             },
-            "hasMore": has_more,
+            "has_more": has_more,
         })
     }
 }

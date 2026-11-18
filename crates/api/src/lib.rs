@@ -9,7 +9,7 @@ use axum::extract::{Request, State as AxumState};
 use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use node::PeerConfig;
+use node::{NodePool, PeerConfig};
 use store::Store;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
@@ -20,8 +20,12 @@ pub mod advanced;
 pub mod dto;
 pub mod error;
 pub mod openapi;
+pub mod prices;
 pub mod routes;
+pub mod status_page;
 pub mod stream;
+pub mod transactions_ext;
+pub mod wallet;
 
 pub use error::ApiError;
 
@@ -30,8 +34,11 @@ pub struct AppState {
     pub store: Arc<dyn Store>,
     pub hub: Option<Arc<stream::StreamHub>>,
     pub peers: Vec<PeerConfig>,
+    /// Shared peer health and ordering for peer-backed routes.
+    pub pool: NodePool,
     pub allow_broadcast: bool,
     pub archive: Option<archive::SharedArchive>,
+    pub started_at: Instant,
 }
 
 impl AppState {
@@ -40,9 +47,15 @@ impl AppState {
             store,
             hub: None,
             peers: Vec::new(),
+            pool: NodePool::new(Vec::new()),
             allow_broadcast: false,
             archive: None,
+            started_at: Instant::now(),
         }
+    }
+
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started_at.elapsed().as_secs()
     }
 }
 
@@ -51,12 +64,17 @@ pub fn router(state: AppState) -> Router {
     let mut app = Router::new()
         .merge(routes::router())
         .merge(advanced::router())
+        .merge(prices::router())
         .merge(stream::router())
+        .merge(status_page::router())
+        .merge(transactions_ext::router())
+        .merge(wallet::router())
         .route(
             "/openapi.json",
             axum::routing::get(|| async { axum::Json(openapi::spec()) }),
         )
-        .route("/docs", axum::routing::get(routes::docs))
+        .route("/docs", axum::routing::get(routes::scalar_docs))
+        .route("/scalar.js", axum::routing::get(routes::scalar_js))
         .fallback(routes::not_found)
         .with_state(state);
     if let Some(limiter) = RateLimiter::from_env() {
@@ -184,7 +202,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_millis(1000));
     let hub_task = tokio::spawn(hub.clone().run(store.clone(), poll, cancel.clone()));
-    let peers = std::env::var("QUBIC_PEERS")
+    let peers: Vec<PeerConfig> = std::env::var("QUBIC_PEERS")
         .or_else(|_| std::env::var("QUBIC_PEER"))
         .map(|value| {
             value
@@ -195,13 +213,32 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         })
         .unwrap_or_default();
     let allow_broadcast = std::env::var("ALLOW_BROADCAST").is_ok_and(|value| value == "true");
+    let pool = NodePool::new(peers.clone());
     let archive = archive_from_env();
+    let price_interval = std::env::var("PRICE_POLL_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(60));
+    let price_task = if peers.is_empty() {
+        None
+    } else {
+        Some(tokio::spawn(prices::run_poller(
+            store.clone(),
+            peers.clone(),
+            Some(hub.clone()),
+            price_interval,
+            cancel.clone(),
+        )))
+    };
     let app = router(AppState {
         store,
         hub: Some(hub),
         peers,
+        pool,
         allow_broadcast,
         archive,
+        started_at: Instant::now(),
     });
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "glyph api listening");
@@ -210,6 +247,9 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         .await?;
     cancel.cancel();
     let _ = hub_task.await;
+    if let Some(task) = price_task {
+        let _ = task.await;
+    }
     Ok(())
 }
 

@@ -14,7 +14,7 @@ fn cursor_param() -> Value {
         "name": "cursor",
         "in": "query",
         "required": false,
-        "description": "Opaque cursor from meta.nextCursor. Bound to the route and filters.",
+        "description": "Opaque cursor from meta.next_cursor. Bound to the route and filters.",
         "schema": { "type": "string" }
     })
 }
@@ -57,6 +57,8 @@ pub fn spec() -> Value {
             { "name": "events" },
             { "name": "identities" },
             { "name": "assets" },
+            { "name": "wallets" },
+            { "name": "prices" },
             { "name": "analytics" },
             { "name": "stream" },
             { "name": "network" },
@@ -77,6 +79,14 @@ pub fn spec() -> Value {
                     "tags": ["status"],
                     "summary": "Indexer head, ingest cursor, and counts",
                     "responses": { "200": { "description": "Current status" } }
+                }
+            },
+            "/status": {
+                "get": {
+                    "tags": ["status"],
+                    "summary": "Server-rendered operations dashboard",
+                    "description": "Uptime, head, ingest cursor, counts, and runtime feature flags. Refreshes every 5 seconds and does not require JavaScript.",
+                    "responses": { "200": { "description": "HTML dashboard", "content": { "text/html": { "schema": { "type": "string" } } } } }
                 }
             },
             "/v1/network/stats": {
@@ -105,6 +115,27 @@ pub fn spec() -> Value {
                     "responses": { "200": { "description": "Epoch" }, "404": { "description": "Epoch not indexed" } }
                 }
             },
+            "/v1/epochs/{epoch}/computors": {
+                "get": {
+                    "tags": ["epochs"],
+                    "summary": "Elected computor set for an epoch",
+                    "description": "Ordered by computor_index. public_key is 0x-prefixed hex and identity is the canonical uppercase base-26 form.",
+                    "parameters": [path_param("epoch", "Epoch number")],
+                    "responses": {
+                        "200": {
+                            "description": "Computor list",
+                            "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "data": { "type": "array", "items": { "$ref": "#/components/schemas/Computor" } },
+                                    "meta": { "type": "object" }
+                                }
+                            } } }
+                        },
+                        "404": { "description": "No computors indexed for the epoch" }
+                    }
+                }
+            },
             "/v1/ticks": {
                 "get": {
                     "tags": ["ticks"],
@@ -124,6 +155,24 @@ pub fn spec() -> Value {
                     "responses": {
                         "200": { "description": "Tick" },
                         "404": { "description": "Tick not indexed" }
+                    }
+                }
+            },
+            "/v1/ticks/{tick}/evidence": {
+                "get": {
+                    "tags": ["ticks"],
+                    "summary": "Quorum evidence behind a stored tick",
+                    "description": "Digests are lowercase hex. Vote counts describe how the winning quorum was assembled.",
+                    "parameters": [path_param("tick", "Global tick number")],
+                    "responses": {
+                        "200": {
+                            "description": "Quorum evidence",
+                            "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "properties": { "data": { "$ref": "#/components/schemas/QuorumEvidence" } }
+                            } } }
+                        },
+                        "404": { "description": "No evidence indexed for the tick" }
                     }
                 }
             },
@@ -233,6 +282,29 @@ pub fn spec() -> Value {
                     }
                 }
             },
+            "/v1/identities/{identity}/activity": {
+                "get": {
+                    "tags": ["identities", "transactions", "events"],
+                    "summary": "Linear transaction and contract-effect history",
+                    "description": "Merges direct transactions with decoded events where the identity participates, including contract payouts and asset movements.",
+                    "parameters": [path_param("identity", "Uppercase base-26 identity"), limit_param(), cursor_param(), offset_param()],
+                    "responses": {
+                        "200": { "description": "Paginated activity rows with kind transaction or event" },
+                        "400": { "description": "Invalid identity or cursor" }
+                    }
+                }
+            },
+            "/v1/identities/{identity}/events": {
+                "get": {
+                    "tags": ["identities", "events"],
+                    "summary": "Events where the identity participates",
+                    "parameters": [path_param("identity", "Uppercase base-26 identity"), limit_param(), cursor_param(), offset_param()],
+                    "responses": {
+                        "200": { "description": "Paginated event rows" },
+                        "400": { "description": "Invalid identity or cursor" }
+                    }
+                }
+            },
             "/v1/assets": {
                 "get": {
                     "tags": ["assets"],
@@ -253,6 +325,65 @@ pub fn spec() -> Value {
                         "200": { "description": "Asset" },
                         "400": { "description": "Invalid issuer" },
                         "404": { "description": "Asset not indexed" }
+                    }
+                }
+            },
+            "/v1/wallets/{identity}": {
+                "get": {
+                    "tags": ["wallets", "identities", "network"],
+                    "summary": "Wallet overview from the index and a direct peer",
+                    "description": "Combines the indexed identity and its ten newest transactions with the peer spectrum entity and the issued, owned, and possessed asset lists. One peer connection serves the request.",
+                    "parameters": [path_param("identity", "60-character identity")],
+                    "responses": {
+                        "200": { "description": "Wallet overview", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/WalletOverview" }, "meta": { "type": "object" } } } } } },
+                        "400": { "description": "Invalid identity" },
+                        "404": { "description": "Identity is neither indexed nor in the peer spectrum" },
+                        "503": { "description": "No peer available or peer lookup failed" }
+                    }
+                }
+            },
+            "/v1/wallets/{identity}/assets": {
+                "get": {
+                    "tags": ["wallets", "assets", "network"],
+                    "summary": "Issued, owned, and possessed assets for a wallet",
+                    "parameters": [
+                        path_param("identity", "60-character identity"),
+                        { "name": "kind", "in": "query", "required": false, "schema": { "type": "string", "enum": ["issued", "owned", "possessed", "all"], "default": "all" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Typed asset lists", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/WalletAssets" }, "meta": { "type": "object" } } } } } },
+                        "400": { "description": "Invalid identity or asset kind" },
+                        "503": { "description": "No peer available or peer lookup failed" }
+                    }
+                }
+            },
+            "/v1/wallets/{identity}/snapshot": {
+                "get": {
+                    "tags": ["wallets", "network"],
+                    "summary": "Point-in-time peer snapshot for a wallet",
+                    "description": "Entity, asset lists, counts, and peer head from a single peer connection. Never cached.",
+                    "parameters": [path_param("identity", "60-character identity")],
+                    "responses": {
+                        "200": { "description": "Wallet snapshot", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/WalletSnapshot" }, "meta": { "type": "object" } } } } } },
+                        "400": { "description": "Invalid identity" },
+                        "503": { "description": "No peer available or peer lookup failed" }
+                    }
+                }
+            },
+            "/v1/assets/{issuer}/{name}/holders": {
+                "get": {
+                    "tags": ["assets", "network"],
+                    "summary": "Ownership holders for an asset",
+                    "description": "Queries the peer asset tree for ownership records of one issuer and asset name. Holders are deduplicated by identity, sorted by shares descending then identity, and truncated to limit.",
+                    "parameters": [
+                        path_param("issuer", "Issuer identity"),
+                        path_param("name", "Asset name, 1-7 uppercase ASCII letters or digits"),
+                        { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Holder snapshot; an empty list is valid", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "type": "array", "items": { "$ref": "#/components/schemas/AssetHolder" } }, "meta": { "type": "object" } } } } } },
+                        "400": { "description": "Invalid issuer, asset name, or limit" },
+                        "503": { "description": "No peer available or asset lookup failed" }
                     }
                 }
             },
@@ -374,6 +505,49 @@ pub fn spec() -> Value {
                     }
                 }
             },
+            "/v1/transactions/{hash}/network/status": {
+                "get": {
+                    "tags": ["transactions", "network"],
+                    "summary": "Peer confirmation and money-flow status for a transaction",
+                    "description": "Looks up the confirmed transaction by hash, then asks the same peer for the tick tx-status add-on. When the peer does not run the add-on, the response is still 200 with money_flew null and meta.status_source unavailable.",
+                    "parameters": [path_param("hash", "60-character transaction hash")],
+                    "responses": {
+                        "200": { "description": "Peer transaction status", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/TransactionNetworkStatus" } } } } } },
+                        "400": { "description": "Invalid hash" },
+                        "404": { "description": "Peer has no confirmed transaction" },
+                        "503": { "description": "No peer available or transaction lookup failed" }
+                    }
+                }
+            },
+            "/v1/transactions/validate": {
+                "post": {
+                    "tags": ["transactions"],
+                    "summary": "Validate a signed transaction locally without broadcasting",
+                    "description": "Decodes the signed transaction and reports amount-range, input-size, and SchnorrQ signature checks. No peer connection is opened and ALLOW_BROADCAST is not required.",
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ValidateRequest" } } }
+                    },
+                    "responses": {
+                        "200": { "description": "Validation report; data.valid is false when a check fails", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransactionValidation" } } } },
+                        "400": { "description": "Raw bytes are not hex or do not decode as a transaction" }
+                    }
+                }
+            },
+            "/v1/transactions/{hash}/status": {
+                "get": {
+                    "tags": ["transactions", "network"],
+                    "summary": "Combined indexed and peer transaction status",
+                    "description": "Returns the indexed row when present and best-effort peer confirmation data. An indexed transaction still returns 200 when peers are unavailable; meta.peer_error explains the degradation.",
+                    "parameters": [path_param("hash", "60-character transaction hash")],
+                    "responses": {
+                        "200": { "description": "Indexed and/or peer transaction status" },
+                        "400": { "description": "Invalid hash" },
+                        "404": { "description": "Unknown to both index and peer" },
+                        "503": { "description": "No peer and no indexed row" }
+                    }
+                }
+            },
             "/v1/ticks/{tick}/tx-status": {
                 "get": {
                     "tags": ["ticks", "network"],
@@ -417,6 +591,93 @@ pub fn spec() -> Value {
                         "503": { "description": "No peer available or contract call failed" }
                     }
                 }
+            },
+            "/v1/prices": {
+                "get": {
+                    "tags": ["prices"],
+                    "summary": "Hourly QUBIC/USDT points, ascending",
+                    "description": "Points recorded from the latest verified QUBIC/USDT Price oracle reply. The QPayhub GetQuUsdPrice read function is used only as a secondary source.",
+                    "parameters": [
+                        { "name": "from_hour", "in": "query", "schema": { "type": "integer", "minimum": 0 }, "description": "First core price hour, inclusive" },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 168 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Price points", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "type": "array", "items": { "$ref": "#/components/schemas/PricePoint" } }, "meta": { "type": "object" } } } } } },
+                        "500": { "description": "Storage failure" }
+                    }
+                }
+            },
+            "/v1/prices/history": {
+                "get": {
+                    "tags": ["prices"],
+                    "summary": "Trailing QUBIC/USDT price window",
+                    "parameters": [{ "name": "hours", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 24 } }],
+                    "responses": { "200": { "description": "Ascending price window" } }
+                }
+            },
+            "/v1/prices/latest": {
+                "get": {
+                    "tags": ["prices"],
+                    "summary": "Latest stored QUBIC/USDT price point",
+                    "responses": {
+                        "200": { "description": "Latest price", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/PricePoint" } } } } } },
+                        "404": { "description": "No price data yet" }
+                    }
+                }
+            },
+            "/v1/prices/snapshot": {
+                "get": {
+                    "tags": ["prices"],
+                    "summary": "QUBIC/USDT price metadata and latest point",
+                    "responses": {
+                        "200": { "description": "Price snapshot; data is null before the first poll", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "oneOf": [{ "$ref": "#/components/schemas/PriceSnapshot" }, { "type": "null" }] }, "meta": { "type": "object" } } } } } },
+                        "500": { "description": "Storage failure" }
+                    }
+                }
+            },
+            "/v1/wallets/{identity}": {
+                "get": {
+                    "tags": ["wallets", "identities", "network"],
+                    "summary": "Wallet overview from a peer snapshot plus indexed history",
+                    "parameters": [path_param("identity", "Uppercase base-26 identity")],
+                    "responses": {
+                        "200": { "description": "Entity, assets, and recent transactions" },
+                        "400": { "description": "Invalid identity" },
+                        "404": { "description": "Identity absent from both index and peer spectrum" },
+                        "503": { "description": "No peer available" }
+                    }
+                }
+            },
+            "/v1/wallets/{identity}/assets": {
+                "get": {
+                    "tags": ["wallets", "assets", "network"],
+                    "summary": "Issued, owned, and possessed asset snapshot",
+                    "parameters": [
+                        path_param("identity", "Uppercase base-26 identity"),
+                        { "name": "kind", "in": "query", "schema": { "type": "string", "enum": ["issued", "owned", "possessed", "all"], "default": "all" } }
+                    ],
+                    "responses": { "200": { "description": "Asset lists" }, "400": { "description": "Invalid identity or kind" }, "503": { "description": "No peer available" } }
+                }
+            },
+            "/v1/wallets/{identity}/snapshot": {
+                "get": {
+                    "tags": ["wallets", "network"],
+                    "summary": "Point-in-time wallet and asset snapshot",
+                    "parameters": [path_param("identity", "Uppercase base-26 identity")],
+                    "responses": { "200": { "description": "Entity and asset snapshot" }, "400": { "description": "Invalid identity" }, "503": { "description": "No peer available" } }
+                }
+            },
+            "/v1/assets/{issuer}/{name}/holders": {
+                "get": {
+                    "tags": ["assets", "wallets", "network"],
+                    "summary": "Ownership holder snapshot for one asset",
+                    "parameters": [
+                        path_param("issuer", "Issuer identity"),
+                        path_param("name", "Asset name"),
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
+                    ],
+                    "responses": { "200": { "description": "Ranked holders" }, "400": { "description": "Invalid issuer or name" }, "503": { "description": "No peer available" } }
+                }
             }
         },
         "components": {
@@ -446,10 +707,68 @@ pub fn spec() -> Value {
                         "raw": { "type": "string", "description": "Signed transaction bytes as hex" }
                     }
                 },
+                "ValidateRequest": {
+                    "type": "object",
+                    "required": ["raw"],
+                    "properties": {
+                        "raw": { "type": "string", "description": "Signed transaction bytes as hex, with or without a 0x prefix" }
+                    }
+                },
+                "TransactionValidationCheck": {
+                    "type": "object",
+                    "required": ["name", "passed"],
+                    "properties": {
+                        "name": { "type": "string", "enum": ["amount", "input_size", "signature"] },
+                        "passed": { "type": "boolean" },
+                        "detail": { "type": "string" }
+                    }
+                },
+                "TransactionValidation": {
+                    "type": "object",
+                    "required": ["data"],
+                    "properties": {
+                        "data": {
+                            "type": "object",
+                            "required": ["valid", "hash", "checks"],
+                            "properties": {
+                                "valid": { "type": "boolean" },
+                                "hash": { "type": "string" },
+                                "source": { "type": "string" },
+                                "destination": { "type": "string" },
+                                "amount": { "type": "integer", "format": "int64" },
+                                "tick": { "type": "integer" },
+                                "input_type": { "type": "integer" },
+                                "input_data": { "type": "string" },
+                                "input_bytes": { "type": "integer" },
+                                "total_bytes": { "type": "integer" },
+                                "checks": { "type": "array", "items": { "$ref": "#/components/schemas/TransactionValidationCheck" } }
+                            }
+                        },
+                        "meta": { "type": "object" }
+                    }
+                },
+                "TransactionNetworkStatus": {
+                    "type": "object",
+                    "required": ["hash", "confirmed", "execution"],
+                    "properties": {
+                        "hash": { "type": "string" },
+                        "tick": { "type": "integer" },
+                        "source": { "type": "string" },
+                        "destination": { "type": "string" },
+                        "amount": { "type": "integer", "format": "int64" },
+                        "input_type": { "type": "integer" },
+                        "input_data": { "type": "string" },
+                        "confirmed": { "type": "boolean" },
+                        "money_flew": { "type": ["boolean", "null"] },
+                        "execution": { "type": "string", "enum": ["transferred", "no_effect", "unknown"] },
+                        "current_tick": { "type": ["integer", "null"] },
+                        "confirmations": { "type": ["integer", "null"] }
+                    }
+                },
                 "ContractQueryRequest": {
                     "type": "object",
                     "properties": {
-                        "inputType": { "type": "integer", "minimum": 0, "default": 0 },
+                        "input_type": { "type": "integer", "minimum": 0, "default": 0 },
                         "input": { "type": "string", "description": "Hex-encoded input, at most MAX_INPUT_SIZE bytes" }
                     }
                 },
@@ -459,9 +778,9 @@ pub fn spec() -> Value {
                         "limit": { "type": "integer" },
                         "offset": { "type": "integer" },
                         "count": { "type": "integer" },
-                        "nextOffset": { "type": ["integer", "null"] },
-                        "nextCursor": { "type": ["string", "null"] },
-                        "hasMore": { "type": "boolean" }
+                        "next_offset": { "type": ["integer", "null"] },
+                        "next_cursor": { "type": ["string", "null"] },
+                        "has_more": { "type": "boolean" }
                     }
                 },
                 "Tick": {
@@ -521,6 +840,35 @@ pub fn spec() -> Value {
                         "event_count": { "type": "integer" }, "closed": { "type": "boolean" }
                     }
                 },
+                "Computor": {
+                    "type": "object",
+                    "required": ["epoch", "computor_index", "public_key", "identity"],
+                    "properties": {
+                        "epoch": { "type": "integer" },
+                        "computor_index": { "type": "integer" },
+                        "public_key": { "type": "string", "description": "0x-prefixed hex public key" },
+                        "identity": { "type": "string", "description": "Canonical uppercase base-26 identity" }
+                    }
+                },
+                "QuorumEvidence": {
+                    "type": "object",
+                    "required": ["epoch", "tick", "quorum_digest", "tick_data_digest", "verification", "timestamp"],
+                    "properties": {
+                        "epoch": { "type": "integer" },
+                        "tick": { "type": "integer" },
+                        "quorum_digest": { "type": "string", "description": "Lowercase hex K12 digest agreed by the quorum" },
+                        "tick_data_digest": { "type": "string", "description": "Lowercase hex K12 digest of the persisted tick data" },
+                        "required_votes": { "type": "integer" },
+                        "aligned_votes": { "type": "integer" },
+                        "fetched_votes": { "type": "integer" },
+                        "unique_votes": { "type": "integer" },
+                        "verified_votes": { "type": "integer" },
+                        "verification": { "type": "string", "enum": ["quorum", "data", "state"] },
+                        "warning_count": { "type": "integer" },
+                        "warnings": { "type": "string", "description": "Serialized warning list" },
+                        "timestamp": { "type": "string", "format": "date-time" }
+                    }
+                },
                 "Asset": {
                     "type": "object",
                     "properties": {
@@ -530,6 +878,153 @@ pub fn spec() -> Value {
                         "shares": { "type": "integer", "format": "int64" },
                         "issued_tick": { "type": "integer" }, "log_id": { "type": "integer", "format": "int64" },
                         "timestamp": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "WalletEntity": {
+                    "type": "object",
+                    "properties": {
+                        "spectrum_index": { "type": "integer" },
+                        "tick": { "type": "integer" },
+                        "public_key": { "type": "string" },
+                        "balance": { "type": "integer", "format": "int64" },
+                        "incoming_amount": { "type": "integer", "format": "int64" },
+                        "outgoing_amount": { "type": "integer", "format": "int64" },
+                        "incoming_transfers": { "type": "integer" },
+                        "outgoing_transfers": { "type": "integer" },
+                        "latest_incoming_tick": { "type": "integer" },
+                        "latest_outgoing_tick": { "type": "integer" }
+                    }
+                },
+                "IssuedAsset": {
+                    "type": "object",
+                    "required": ["issuer", "name", "universe_index"],
+                    "properties": {
+                        "issuer": { "type": "string" },
+                        "name": { "type": "string" },
+                        "decimals": { "type": "integer" },
+                        "unit": { "type": "string" },
+                        "universe_index": { "type": "integer" },
+                        "tick": { "type": "integer" }
+                    }
+                },
+                "OwnedAsset": {
+                    "type": "object",
+                    "required": ["owner", "issuer", "name", "shares"],
+                    "properties": {
+                        "owner": { "type": "string" },
+                        "issuer": { "type": "string" },
+                        "name": { "type": "string" },
+                        "decimals": { "type": "integer" },
+                        "unit": { "type": "string" },
+                        "shares": { "type": "integer", "format": "int64" },
+                        "universe_index": { "type": "integer" },
+                        "tick": { "type": "integer" },
+                        "managing_contract_index": { "type": "integer" },
+                        "ownership_index": { "type": "integer" },
+                        "issuance": { "type": "object" }
+                    }
+                },
+                "PossessedAsset": {
+                    "type": "object",
+                    "required": ["possessor", "issuer", "name", "shares"],
+                    "properties": {
+                        "possessor": { "type": "string" },
+                        "owner": { "type": "string" },
+                        "issuer": { "type": "string" },
+                        "name": { "type": "string" },
+                        "decimals": { "type": "integer" },
+                        "unit": { "type": "string" },
+                        "shares": { "type": "integer", "format": "int64" },
+                        "universe_index": { "type": "integer" },
+                        "tick": { "type": "integer" },
+                        "managing_contract_index": { "type": "integer" },
+                        "possession_index": { "type": "integer" },
+                        "ownership": { "type": "object" }
+                    }
+                },
+                "WalletAssets": {
+                    "type": "object",
+                    "properties": {
+                        "identity": { "type": "string" },
+                        "issued": { "type": "array", "items": { "$ref": "#/components/schemas/IssuedAsset" } },
+                        "owned": { "type": "array", "items": { "$ref": "#/components/schemas/OwnedAsset" } },
+                        "possessed": { "type": "array", "items": { "$ref": "#/components/schemas/PossessedAsset" } }
+                    }
+                },
+                "WalletOverview": {
+                    "type": "object",
+                    "required": ["identity", "assets"],
+                    "properties": {
+                        "identity": { "type": "string" },
+                        "public_key": { "type": "string" },
+                        "entity": { "$ref": "#/components/schemas/WalletEntity" },
+                        "assets": { "$ref": "#/components/schemas/WalletAssets" },
+                        "recent": { "type": "array", "items": { "$ref": "#/components/schemas/Transaction" } }
+                    }
+                },
+                "WalletSnapshot": {
+                    "type": "object",
+                    "required": ["identity", "assets"],
+                    "properties": {
+                        "identity": { "type": "string" },
+                        "public_key": { "type": "string" },
+                        "peer_tick": { "type": "integer" },
+                        "epoch": { "type": ["integer", "null"] },
+                        "entity": { "$ref": "#/components/schemas/WalletEntity" },
+                        "assets": { "$ref": "#/components/schemas/WalletAssets" },
+                        "counts": { "type": "object" }
+                    }
+                },
+                "AssetHolder": {
+                    "type": "object",
+                    "required": ["identity", "shares"],
+                    "properties": {
+                        "identity": { "type": "string" },
+                        "shares": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "PricePoint": {
+                    "type": "object",
+                    "required": ["hour", "timestamp", "price_e8", "price_usdt"],
+                    "properties": {
+                        "hour": { "type": "integer", "description": "Hours since 2022-04-13T12:00:00Z" },
+                        "timestamp": { "type": "string", "format": "date-time" },
+                        "price_e8": { "type": "integer", "format": "int64", "description": "QUBIC/USDT price scaled by 1e8 (USDT per QUBIC)" },
+                        "price_usdt": { "type": "number", "description": "USDT per QUBIC rounded to eight decimals" },
+                        "append_tick": { "type": "integer" },
+                        "source_tick": { "type": "integer" },
+                        "epoch": { "type": "integer" },
+                        "flags": { "type": "integer" },
+                        "filled": { "type": "boolean", "description": "True when the core filled a missing hour from the previous price" },
+                        "stale": { "type": "boolean", "description": "True when the on-chain source marked the value stale" },
+                        "source": { "type": "integer", "description": "0 Price oracle interface, 29 QPayhub fallback" },
+                        "source_name": { "type": "string", "description": "price_oracle, qpayhub, or unknown" },
+                        "synced": { "type": "boolean" },
+                        "bound": { "type": "boolean" },
+                        "series_digest": { "type": "string", "description": "Hex K12 digest of the series state" },
+                        "observed_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "PriceSnapshot": {
+                    "type": "object",
+                    "required": ["points", "synced", "bound", "source"],
+                    "properties": {
+                        "latest": { "oneOf": [{ "$ref": "#/components/schemas/PricePoint" }, { "type": "null" }] },
+                        "points": { "type": "integer", "description": "Distinct stored hours" },
+                        "hour": { "type": ["integer", "null"] },
+                        "timestamp": { "type": ["string", "null"], "format": "date-time" },
+                        "price_e8": { "type": ["integer", "null"], "format": "int64" },
+                        "price_usdt": { "type": ["number", "null"] },
+                        "synced": { "type": "boolean" },
+                        "bound": { "type": "boolean" },
+                        "stale": { "type": "boolean", "description": "True when the on-chain source marked the value stale" },
+                        "source": { "type": "integer", "description": "0 Price oracle interface, 29 QPayhub fallback" },
+                        "source_name": { "type": "string" },
+                        "series_digest": { "type": "string" },
+                        "epoch": { "type": "integer" },
+                        "append_tick": { "type": "integer" },
+                        "source_tick": { "type": "integer" },
+                        "observed_at": { "type": "string", "format": "date-time" }
                     }
                 },
                 "NetworkStats": {
@@ -560,11 +1055,14 @@ mod tests {
         for path in [
             "/healthz",
             "/v1/status",
+            "/status",
             "/v1/network/stats",
             "/v1/epochs",
             "/v1/epochs/{epoch}",
+            "/v1/epochs/{epoch}/computors",
             "/v1/ticks",
             "/v1/ticks/{tick}",
+            "/v1/ticks/{tick}/evidence",
             "/v1/ticks/{tick}/transactions",
             "/v1/ticks/{tick}/events",
             "/v1/transactions",
@@ -573,8 +1071,14 @@ mod tests {
             "/v1/identities",
             "/v1/identities/{identity}",
             "/v1/identities/{identity}/transactions",
+            "/v1/identities/{identity}/activity",
+            "/v1/identities/{identity}/events",
             "/v1/assets",
             "/v1/assets/{issuer}/{name}",
+            "/v1/assets/{issuer}/{name}/holders",
+            "/v1/wallets/{identity}",
+            "/v1/wallets/{identity}/assets",
+            "/v1/wallets/{identity}/snapshot",
             "/v1/transactions/batch",
             "/v1/analytics/activity",
             "/v1/analytics/top-identities",
@@ -586,9 +1090,20 @@ mod tests {
             "/v1/ws",
             "/v1/identities/{identity}/entity",
             "/v1/transactions/{hash}/network",
+            "/v1/transactions/{hash}/network/status",
+            "/v1/transactions/{hash}/status",
+            "/v1/transactions/validate",
             "/v1/ticks/{tick}/tx-status",
             "/v1/ticks/{tick}/raw",
             "/v1/contracts/{contract_index}/query",
+            "/v1/prices",
+            "/v1/prices/history",
+            "/v1/prices/latest",
+            "/v1/prices/snapshot",
+            "/v1/wallets/{identity}",
+            "/v1/wallets/{identity}/assets",
+            "/v1/wallets/{identity}/snapshot",
+            "/v1/assets/{issuer}/{name}/holders",
             "/v1/search",
         ] {
             assert!(paths.contains_key(path), "missing {path}");

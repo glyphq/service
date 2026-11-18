@@ -13,7 +13,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
-use store::{ClickHouseStore, EventRow, IdentityRow, Store, TickBatch, TransactionRow};
+use store::{
+    ClickHouseStore, EventParticipantRow, EventRow, IdentityRow, Store, TickBatch, TransactionRow,
+};
 use tower::ServiceExt;
 
 const IDENTITY: &str = "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK";
@@ -96,6 +98,40 @@ fn batch(tick: u32) -> TickBatch {
         log_digest: u64::from(tick),
         timestamp: timestamp(),
     }];
+    batch.events.push(EventRow {
+        epoch: 240,
+        tick,
+        log_id: u64::from(tick) + 10_000,
+        log_type: 0,
+        type_name: "qu_transfer".into(),
+        tx_hash: String::new(),
+        tx_index: -1,
+        body: format!(r#"{{"from":"{OTHER}","to":"{IDENTITY}","amount":"25"}}"#),
+        log_digest: u64::from(tick) + 1,
+        timestamp: timestamp(),
+    });
+    batch.event_participants = vec![
+        EventParticipantRow {
+            epoch: 240,
+            tick,
+            log_id: u64::from(tick) + 10_000,
+            identity: OTHER.into(),
+            role: "from".into(),
+            tx_hash: String::new(),
+            tx_index: -1,
+            timestamp: timestamp(),
+        },
+        EventParticipantRow {
+            epoch: 240,
+            tick,
+            log_id: u64::from(tick) + 10_000,
+            identity: IDENTITY.into(),
+            role: "to".into(),
+            tx_hash: String::new(),
+            tx_index: -1,
+            timestamp: timestamp(),
+        },
+    ];
     batch.identities = vec![IdentityRow {
         identity: IDENTITY.into(),
         public_key: format!("0x{}", "00".repeat(32)),
@@ -170,7 +206,7 @@ async fn live_clickhouse_serves_every_collection() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["ticks"], 2);
     assert_eq!(body["data"]["transactions"], 4);
-    assert_eq!(body["data"]["events"], 2);
+    assert_eq!(body["data"]["events"], 4);
 
     let (status, body) = get(&app, "/v1/epochs").await;
     assert_eq!(status, StatusCode::OK);
@@ -185,7 +221,7 @@ async fn live_clickhouse_serves_every_collection() {
     let (status, body) = get(&app, "/v1/ticks?epoch=240&limit=1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"][0]["tick"], 101);
-    let cursor = body["meta"]["nextCursor"].as_str().unwrap().to_owned();
+    let cursor = body["meta"]["next_cursor"].as_str().unwrap().to_owned();
 
     let (status, body) = get(
         &app,
@@ -223,6 +259,21 @@ async fn live_clickhouse_serves_every_collection() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["transfer_count"], 2);
 
+    let (status, body) = get(&app, &format!("/v1/identities/{IDENTITY}/activity")).await;
+    assert_eq!(status, StatusCode::OK);
+    let kinds: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|row| row["kind"].as_str())
+        .collect();
+    assert!(kinds.contains(&"transaction"));
+    assert!(kinds.contains(&"event"));
+    let (status, body) = get(&app, &format!("/v1/identities/{IDENTITY}/events")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"][0]["type_name"], "qu_transfer");
+    assert!(body["data"][0].get("role").is_none());
+
     let (status, body) = get(&app, "/v1/assets").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"][0]["name"], "QX");
@@ -234,7 +285,7 @@ async fn live_clickhouse_serves_every_collection() {
 
     let (status, body) = get(&app, "/v1/analytics/activity?interval=3600&limit=10").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["meta"]["intervalSeconds"], 3600);
+    assert_eq!(body["meta"]["interval_seconds"], 3600);
     assert_eq!(body["data"][0]["transactions"], 4);
 
     let (status, body) = get(&app, "/v1/analytics/top-identities?limit=10").await;
@@ -262,4 +313,59 @@ async fn live_clickhouse_serves_every_collection() {
     assert_eq!(body["openapi"], "3.1.0");
 
     store.drop_database().await.expect("drop test database");
+}
+
+#[tokio::test]
+#[ignore = "requires a reachable Qubic peer; run with --ignored"]
+async fn live_qubic_usdt_price_smoke() {
+    let addr = std::env::var("GLYPH_LIVE_PEER")
+        .unwrap_or_else(|_| "157.180.10.49:21841".into())
+        .parse()
+        .expect("GLYPH_LIVE_PEER must be host:port");
+    let pool = node::NodePool::new(vec![node::PeerConfig::new(addr)]);
+    let subscriptions = pool.oracle_subscription_ids().await;
+    match &subscriptions {
+        Ok(ids) => eprintln!("live oracle subscriptions at {addr}: {}", ids.len()),
+        Err(error) => eprintln!("live oracle subscription discovery failed at {addr}: {error}"),
+    }
+    match api::prices::read_price(&pool).await {
+        Ok(Some(price)) => {
+            eprintln!(
+                "live QUBIC/USDT: price_e8={} price_usdt={} source={} ({}) \
+                 source_tick={} append_tick={} epoch={} stale={} digest={}",
+                price.price_e8,
+                api::prices::price_usdt(price.price_e8),
+                price.source,
+                api::prices::source_name(price.source),
+                price.source_tick,
+                price.append_tick,
+                price.epoch,
+                price.stale,
+                hex::encode(price.digest),
+            );
+            assert!(price.price_e8 > 0);
+        }
+        Ok(None) => {
+            eprintln!(
+                "live QUBIC/USDT price unavailable: no active Price oracle subscription \
+                 with a revealed QUBIC/USDT reply and no usable QPayhub GetQuUsdPrice value"
+            );
+            match pool
+                .contract_function(
+                    api::prices::QPAYHUB_CONTRACT_INDEX,
+                    api::prices::QPAYHUB_GET_QU_USD_PRICE_INPUT_TYPE,
+                    &[],
+                )
+                .await
+            {
+                Ok(data) => eprintln!(
+                    "QPayhub GetQuUsdPrice raw: {} bytes {}",
+                    data.len(),
+                    hex::encode(&data)
+                ),
+                Err(error) => eprintln!("QPayhub GetQuUsdPrice failed: {error}"),
+            }
+        }
+        Err(error) => panic!("live QUBIC/USDT price query failed at {addr}: {error}"),
+    }
 }

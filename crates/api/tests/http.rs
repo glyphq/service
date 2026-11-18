@@ -8,9 +8,9 @@ use axum::response::IntoResponse;
 use chrono::{TimeZone, Utc};
 use serde_json::Value;
 use store::{
-    ActivityBucket, AssetRow, EpochRow, EventFilter, EventRow, EventTypeCount, IdentityRow,
-    IngestCursor, NetworkStats, Result as StoreResult, Store, TickBatch, TickRow,
-    TransactionFilter, TransactionRow, WriteOutcome,
+    ActivityBucket, AssetRow, ComputorRow, EpochRow, EventFilter, EventRow, EventTypeCount,
+    IdentityRow, IngestCursor, NetworkStats, QuorumEvidenceRow, Result as StoreResult, Store,
+    TickBatch, TickRow, TransactionFilter, TransactionRow, WriteOutcome,
 };
 use tower::ServiceExt;
 
@@ -35,6 +35,8 @@ struct MockStore {
     events: Vec<EventRow>,
     identities: Vec<IdentityRow>,
     assets: Vec<AssetRow>,
+    computors: Vec<ComputorRow>,
+    evidence: Vec<QuorumEvidenceRow>,
 }
 
 impl MockStore {
@@ -117,12 +119,45 @@ impl MockStore {
             log_id: 70,
             timestamp: timestamp(),
         }];
+        let computors = (0..3u16)
+            .map(|index| {
+                let mut key = [0u8; 32];
+                key[0] = u8::try_from(index + 1).expect("small index");
+                let public_key = qubic::PublicKey::new(key);
+                ComputorRow {
+                    epoch: 1,
+                    computor_index: index,
+                    public_key: public_key.to_hex(),
+                    identity: public_key.to_identity(),
+                    version: 1,
+                    timestamp: timestamp(),
+                }
+            })
+            .collect();
+        let evidence = vec![QuorumEvidenceRow {
+            epoch: 1,
+            tick: 7,
+            quorum_digest: [0xAA; 32],
+            tick_data_digest: [0xBB; 32],
+            required_votes: 451,
+            aligned_votes: 500,
+            fetched_votes: 600,
+            unique_votes: 550,
+            verified_votes: 480,
+            verification: "data".into(),
+            warning_count: 1,
+            warnings: r#"["lagging peer"]"#.into(),
+            timestamp: timestamp(),
+            version: 7,
+        }];
         Self {
             ticks,
             transactions,
             events,
             identities,
             assets,
+            computors,
+            evidence,
         }
     }
 }
@@ -302,6 +337,19 @@ impl Store for MockStore {
             .iter()
             .find(|row| row.issuer == issuer && row.name == name)
             .cloned())
+    }
+
+    async fn computors(&self, epoch: u16) -> StoreResult<Vec<ComputorRow>> {
+        Ok(self
+            .computors
+            .iter()
+            .filter(|row| row.epoch == epoch)
+            .cloned()
+            .collect())
+    }
+
+    async fn evidence_for_tick(&self, tick: u32) -> StoreResult<Option<QuorumEvidenceRow>> {
+        Ok(self.evidence.iter().find(|row| row.tick == tick).cloned())
     }
 
     async fn transactions_page(
@@ -501,8 +549,8 @@ async fn tick_and_transaction_resources() {
     let (status, body) = get("/v1/transactions?limit=1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"].as_array().unwrap().len(), 1);
-    assert_eq!(body["meta"]["hasMore"], true);
-    assert!(body["meta"]["nextCursor"].is_string());
+    assert_eq!(body["meta"]["has_more"], true);
+    assert!(body["meta"]["next_cursor"].is_string());
 
     let (status, body) = get("/v1/ticks/7/events").await;
     assert_eq!(status, StatusCode::OK);
@@ -549,6 +597,55 @@ async fn collection_resources_are_typed_and_enveloped() {
 }
 
 #[tokio::test]
+async fn computors_and_evidence_are_typed_and_report_not_found() {
+    let (status, body, headers) = request("/v1/epochs/1/computors", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["data"].as_array().expect("computor list");
+    assert_eq!(rows.len(), 3);
+    let mut key = [0u8; 32];
+    key[0] = 1;
+    let public_key = qubic::PublicKey::new(key);
+    assert_eq!(rows[0]["epoch"], 1);
+    assert_eq!(rows[0]["computor_index"], 0);
+    assert_eq!(rows[0]["public_key"], public_key.to_hex());
+    assert_eq!(rows[0]["identity"], public_key.to_identity());
+    assert_eq!(body["meta"]["epoch"], 1);
+    assert_eq!(body["meta"]["count"], 3);
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=30, stale-while-revalidate=60"
+    );
+
+    let (status, body) = get("/v1/epochs/999/computors").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "not_found");
+
+    let (status, body, headers) = request("/v1/ticks/7/evidence", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["epoch"], 1);
+    assert_eq!(body["data"]["tick"], 7);
+    assert_eq!(body["data"]["quorum_digest"], "aa".repeat(32));
+    assert_eq!(body["data"]["tick_data_digest"], "bb".repeat(32));
+    assert_eq!(body["data"]["required_votes"], 451);
+    assert_eq!(body["data"]["aligned_votes"], 500);
+    assert_eq!(body["data"]["fetched_votes"], 600);
+    assert_eq!(body["data"]["unique_votes"], 550);
+    assert_eq!(body["data"]["verified_votes"], 480);
+    assert_eq!(body["data"]["verification"], "data");
+    assert_eq!(body["data"]["warning_count"], 1);
+    assert_eq!(body["data"]["warnings"], r#"["lagging peer"]"#);
+    assert!(body["data"]["timestamp"].is_string());
+    assert_eq!(
+        headers.get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+
+    let (status, body) = get("/v1/ticks/999/evidence").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "not_found");
+}
+
+#[tokio::test]
 async fn filters_narrow_transactions_and_events() {
     let (status, body) = get(&format!("/v1/transactions?identity={IDENTITY}&limit=2")).await;
     assert_eq!(status, StatusCode::OK);
@@ -574,7 +671,7 @@ async fn cursors_page_without_duplicates_and_reject_other_filters() {
     let (status, body) = get("/v1/ticks?limit=1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"][0]["tick"], 7);
-    let cursor = body["meta"]["nextCursor"].as_str().unwrap().to_owned();
+    let cursor = body["meta"]["next_cursor"].as_str().unwrap().to_owned();
 
     let (status, body) = get(&format!("/v1/ticks?limit=1&cursor={cursor}")).await;
     assert_eq!(status, StatusCode::OK);
@@ -647,7 +744,11 @@ async fn openapi_and_docs_are_served() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["openapi"], "3.1.0");
     assert!(body["paths"]["/v1/epochs"].is_object());
+    assert!(body["paths"]["/v1/epochs/{epoch}/computors"].is_object());
+    assert!(body["paths"]["/v1/ticks/{tick}/evidence"].is_object());
     assert!(body["paths"]["/v1/assets/{issuer}/{name}"].is_object());
+    assert!(body["components"]["schemas"]["Computor"].is_object());
+    assert!(body["components"]["schemas"]["QuorumEvidence"].is_object());
 
     let app = router(AppState::new(Arc::new(MockStore::new())));
     let response = app
@@ -655,6 +756,33 @@ async fn openapi_and_docs_are_served() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&bytes);
+    assert!(html.contains("Scalar.createApiReference"));
+    assert!(html.contains("/scalar.js"));
+    assert!(html.contains("/openapi.json"));
+
+    let app = router(AppState::new(Arc::new(MockStore::new())));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/scalar.js")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "application/javascript"
+    );
 }
 
 #[tokio::test]
@@ -713,7 +841,7 @@ async fn batch_lookup_reports_found_and_missing() {
 async fn analytics_routes_have_effective_defaults() {
     let (status, body) = get("/v1/analytics/activity").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["meta"]["intervalSeconds"], 3600);
+    assert_eq!(body["meta"]["interval_seconds"], 3600);
     assert_eq!(body["meta"]["limit"], 24);
     assert_eq!(body["data"][0]["ticks"], 3);
 
@@ -754,6 +882,151 @@ async fn optional_network_features_report_unavailable_or_forbidden() {
 }
 
 #[tokio::test]
+async fn transaction_validation_reports_local_checks() {
+    let raw = include_bytes!("../../node/fixtures/tx-91916364-1.bin");
+    let transaction = qubic::Transaction::decode(raw).expect("fixture transaction decodes");
+
+    let (status, body, headers) = {
+        let app = router(AppState::new(Arc::new(MockStore::new())));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/transactions/validate")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "raw": format!("0x{}", hex::encode(raw)) }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice::<Value>(&bytes).expect("json body"),
+            headers,
+        )
+    };
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers.get(header::CACHE_CONTROL).unwrap(), "no-store");
+    assert_eq!(body["data"]["valid"], true);
+    assert_eq!(
+        body["data"]["hash"],
+        qubic::encode_tx_hash(&transaction.hash())
+    );
+    assert_eq!(
+        body["data"]["source"],
+        qubic::PublicKey(transaction.source).to_identity()
+    );
+    assert_eq!(body["data"]["tick"], transaction.tick);
+    assert_eq!(body["data"]["amount"], transaction.amount);
+    assert_eq!(body["data"]["input_bytes"], transaction.input.len());
+    assert_eq!(
+        body["data"]["total_bytes"],
+        qubic::Transaction::BASE_SIZE + transaction.input.len() + 64
+    );
+    let checks = body["data"]["checks"].as_array().expect("checks array");
+    assert_eq!(checks.len(), 3);
+    assert!(checks.iter().all(|check| check["passed"] == true));
+    assert_eq!(body["meta"]["source"], "local");
+    assert_eq!(body["meta"]["broadcast"], false);
+}
+
+#[tokio::test]
+async fn transaction_validation_reports_failed_checks() {
+    let raw = include_bytes!("../../node/fixtures/tx-91916364-1.bin");
+    let mut tampered = raw.to_vec();
+    let last = tampered.len() - 1;
+    tampered[last] ^= 0xFF;
+    let (status, body) = post(
+        "/v1/transactions/validate",
+        serde_json::json!({ "raw": hex::encode(&tampered) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["valid"], false);
+    let checks = body["data"]["checks"].as_array().expect("checks array");
+    let signature = checks
+        .iter()
+        .find(|check| check["name"] == "signature")
+        .expect("signature check");
+    assert_eq!(signature["passed"], false);
+    assert!(signature["detail"].is_string());
+
+    let oversized = qubic::Transaction {
+        source: [1; 32],
+        destination: [2; 32],
+        amount: qubic::messages::MAX_AMOUNT + 1,
+        tick: 7,
+        input_type: 0,
+        input: vec![0; qubic::messages::MAX_INPUT_SIZE + 1],
+        signature: [0; 64],
+    };
+    let (status, body) = post(
+        "/v1/transactions/validate",
+        serde_json::json!({ "raw": hex::encode(oversized.encode()) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["valid"], false);
+    let checks = body["data"]["checks"].as_array().expect("checks array");
+    assert_eq!(checks[0]["name"], "amount");
+    assert_eq!(checks[0]["passed"], false);
+    assert_eq!(checks[1]["name"], "input_size");
+    assert_eq!(checks[1]["passed"], false);
+}
+
+#[tokio::test]
+async fn transaction_validation_rejects_malformed_bytes() {
+    let (status, body) = post(
+        "/v1/transactions/validate",
+        serde_json::json!({ "raw": "not hex" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "bad_request");
+
+    let raw = include_bytes!("../../node/fixtures/tx-91916364-1.bin");
+    let (status, body) = post(
+        "/v1/transactions/validate",
+        serde_json::json!({ "raw": hex::encode(&raw[..raw.len() - 1]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "bad_request");
+
+    let (status, body) = post(
+        "/v1/transactions/validate",
+        serde_json::json!({ "raw": "00" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn transaction_network_status_reports_errors() {
+    let (status, body) = get("/v1/transactions/not-a-hash/network/status").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_transaction_hash");
+
+    let hash = hash_for(7, 0);
+    let (status, body) = get(&format!("/v1/transactions/{hash}/network/status")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "unavailable");
+
+    let (status, body) = get(&format!("/v1/transactions/{hash}/network")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "unavailable");
+}
+
+#[tokio::test]
 async fn raw_archive_serves_a_section() {
     let dir = std::env::temp_dir().join(format!("glyph-api-raw-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -763,13 +1036,8 @@ async fn raw_archive_serves_a_section() {
     bundle.set_section(archive::Section::Transactions, vec![1, 2, 3, 4]);
     archive::put_bundle(&archive, &bundle).await.unwrap();
 
-    let state = AppState {
-        store: Arc::new(MockStore::new()),
-        hub: None,
-        peers: Vec::new(),
-        allow_broadcast: false,
-        archive: Some(Arc::new(archive)),
-    };
+    let mut state = AppState::new(Arc::new(MockStore::new()));
+    state.archive = Some(Arc::new(archive));
     let response = router(state)
         .oneshot(
             Request::builder()
@@ -789,13 +1057,9 @@ async fn raw_archive_serves_a_section() {
         .unwrap();
     assert_eq!(bytes.as_ref(), &[1, 2, 3, 4]);
 
-    let app = router(AppState {
-        store: Arc::new(MockStore::new()),
-        hub: None,
-        peers: Vec::new(),
-        allow_broadcast: false,
-        archive: Some(Arc::new(archive::FileArchive::new(&dir))),
-    });
+    let mut state = AppState::new(Arc::new(MockStore::new()));
+    state.archive = Some(Arc::new(archive::FileArchive::new(&dir)));
+    let app = router(state);
     let response = app
         .oneshot(
             Request::builder()

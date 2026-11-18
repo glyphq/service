@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use axum::extract::{Path, Query, State};
-use axum::http::header;
-use axum::response::{Html, IntoResponse};
+use axum::http::{StatusCode, header};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -23,8 +23,10 @@ pub fn router() -> Router<AppState> {
         .route("/v1/network/stats", get(network_stats))
         .route("/v1/epochs", get(epochs))
         .route("/v1/epochs/{epoch}", get(epoch))
+        .route("/v1/epochs/{epoch}/computors", get(epoch_computors))
         .route("/v1/ticks", get(ticks))
         .route("/v1/ticks/{tick}", get(tick))
+        .route("/v1/ticks/{tick}/evidence", get(tick_evidence))
         .route("/v1/ticks/{tick}/transactions", get(tick_transactions))
         .route("/v1/ticks/{tick}/events", get(tick_events))
         .route(
@@ -39,6 +41,8 @@ pub fn router() -> Router<AppState> {
             "/v1/identities/{identity}/transactions",
             get(identity_transactions),
         )
+        .route("/v1/identities/{identity}/activity", get(identity_activity))
+        .route("/v1/identities/{identity}/events", get(identity_events))
         .route("/v1/identities/{identity}", get(identity))
         .route("/v1/assets", get(assets))
         .route("/v1/assets/{issuer}/{name}", get(asset))
@@ -175,7 +179,15 @@ async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiE
                 "ingest": stats.get("ingest").cloned().unwrap_or(Value::Null),
                 "stats": stats,
             },
-            "meta": { "source": "direct-qubic-peers" }
+            "meta": {
+                "source": "direct-qubic-peers",
+                "version": env!("CARGO_PKG_VERSION"),
+                "uptime_seconds": state.uptime_seconds(),
+                "streaming": state.hub.is_some(),
+                "broadcast": state.allow_broadcast,
+                "archive": state.archive.is_some(),
+                "peers_configured": state.peers.len(),
+            }
         })),
     ))
 }
@@ -223,6 +235,37 @@ async fn epoch(
     ))
 }
 
+async fn epoch_computors(
+    State(state): State<AppState>,
+    Path(epoch): Path<u16>,
+) -> Result<impl IntoResponse, ApiError> {
+    let rows = state.store.computors(epoch).await?;
+    if rows.is_empty() {
+        return Err(ApiError::not_found(format!(
+            "computors for epoch {epoch} are not indexed"
+        )));
+    }
+    let count = rows.len();
+    let rows: Vec<Value> = rows
+        .into_iter()
+        .map(|row| {
+            json!({
+                "epoch": row.epoch,
+                "computor_index": row.computor_index,
+                "public_key": row.public_key,
+                "identity": row.identity,
+            })
+        })
+        .collect();
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({
+            "data": rows,
+            "meta": { "epoch": epoch, "count": count },
+        })),
+    ))
+}
+
 async fn ticks(
     State(state): State<AppState>,
     Query(params): Query<TickListQuery>,
@@ -260,6 +303,36 @@ async fn tick(
     Ok((
         [(header::CACHE_CONTROL, IMMUTABLE)],
         Json(json!({ "data": row })),
+    ))
+}
+
+async fn tick_evidence(
+    State(state): State<AppState>,
+    Path(tick): Path<u32>,
+) -> Result<impl IntoResponse, ApiError> {
+    let row =
+        state.store.evidence_for_tick(tick).await?.ok_or_else(|| {
+            ApiError::not_found(format!("evidence for tick {tick} is not indexed"))
+        })?;
+    Ok((
+        [(header::CACHE_CONTROL, IMMUTABLE)],
+        Json(json!({
+            "data": {
+                "epoch": row.epoch,
+                "tick": row.tick,
+                "quorum_digest": hex::encode(row.quorum_digest),
+                "tick_data_digest": hex::encode(row.tick_data_digest),
+                "required_votes": row.required_votes,
+                "aligned_votes": row.aligned_votes,
+                "fetched_votes": row.fetched_votes,
+                "unique_votes": row.unique_votes,
+                "verified_votes": row.verified_votes,
+                "verification": row.verification,
+                "warning_count": row.warning_count,
+                "warnings": row.warnings,
+                "timestamp": row.timestamp,
+            }
+        })),
     ))
 }
 
@@ -487,6 +560,54 @@ async fn identity_transactions(
     ))
 }
 
+async fn identity_activity(
+    State(state): State<AppState>,
+    Path(identity): Path<String>,
+    Query(params): Query<PageParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let identity = identity.trim().to_ascii_uppercase();
+    qubic::PublicKey::from_identity(&identity)
+        .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
+    let page = params.resolve(&format!("identities/{identity}/activity"))?;
+    let mut rows = state
+        .store
+        .activity_for_identity(&identity, page.fetch_limit(), page.offset)
+        .await?;
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
+    Ok((
+        [(header::CACHE_CONTROL, RECENT)],
+        Json(json!({
+            "data": rows,
+            "meta": page.meta(rows.len(), has_more),
+        })),
+    ))
+}
+
+async fn identity_events(
+    State(state): State<AppState>,
+    Path(identity): Path<String>,
+    Query(params): Query<PageParams>,
+) -> Result<impl IntoResponse, ApiError> {
+    let identity = identity.trim().to_ascii_uppercase();
+    qubic::PublicKey::from_identity(&identity)
+        .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
+    let page = params.resolve(&format!("identities/{identity}/events"))?;
+    let mut rows = state
+        .store
+        .events_for_identity(&identity, page.fetch_limit(), page.offset)
+        .await?;
+    let has_more = rows.len() > page.limit as usize;
+    rows.truncate(page.limit as usize);
+    Ok((
+        [(header::CACHE_CONTROL, RECENT)],
+        Json(json!({
+            "data": rows,
+            "meta": page.meta(rows.len(), has_more),
+        })),
+    ))
+}
+
 async fn identity(
     State(state): State<AppState>,
     Path(identity): Path<String>,
@@ -610,7 +731,7 @@ async fn analytics_activity(
         [(header::CACHE_CONTROL, AGGREGATE)],
         Json(json!({
             "data": rows,
-            "meta": { "intervalSeconds": interval, "limit": limit },
+            "meta": { "interval_seconds": interval, "limit": limit },
         })),
     ))
 }
@@ -652,8 +773,10 @@ pub async fn docs() -> Html<&'static str> {
 <li><code>GET /v1/network/stats</code></li>
 <li><code>GET /v1/epochs?limit=&amp;cursor=</code></li>
 <li><code>GET /v1/epochs/{epoch}</code></li>
+<li><code>GET /v1/epochs/{epoch}/computors</code></li>
 <li><code>GET /v1/ticks?epoch=&amp;limit=&amp;cursor=</code></li>
 <li><code>GET /v1/ticks/{tick}</code></li>
+<li><code>GET /v1/ticks/{tick}/evidence</code></li>
 <li><code>GET /v1/ticks/{tick}/transactions?limit=&amp;cursor=</code></li>
 <li><code>GET /v1/ticks/{tick}/events?limit=&amp;cursor=</code></li>
 <li><code>GET /v1/transactions?epoch=&amp;tick=&amp;identity=&amp;limit=&amp;cursor=</code></li>
@@ -664,6 +787,14 @@ pub async fn docs() -> Html<&'static str> {
 <li><code>GET /v1/identities/{identity}/transactions?limit=&amp;cursor=</code></li>
 <li><code>GET /v1/assets?issuer=&amp;limit=&amp;cursor=</code></li>
 <li><code>GET /v1/assets/{issuer}/{name}</code></li>
+<li><code>GET /v1/assets/{issuer}/{name}/holders?limit=</code></li>
+<li><code>GET /v1/wallets/{identity}</code></li>
+<li><code>GET /v1/wallets/{identity}/assets?kind=</code></li>
+<li><code>GET /v1/wallets/{identity}/snapshot</code></li>
+<li><code>GET /v1/prices?from_hour=&amp;limit=</code></li>
+<li><code>GET /v1/prices/history?hours=</code></li>
+<li><code>GET /v1/prices/latest</code></li>
+<li><code>GET /v1/prices/snapshot</code></li>
 <li><code>POST /v1/transactions/batch</code></li>
 <li><code>POST /v1/transactions</code> (requires <code>ALLOW_BROADCAST=true</code>)</li>
 <li><code>GET /v1/analytics/activity?interval=&amp;limit=</code></li>
@@ -674,6 +805,8 @@ pub async fn docs() -> Html<&'static str> {
 <li><code>GET /v1/ws</code></li>
 <li><code>GET /v1/identities/{identity}/entity</code></li>
 <li><code>GET /v1/transactions/{hash}/network</code></li>
+<li><code>GET /v1/transactions/{hash}/network/status</code></li>
+<li><code>POST /v1/transactions/validate</code></li>
 <li><code>GET /v1/ticks/{tick}/tx-status</code></li>
 <li><code>GET /v1/ticks/{tick}/raw?section=</code></li>
 <li><code>POST /v1/contracts/{contract_index}/query</code></li>
@@ -681,4 +814,38 @@ pub async fn docs() -> Html<&'static str> {
 </ul>
 </body></html>"#,
     )
+}
+
+/// Scalar API reference backed by the embedded bundle, so the docs work
+/// without a CDN and without a network.
+pub async fn scalar_docs() -> Html<String> {
+    let config = json!({
+        "url": "/openapi.json",
+        "layout": "modern",
+        "theme": "purple",
+        "darkMode": true,
+        "agent": { "disabled": true },
+    });
+    Html(scalar_api_reference::scalar_html(
+        &config,
+        Some("/scalar.js"),
+    ))
+}
+
+pub async fn scalar_js() -> Response {
+    match scalar_api_reference::get_asset_with_mime("scalar.js") {
+        Some((mime, bytes)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, mime),
+                (
+                    header::CACHE_CONTROL,
+                    "public, max-age=31536000, immutable".to_owned(),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        None => ApiError::internal("Scalar JavaScript asset is missing").into_response(),
+    }
 }
