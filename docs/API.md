@@ -13,7 +13,8 @@ document instead of proxying upstream.
 - The server is axum with gzip and zstd response compression, CORS (permissive
   by default or restricted with `CORS_ALLOWED_ORIGINS`), an `x-request-id`
   header, optional `RATE_LIMIT_PER_MINUTE` throttling, and request tracing.
-- The OpenAPI 3.1 document is at `GET /openapi.json`. A small HTML index is at
+- The OpenAPI 3.1 document is at `GET /openapi.json`. An interactive Scalar
+  reference with grouped sections and generated request snippets is at
   `GET /docs`.
 
 This page documents the implemented surface. Planned endpoints and tiers are in
@@ -1099,7 +1100,10 @@ from a static spec in `crates/api/src/openapi.rs`.
 
 ### `GET /docs`
 
-Small HTML index linking to `/openapi.json` and listing the implemented routes.
+Interactive Scalar API reference backed by `/openapi.json`. Sections are grouped
+into Operations, Chain Data, Accounts & Assets, Markets & Analytics, and Live &
+Lookup. Every operation has a stable `operationId`, so Scalar's generated
+snippets use readable method names.
 
 ### Unknown routes
 
