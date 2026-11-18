@@ -396,6 +396,10 @@ pub trait Store: Send + Sync {
     async fn init(&self) -> Result<()>;
     async fn drop_database(&self) -> Result<()>;
     async fn head(&self) -> Result<Option<TickRow>>;
+    /// Earliest tick number in the index, or `None` when the store is empty.
+    async fn earliest_tick(&self) -> Result<Option<u32>> {
+        Ok(None)
+    }
     async fn tick(&self, tick: u32) -> Result<Option<TickRow>>;
     async fn transactions_for_tick(
         &self,
@@ -797,6 +801,15 @@ impl Store for ClickHouseStore {
             .fetch_optional::<rows::TickSelect>()
             .await?;
         Ok(row.map(Into::into))
+    }
+
+    async fn earliest_tick(&self) -> Result<Option<u32>> {
+        let row = self
+            .client
+            .query("SELECT min(tick) AS tick, count() AS n FROM ticks")
+            .fetch_one::<rows::EarliestTickRow>()
+            .await?;
+        Ok((row.n > 0).then_some(row.tick))
     }
 
     async fn tick(&self, tick: u32) -> Result<Option<TickRow>> {

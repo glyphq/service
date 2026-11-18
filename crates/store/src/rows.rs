@@ -595,6 +595,12 @@ pub(crate) struct CountRow {
     pub n: u64,
 }
 
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct EarliestTickRow {
+    pub tick: u32,
+    pub n: u64,
+}
+
 pub(crate) async fn insert_cursor(
     client: &clickhouse::Client,
     key: &str,

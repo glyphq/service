@@ -119,7 +119,8 @@ page while `/healthz` and the JSON API keep their normal status codes.
 
 ### `GET /v1/status`
 
-Indexed head, progress, and counts.
+Indexed head, live ingest and peer progress, current-epoch backfill coverage,
+and counts. This response is never cached.
 
 ```json
 {
@@ -138,6 +139,35 @@ Indexed head, progress, and counts.
       "epoch": 240,
       "verification": "data",
       "updated_at": "2026-11-18T15:10:03.000Z"
+    },
+    "ingest_status": {
+      "last_indexed_tick": 91916480,
+      "indexed_ticks": 6481,
+      "ticks_per_second": 34.2,
+      "lag_ticks": 3,
+      "eta_seconds": 0
+    },
+    "network": {
+      "reachable": true,
+      "head": 91916483,
+      "epoch": 240,
+      "initial_tick": 91910000,
+      "tick_duration": 0,
+      "ticks_per_second": 0.7,
+      "error": null
+    },
+    "backfill": {
+      "available": true,
+      "complete": true,
+      "initial_tick": 91910000,
+      "first_indexed_tick": 91910000,
+      "last_indexed_tick": 91916480,
+      "missing_before": 0,
+      "indexed_ticks": 6481,
+      "epoch_ticks": 6484,
+      "remaining_ticks": 3,
+      "coverage": 0.9995373238741517,
+      "coverage_percent": 99.95
     },
     "stats": {
       "head": { "...": "..." },
@@ -163,6 +193,23 @@ Indexed head, progress, and counts.
 
 `head` is `null` before the first tick is written. `data.ingest` is the typed
 ingest cursor. `data.stats` contains `head`, `counts`, `cursor`, and `ingest`.
+
+`ingest_status.ticks_per_second` is measured between status requests at least
+one second apart, so the first request after startup returns `null`. A
+zero-growth interval returns `0.0`. `lag_ticks` is the peer head minus the last
+indexed tick, and `eta_seconds` divides that lag by the ingest rate.
+
+`network` comes from a peer head sampled with a two-second timeout. `head`,
+`epoch`, `initial_tick`, and `tick_duration` are peer values. `ticks_per_second`
+is the observed peer head advance since the previous status request, which
+varies with network conditions. When the peer cannot be reached, `reachable` is
+`false`, `error` explains why, and the other network values are `null`.
+
+`backfill` describes current-epoch coverage. `complete` is true when the first
+indexed tick is at or before `initial_tick`. `indexed_ticks` counts only ticks
+inside the current epoch (bounded by the peer head), `epoch_ticks` counts ticks
+elapsed so far, and `coverage` is their ratio. When the peer is unavailable,
+`available` is `false` and a `reason` field is included.
 
 ### `GET /v1/network/stats`
 

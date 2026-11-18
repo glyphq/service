@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
@@ -169,14 +170,67 @@ async fn healthz() -> Json<Value> {
 }
 
 async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let head = state.store.head().await?;
-    let stats = state.store.stats().await?;
+    let (head, stats, earliest, network) = tokio::join!(
+        state.store.head(),
+        state.store.stats(),
+        state.store.earliest_tick(),
+        tokio::time::timeout(Duration::from_secs(2), state.pool.head()),
+    );
+    let head = head?;
+    let stats = stats?;
+    let earliest = earliest?;
+    let (network, network_error) = match network {
+        Ok(Ok(network)) => (Some(network), None),
+        Ok(Err(error)) => (None, Some(error.to_string())),
+        Err(_) => (None, Some("peer head request timed out".to_string())),
+    };
+    let last_indexed = stats
+        .get("ingest")
+        .and_then(|ingest| ingest.get("last_indexed_tick"))
+        .and_then(Value::as_u64)
+        .and_then(|tick| u32::try_from(tick).ok());
+    let indexed_ticks = stats
+        .get("counts")
+        .and_then(|counts| counts.get("ticks"))
+        .and_then(Value::as_u64);
+    let network_head = network.as_ref().map(|head| head.tick);
+    let rates = state.progress.observe(last_indexed, network_head);
+    let lag_ticks = network_head
+        .zip(last_indexed)
+        .map(|(network, indexed)| network.saturating_sub(indexed));
+    let eta_seconds = lag_ticks
+        .zip(rates.ingest)
+        .filter(|(_, rate)| *rate > 0.0)
+        .map(|(lag, rate)| (f64::from(lag) / rate).round() as u64);
+    let backfill = backfill_json(
+        network.as_ref().map(|head| head.initial_tick),
+        network_head,
+        earliest,
+        last_indexed,
+    );
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
             "data": {
                 "head": head,
                 "ingest": stats.get("ingest").cloned().unwrap_or(Value::Null),
+                "ingest_status": {
+                    "last_indexed_tick": last_indexed,
+                    "indexed_ticks": indexed_ticks,
+                    "ticks_per_second": rates.ingest,
+                    "lag_ticks": lag_ticks,
+                    "eta_seconds": eta_seconds,
+                },
+                "network": {
+                    "reachable": network.is_some(),
+                    "head": network_head,
+                    "epoch": network.as_ref().map(|head| head.epoch),
+                    "initial_tick": network.as_ref().map(|head| head.initial_tick),
+                    "tick_duration": network.as_ref().map(|head| head.tick_duration),
+                    "ticks_per_second": rates.network,
+                    "error": network_error,
+                },
+                "backfill": backfill,
                 "stats": stats,
             },
             "meta": {
@@ -201,6 +255,53 @@ async fn network_stats(State(state): State<AppState>) -> Result<impl IntoRespons
             "meta": { "source": "direct-qubic-peers" },
         })),
     ))
+}
+
+fn backfill_json(
+    initial_tick: Option<u32>,
+    network_head: Option<u32>,
+    earliest_tick: Option<u32>,
+    last_indexed_tick: Option<u32>,
+) -> Value {
+    let Some(initial_tick) = initial_tick else {
+        return json!({ "available": false, "reason": "network head is unavailable" });
+    };
+    let epoch_ticks = network_head.map(|head| u64::from(head.saturating_sub(initial_tick)) + 1);
+    let missing_before =
+        earliest_tick.map(|earliest| u64::from(earliest.saturating_sub(initial_tick)));
+    let complete = earliest_tick.is_some_and(|earliest| earliest <= initial_tick);
+    let remaining = network_head
+        .zip(last_indexed_tick)
+        .map(|(head, last)| u64::from(head.saturating_sub(last)));
+    // Count only ticks that belong to the current epoch so the coverage value does not
+    // drift when a previous epoch remains indexed after the epoch boundary.
+    let indexed_in_epoch = match (network_head, earliest_tick, last_indexed_tick) {
+        (Some(head), Some(earliest), Some(last)) => {
+            let start = earliest.max(initial_tick);
+            let end = last.min(head);
+            (end >= start).then(|| u64::from(end - start) + 1)
+        }
+        _ => None,
+    };
+    let coverage = match (indexed_in_epoch, epoch_ticks) {
+        (Some(indexed), Some(total)) if total > 0 => {
+            Some((indexed as f64 / total as f64).clamp(0.0, 1.0))
+        }
+        _ => None,
+    };
+    json!({
+        "available": true,
+        "complete": complete,
+        "initial_tick": initial_tick,
+        "first_indexed_tick": earliest_tick,
+        "last_indexed_tick": last_indexed_tick,
+        "missing_before": missing_before,
+        "indexed_ticks": indexed_in_epoch,
+        "epoch_ticks": epoch_ticks,
+        "remaining_ticks": remaining,
+        "coverage": coverage,
+        "coverage_percent": coverage.map(|value| (value * 100.0 * 100.0).round() / 100.0),
+    })
 }
 
 async fn epochs(

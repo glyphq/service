@@ -39,6 +39,9 @@ pub struct AppState {
     pub allow_broadcast: bool,
     pub archive: Option<archive::SharedArchive>,
     pub started_at: Instant,
+    /// Per-process sample used to report observed tick rates without a
+    /// background task or an extra database write.
+    pub progress: Arc<ProgressSampler>,
 }
 
 impl AppState {
@@ -51,12 +54,66 @@ impl AppState {
             allow_broadcast: false,
             archive: None,
             started_at: Instant::now(),
+            progress: Arc::new(ProgressSampler::default()),
         }
     }
 
     pub fn uptime_seconds(&self) -> u64 {
         self.started_at.elapsed().as_secs()
     }
+}
+
+#[derive(Debug, Default)]
+pub struct ProgressSampler {
+    previous: Mutex<Option<ProgressSample>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProgressSample {
+    at: Instant,
+    indexed: Option<u32>,
+    network: Option<u32>,
+}
+
+/// Tick rates measured between two status requests.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct ProgressRates {
+    pub ingest: Option<f64>,
+    pub network: Option<f64>,
+}
+
+impl ProgressSampler {
+    /// Records the current indexed and network ticks and returns the rate since
+    /// the previous sample. Samples closer than one second return `None` so
+    /// dashboard refreshes do not produce spiky numbers.
+    pub fn observe(&self, indexed: Option<u32>, network: Option<u32>) -> ProgressRates {
+        let now = Instant::now();
+        let mut previous = self.previous.lock().expect("progress sampler lock");
+        let rates = previous.map_or_else(ProgressRates::default, |sample| {
+            let elapsed = now.duration_since(sample.at).as_secs_f64();
+            if elapsed < 1.0 {
+                return ProgressRates::default();
+            }
+            ProgressRates {
+                ingest: rate(sample.indexed, indexed, elapsed),
+                network: rate(sample.network, network, elapsed),
+            }
+        });
+        *previous = Some(ProgressSample {
+            at: now,
+            indexed,
+            network,
+        });
+        rates
+    }
+}
+
+fn rate(previous: Option<u32>, current: Option<u32>, elapsed: f64) -> Option<f64> {
+    let previous = previous?;
+    let current = current?;
+    current
+        .checked_sub(previous)
+        .map(|delta| f64::from(delta) / elapsed)
 }
 
 pub fn router(state: AppState) -> Router {
@@ -239,6 +296,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         allow_broadcast,
         archive,
         started_at: Instant::now(),
+        progress: Arc::new(ProgressSampler::default()),
     });
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "glyph api listening");

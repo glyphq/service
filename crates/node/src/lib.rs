@@ -6,7 +6,7 @@ use qubic::LogEvent;
 use qubic::crypto::schnorrq;
 use qubic::messages::{
     ASSET_REQUEST_GET_SIBLINGS, COMPUTOR_COUNT, Computors, CurrentTickInfo, LOG_TX_PER_TICK,
-    LogRanges, MAX_AMOUNT, MAX_INPUT_SIZE, ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS,
+    LogRanges, MAX_AMOUNT, MAX_CONTRACTS, MAX_INPUT_SIZE, ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS,
     ORACLE_REQUEST_QUERY_AND_RESPONSE, ORACLE_REQUEST_SUBSCRIPTION, ORACLE_RESPOND_QUERY_DATA,
     ORACLE_RESPOND_QUERY_METADATA, ORACLE_RESPOND_REPLY_DATA, ORACLE_RESPOND_SUBSCRIPTION,
     ORACLE_RESPOND_SUBSCRIPTION_IDS, OracleQueryMetadata, OracleSubscription,
@@ -26,6 +26,15 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 pub mod health;
+
+/// Capability is a property of the peer, not of one TCP connection. Fetch
+/// workers open short-lived connections, so cache the answer per address to
+/// avoid paying the probe timeout on every tick.
+fn log_ranges_cache() -> &'static std::sync::Mutex<HashMap<SocketAddr, bool>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<SocketAddr, bool>>> =
+        std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
 
 /// How long a peer may take to answer one packet of a request.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(8);
@@ -319,6 +328,10 @@ impl Peer {
     pub async fn connect(config: PeerConfig) -> Result<Self> {
         let stream = Self::open(&config).await?;
         let (reader, writer) = stream.into_split();
+        let log_ranges_supported = log_ranges_cache()
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&config.addr).copied());
         let mut peer = Self {
             config,
             reader: BufReader::new(reader),
@@ -327,7 +340,7 @@ impl Peer {
             pending: HashMap::new(),
             public_peers: Vec::new(),
             desynced: false,
-            log_ranges_supported: None,
+            log_ranges_supported,
             observed_head: None,
         };
         peer.handshake().await?;
@@ -951,6 +964,9 @@ impl Peer {
     fn set_log_ranges_supported(&mut self, supported: bool, reason: &str) {
         let previous = self.log_ranges_supported;
         self.log_ranges_supported = Some(supported);
+        if let Ok(mut cache) = log_ranges_cache().lock() {
+            cache.insert(self.config.addr, supported);
+        }
         match (previous, supported) {
             (Some(value), next) if value == next => {}
             (_, true) => {
@@ -1065,7 +1081,22 @@ impl Peer {
             });
         }
         tracing::debug!(tick, "bundle: tick data");
-        let tick_data = self.tick_data(tick).await?;
+        // `RequestTickData` omits ticks with no transaction payload. Those
+        // ticks are still part of the chain: quorum votes carry the timestamp
+        // and prove the empty transaction set. Synthesize the data payload so
+        // the verifier can accept the 226-vote empty-tick quorum.
+        let (tick_data, preloaded_votes) = match self.tick_data(tick).await {
+            Ok(tick_data) => (tick_data, None),
+            Err(Error::EndResponse(MessageType::RequestTickData)) => {
+                tracing::debug!(tick, "tick data absent; checking for an empty tick");
+                let votes = self.votes(tick, &[false; COMPUTOR_COUNT]).await?;
+                let Some(vote) = votes.iter().find(|vote| vote.is_empty_vote()) else {
+                    return Err(Error::EndResponse(MessageType::RequestTickData));
+                };
+                (empty_tick_data(vote), Some(votes))
+            }
+            Err(error) => return Err(error),
+        };
         if tick_data.tick != tick {
             return Err(Error::Verification(format!(
                 "tick data is for tick {}, requested {tick}",
@@ -1074,7 +1105,10 @@ impl Peer {
         }
 
         tracing::debug!(tick, "bundle: quorum votes");
-        let votes = self.votes(tick, &[false; COMPUTOR_COUNT]).await?;
+        let votes = match preloaded_votes {
+            Some(votes) => votes,
+            None => self.votes(tick, &[false; COMPUTOR_COUNT]).await?,
+        };
         tracing::debug!(tick, votes = votes.len(), "bundle: transactions");
         let transactions = self.transactions(tick, &[false; TX_PER_TICK]).await?;
 
@@ -1871,6 +1905,30 @@ fn first_vote_or_synthetic(votes: &[Tick], data: &TickData, tick: u32) -> Result
         expected_next_tick_transaction_digest: [0; 32],
         signature: [0; 64],
     })
+}
+
+/// Builds an all-zero `TickData` for an empty tick from one quorum vote.
+///
+/// `RequestTickData` only returns non-empty ticks. The vote supplies the
+/// timestamp and computor index; every transaction slot, timelock, and contract
+/// fee is zero by definition.
+fn empty_tick_data(vote: &Tick) -> TickData {
+    TickData {
+        computor_index: vote.computor_index,
+        epoch: vote.epoch,
+        tick: vote.tick,
+        millisecond: vote.millisecond,
+        second: vote.second,
+        minute: vote.minute,
+        hour: vote.hour,
+        day: vote.day,
+        month: vote.month,
+        year: vote.year,
+        timelock: [0; 32],
+        transaction_digests: vec![[0; 32]; TX_PER_TICK],
+        contract_fees: vec![0; MAX_CONTRACTS],
+        signature: [0; 64],
+    }
 }
 
 #[cfg(test)]

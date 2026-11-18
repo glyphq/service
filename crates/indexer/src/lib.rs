@@ -111,6 +111,7 @@ struct PipelineTuning {
     fetch_window: usize,
     write_batch: usize,
     write_flush: Duration,
+    archive_concurrency: usize,
 }
 
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
@@ -133,6 +134,7 @@ impl PipelineTuning {
             write_flush: Duration::from_millis(
                 env_usize("INDEXER_WRITE_FLUSH_MS", 250, 10, 10_000) as u64,
             ),
+            archive_concurrency: env_usize("INDEXER_ARCHIVE_CONCURRENCY", 16, 1, 64),
         }
     }
 }
@@ -384,6 +386,15 @@ impl<S: Store + 'static> Indexer<S> {
         let mut since_progress = 0u64;
         let mut consecutive_failures = 0u32;
         let mut write_batches = Vec::<TickBatch>::with_capacity(tuning.write_batch);
+        let mut archive_tasks =
+            Vec::<Vec<tokio::task::JoinHandle<archive::Result<()>>>>::with_capacity(
+                tuning.write_batch,
+            );
+        let archive_semaphore = self
+            .config
+            .archive
+            .as_ref()
+            .map(|_| Arc::new(tokio::sync::Semaphore::new(tuning.archive_concurrency)));
         let mut stored_epochs = HashSet::new();
         let mut last_flush = Instant::now();
         let mut run_result = Ok(());
@@ -507,25 +518,29 @@ impl<S: Store + 'static> Indexer<S> {
                         "tick verified"
                     );
 
-                    if let Some(archive) = self.config.archive.clone() {
-                        let archive_started = Instant::now();
-                        match archive_tick(&verified, archive.as_ref()).await {
-                            Ok(()) => tracing::debug!(
-                                tick = verified.tick.tick,
-                                epoch = verified.tick.epoch,
-                                elapsed_ms = archive_started.elapsed().as_secs_f64() * 1_000.0,
+                    let mut archives = Vec::new();
+                    if let (Some(archive), Some(semaphore)) =
+                        (self.config.archive.clone(), archive_semaphore.clone())
+                    {
+                        let tick = verified.tick.tick;
+                        let epoch = verified.tick.epoch;
+                        let raw = raw_bundle(&verified);
+                        archives.push(tokio::spawn(async move {
+                            let _permit = semaphore
+                                .acquire_owned()
+                                .await
+                                .expect("archive semaphore is never closed");
+                            let started = Instant::now();
+                            let result = archive::put_bundle(archive.as_ref(), &raw).await;
+                            tracing::debug!(
+                                tick,
+                                epoch,
+                                ok = result.is_ok(),
+                                elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
                                 "raw bundle archived"
-                            ),
-                            Err(error) if self.config.archive_fail_closed => {
-                                run_result = Err(Error::Archive(error));
-                                break 'writer;
-                            }
-                            Err(error) => tracing::warn!(
-                                tick = verified.tick.tick,
-                                %error,
-                                "raw archive failed; continuing with indexed rows"
-                            ),
-                        }
+                            );
+                            result.map(|_| ())
+                        }));
                     }
 
                     let build_started = Instant::now();
@@ -571,6 +586,7 @@ impl<S: Store + 'static> Indexer<S> {
                     }
 
                     write_batches.push(batch);
+                    archive_tasks.push(archives);
                     consume_next = consume_next.saturating_add(1);
                     consecutive_failures = 0;
                     backoff = Duration::from_millis(250);
@@ -587,8 +603,15 @@ impl<S: Store + 'static> Indexer<S> {
                     );
                     if flush_due {
                         let stored = loop {
-                            match self.flush_batches(&mut write_batches, &mut next).await {
+                            match self
+                                .flush_batches(&mut write_batches, &mut archive_tasks, &mut next)
+                                .await
+                            {
                                 Ok(stored) => break stored,
+                                Err(Error::Archive(error)) => {
+                                    run_result = Err(Error::Archive(error));
+                                    break 'writer;
+                                }
                                 Err(error) => {
                                     if cancel.is_cancelled() {
                                         run_result = Err(error);
@@ -638,8 +661,15 @@ impl<S: Store + 'static> Indexer<S> {
                 )
             {
                 let stored = loop {
-                    match self.flush_batches(&mut write_batches, &mut next).await {
+                    match self
+                        .flush_batches(&mut write_batches, &mut archive_tasks, &mut next)
+                        .await
+                    {
                         Ok(stored) => break stored,
+                        Err(Error::Archive(error)) => {
+                            run_result = Err(Error::Archive(error));
+                            break 'writer;
+                        }
                         Err(error) => {
                             if cancel.is_cancelled() {
                                 run_result = Err(error);
@@ -674,7 +704,10 @@ impl<S: Store + 'static> Indexer<S> {
         // Flush on graceful shutdown. Failures here must not skip the range;
         // the next run resumes from the persisted cursor.
         if !write_batches.is_empty() && run_result.is_ok() {
-            if let Err(error) = self.flush_batches(&mut write_batches, &mut next).await {
+            if let Err(error) = self
+                .flush_batches(&mut write_batches, &mut archive_tasks, &mut next)
+                .await
+            {
                 tracing::error!(tick = next, %error, "shutdown batch write failed");
                 run_result = Err(error);
             }
@@ -694,15 +727,42 @@ impl<S: Store + 'static> Indexer<S> {
         run_result
     }
 
-    async fn flush_batches(&self, batches: &mut Vec<TickBatch>, next: &mut u32) -> Result<usize> {
+    async fn flush_batches(
+        &self,
+        batches: &mut Vec<TickBatch>,
+        archives: &mut Vec<Vec<tokio::task::JoinHandle<archive::Result<()>>>>,
+        next: &mut u32,
+    ) -> Result<usize> {
         if batches.is_empty() {
             return Ok(0);
+        }
+        for tasks in archives.iter_mut() {
+            for task in tasks.drain(..) {
+                match task.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if self.config.archive_fail_closed => {
+                        return Err(Error::Archive(error));
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "raw archive failed; continuing with indexed rows");
+                    }
+                    Err(error) if self.config.archive_fail_closed => {
+                        return Err(Error::Archive(archive::Error::InvalidBundle(format!(
+                            "archive task failed: {error}"
+                        ))));
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "raw archive task failed; continuing");
+                    }
+                }
+            }
         }
         let started = Instant::now();
         let outcomes = self.store.write_ticks(batches).await?;
         let stored = batches.len();
         *next = next_after_flush(*next, outcomes.iter().map(|outcome| outcome.tick).max());
         batches.clear();
+        archives.clear();
         tracing::debug!(
             ticks = stored,
             next = *next,
@@ -907,9 +967,11 @@ impl<S: Store + 'static> Indexer<S> {
                     }
                     row.transfer_count = row.transfer_count.saturating_add(1);
                     row.last_seen_tick = row.last_seen_tick.max(verified.tick.tick);
-                    if row.first_seen_tick == 0 {
-                        row.first_seen_tick = verified.tick.tick;
-                    }
+                    row.first_seen_tick = if row.first_seen_tick == 0 {
+                        verified.tick.tick
+                    } else {
+                        row.first_seen_tick.min(verified.tick.tick)
+                    };
                 }
             }
         }
@@ -1496,10 +1558,7 @@ async fn fetch_worker(
     }
 }
 
-async fn archive_tick(
-    verified: &VerifiedTick,
-    archive: &dyn archive::RawArchive,
-) -> archive::Result<()> {
+fn raw_bundle(verified: &VerifiedTick) -> RawBundle {
     let mut bundle = RawBundle::new(verified.tick.epoch, verified.tick.tick);
     bundle.set_section(Section::TickHeader, verified.tick.encode().to_vec());
     bundle.set_section(Section::TickData, verified.tick_data.encode());
@@ -1520,8 +1579,7 @@ async fn archive_tick(
     }
     bundle.set_section(Section::Logs, logs);
     bundle.set_section(Section::Computors, verified.computors.encode());
-    archive::put_bundle(archive, &bundle).await?;
-    Ok(())
+    bundle
 }
 
 fn required_quorum(digest: &[u8; 32]) -> usize {

@@ -44,27 +44,35 @@ pub fn spec() -> Value {
     json!({
         "openapi": "3.1.0",
         "info": {
-            "title": "Glyph Qubic API",
+            "title": "Glyph API",
             "version": "0.1.0",
-            "description": "Resource-oriented read API over a from-scratch Qubic index fed by direct peer connections. Newest-first collections use opaque cursor pagination."
+            "summary": "A direct-peer read API for the Qubic network.",
+            "description": "# Glyph API\n\nGlyph indexes Qubic by connecting straight to peers and verifying quorum evidence. There is no hosted RPC in the path: every tick, transaction, and event served here came from peer messages that Glyph fetched, aligned, and persisted itself.\n\n## Reading the API\n\n- Every response wraps its payload in `data` and, where relevant, `meta`.\n- Newest-first collections accept `limit` and an opaque `cursor` from `meta.next_cursor`.\n- Tick, epoch, transaction, event, identity, wallet, asset, and price routes are read-only.\n- `/v1/status` reports live ingest and network progress; `/status` renders the same state as HTML.\n\n## Freshness\n\nNewest-first responses are cached briefly. `/v1/status` is never cached and includes the latest indexed tick, the current network head sampled from peers, indexer throughput, and current-epoch backfill coverage."
         },
         "servers": [{ "url": "/" }],
         "tags": [
-            { "name": "status" },
-            { "name": "epochs" },
-            { "name": "ticks" },
-            { "name": "transactions" },
-            { "name": "events" },
-            { "name": "identities" },
-            { "name": "assets" },
-            { "name": "wallets" },
-            { "name": "prices" },
-            { "name": "analytics" },
-            { "name": "stream" },
-            { "name": "network" },
-            { "name": "contracts" },
-            { "name": "archive" },
-            { "name": "search" }
+            { "name": "status", "description": "Liveness, indexer progress, and the HTML operations dashboard." },
+            { "name": "epochs", "description": "Epoch summaries and elected computor sets." },
+            { "name": "ticks", "description": "Tick headers and their verified transaction and event contents." },
+            { "name": "transactions", "description": "Transactions by hash, source, destination, input type, and tick." },
+            { "name": "events", "description": "Contract event logs decoded into typed bodies and participants." },
+            { "name": "identities", "description": "Identity history, balances, transfers, and contract interactions." },
+            { "name": "wallets", "description": "Wallet-centric balances and issued or held assets." },
+            { "name": "assets", "description": "Asset issuances, metadata, and holder sets." },
+            { "name": "prices", "description": "Oracle price samples and hourly QUBIC/USDT history." },
+            { "name": "analytics", "description": "Aggregated activity, volume, and network-level counts." },
+            { "name": "stream", "description": "Server-sent event streams for new ticks and transactions." },
+            { "name": "network", "description": "Peer-observed network state and index coverage." },
+            { "name": "contracts", "description": "Contract call history and per-contract activity." },
+            { "name": "archive", "description": "Raw verified tick bundles retained for audit and replay." },
+            { "name": "search", "description": "Resolve hashes, ticks, epochs, assets, and identities in one request." }
+        ],
+        "x-tagGroups": [
+            { "name": "Operations", "tags": ["status", "network"] },
+            { "name": "Chain data", "tags": ["epochs", "ticks", "transactions", "events", "contracts", "archive"] },
+            { "name": "Accounts and assets", "tags": ["identities", "wallets", "assets"] },
+            { "name": "Market and analytics", "tags": ["prices", "analytics"] },
+            { "name": "Live and lookup", "tags": ["stream", "search"] }
         ],
         "paths": {
             "/healthz": {
@@ -77,8 +85,20 @@ pub fn spec() -> Value {
             "/v1/status": {
                 "get": {
                     "tags": ["status"],
-                    "summary": "Indexer head, ingest cursor, and counts",
-                    "responses": { "200": { "description": "Current status" } }
+                    "summary": "Live indexer and network progress",
+                    "description": "Returns the persisted index head, ingest cursor, sampled peer head, indexer throughput, lag and ETA, and current-epoch backfill coverage. Throughput is measured between status requests at least one second apart, so the first request after startup may omit rates.",
+                    "responses": {
+                        "200": {
+                            "description": "Current status",
+                            "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "properties": {
+                                    "data": { "$ref": "#/components/schemas/Status" },
+                                    "meta": { "type": "object" }
+                                }
+                            } } }
+                        }
+                    }
                 }
             },
             "/status": {
@@ -91,8 +111,9 @@ pub fn spec() -> Value {
             },
             "/v1/network/stats": {
                 "get": {
-                    "tags": ["status"],
-                    "summary": "Index-wide counts and progress",
+                    "tags": ["network"],
+                    "summary": "Index-wide counts and coverage",
+                    "description": "Entity counts and the indexed tick range. Use /v1/status for live peer throughput and backfill progress.",
                     "responses": {
                         "200": { "description": "Network stats", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/NetworkStats" } } } } } },
                         "500": { "description": "Storage failure" }
@@ -1036,6 +1057,58 @@ pub fn spec() -> Value {
                         "identities": { "type": "integer" },
                         "latest_timestamp": { "type": ["string", "null"], "format": "date-time" },
                         "ingest": { "type": "object" }
+                    }
+                },
+                "Status": {
+                    "type": "object",
+                    "properties": {
+                        "head": { "oneOf": [{ "$ref": "#/components/schemas/Tick" }, { "type": "null" }] },
+                        "ingest": { "type": "object", "description": "Persisted ingest cursor: last_indexed_tick, epoch, verification, updated_at." },
+                        "ingest_status": { "$ref": "#/components/schemas/IngestStatus" },
+                        "network": { "$ref": "#/components/schemas/NetworkStatus" },
+                        "backfill": { "$ref": "#/components/schemas/BackfillStatus" },
+                        "stats": { "type": "object", "description": "Counts and ingest cursor returned by /v1/network/stats." }
+                    }
+                },
+                "IngestStatus": {
+                    "type": "object",
+                    "description": "Indexer throughput measured between status requests.",
+                    "properties": {
+                        "last_indexed_tick": { "type": ["integer", "null"] },
+                        "indexed_ticks": { "type": ["integer", "null"], "description": "All ticks currently stored, across epochs." },
+                        "ticks_per_second": { "type": ["number", "null"], "description": "Ticks persisted per second since the previous status request. Null until a second sample exists." },
+                        "lag_ticks": { "type": ["integer", "null"], "description": "Network head minus last indexed tick." },
+                        "eta_seconds": { "type": ["integer", "null"], "description": "Lag divided by ingest rate." }
+                    }
+                },
+                "NetworkStatus": {
+                    "type": "object",
+                    "description": "Peer head sampled directly from a Qubic peer with a short timeout.",
+                    "properties": {
+                        "reachable": { "type": "boolean" },
+                        "head": { "type": ["integer", "null"] },
+                        "epoch": { "type": ["integer", "null"] },
+                        "initial_tick": { "type": ["integer", "null"], "description": "First tick of the peer's epoch." },
+                        "tick_duration": { "type": ["integer", "null"], "description": "Tick duration reported by the peer, in milliseconds when available." },
+                        "ticks_per_second": { "type": ["number", "null"], "description": "Observed peer head advance since the previous status request." },
+                        "error": { "type": ["string", "null"] }
+                    }
+                },
+                "BackfillStatus": {
+                    "type": "object",
+                    "description": "Current-epoch coverage. Coverage compares ticks stored in the epoch with ticks elapsed so far.",
+                    "properties": {
+                        "available": { "type": "boolean", "description": "False when the peer head is unavailable." },
+                        "complete": { "type": "boolean", "description": "True when the first indexed tick is at or before the epoch initial tick." },
+                        "initial_tick": { "type": "integer" },
+                        "first_indexed_tick": { "type": ["integer", "null"] },
+                        "last_indexed_tick": { "type": ["integer", "null"] },
+                        "missing_before": { "type": ["integer", "null"], "description": "Ticks between the epoch initial tick and the first indexed tick." },
+                        "indexed_ticks": { "type": ["integer", "null"], "description": "Ticks stored inside the current epoch, bounded by the peer head." },
+                        "epoch_ticks": { "type": ["integer", "null"], "description": "Ticks elapsed in the current epoch so far." },
+                        "remaining_ticks": { "type": ["integer", "null"] },
+                        "coverage": { "type": ["number", "null"], "description": "indexed_ticks divided by epoch_ticks, from 0 to 1." },
+                        "coverage_percent": { "type": ["number", "null"] }
                     }
                 }
             }
