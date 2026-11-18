@@ -36,6 +36,14 @@ pub const RESPOND_CONTRACT_IPO_SIZE: usize = 8 + 32 * COMPUTOR_COUNT + 8 * COMPU
 pub const RESPOND_ISSUED_ASSETS_SIZE: usize = ASSET_RECORD_SIZE + 8 + 32 * ASSETS_DEPTH;
 pub const RESPOND_OWNED_ASSETS_SIZE: usize = 2 * ASSET_RECORD_SIZE + 8 + 32 * ASSETS_DEPTH;
 pub const RESPOND_POSSESSED_ASSETS_SIZE: usize = 3 * ASSET_RECORD_SIZE + 8 + 32 * ASSETS_DEPTH;
+/// `RequestPriceSeries` (`network_messages/price_feed.h`, 8 bytes).
+pub const REQUEST_PRICE_SERIES_SIZE: usize = 8;
+/// Maximum number of points a peer returns in one `RespondPriceSeries`.
+pub const PRICE_SERIES_MAX_POINTS: usize = 256;
+/// Fixed part of `RespondPriceSeries`, before the point array.
+pub const RESPOND_PRICE_SERIES_HEADER_SIZE: usize = 124;
+/// Size of one `RespondPriceSeriesPoint` on the wire.
+pub const RESPOND_PRICE_SERIES_POINT_SIZE: usize = 20;
 pub const REQUEST_ENTITY_SIZE: usize = 32;
 pub const REQUEST_TRANSACTION_INFO_SIZE: usize = 32;
 pub const REQUEST_TX_STATUS_SIZE: usize = 4;
@@ -69,6 +77,14 @@ pub const ASSET_REQUEST_ANY_OWNER: u16 = 0b1000;
 pub const ASSET_REQUEST_ANY_OWNERSHIP_MANAGING_CONTRACT: u16 = 0b10000;
 pub const ASSET_REQUEST_ANY_POSSESSOR: u16 = 0b100000;
 pub const ASSET_REQUEST_ANY_POSSESSION_MANAGING_CONTRACT: u16 = 0b1000000;
+
+pub const PRICE_SERIES_SOURCE_BOOTSTRAP: u32 = 1;
+pub const PRICE_SERIES_SOURCE_EPOCH_SWITCH: u32 = 2;
+pub const PRICE_SERIES_SOURCE_F6: u32 = 3;
+pub const PRICE_SERIES_SOURCE_SNAPSHOT: u32 = 4;
+
+/// `RespondPriceSeriesPoint.flags` bit marking an hour whose price was filled.
+pub const PRICE_POINT_FLAG_FILLED: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tick {
@@ -759,6 +775,12 @@ impl RequestAssets {
         match self {
             Self::ByFilter { request_type, .. } => *request_type,
             Self::ByUniverseIndex { .. } => ASSET_REQUEST_BY_UNIVERSE_INDEX,
+        }
+    }
+
+    pub fn flags(&self) -> u16 {
+        match self {
+            Self::ByFilter { flags, .. } | Self::ByUniverseIndex { flags, .. } => *flags,
         }
     }
 
@@ -1770,6 +1792,206 @@ fn encode_siblings(out: &mut Vec<u8>, siblings: &[[u8; 32]]) {
     }
 }
 
+/// `RequestPriceSeries` (`network_messages/price_feed.h`, 8 bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RequestPriceSeries {
+    pub from_hour: u32,
+    pub count: u32,
+}
+
+impl RequestPriceSeries {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() != REQUEST_PRICE_SERIES_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "request price series needs {REQUEST_PRICE_SERIES_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        Ok(Self {
+            from_hour: u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")),
+            count: u32::from_le_bytes(payload[4..8].try_into().expect("4 bytes")),
+        })
+    }
+
+    pub fn encode(&self) -> [u8; REQUEST_PRICE_SERIES_SIZE] {
+        let mut out = [0u8; REQUEST_PRICE_SERIES_SIZE];
+        out[0..4].copy_from_slice(&self.from_hour.to_le_bytes());
+        out[4..8].copy_from_slice(&self.count.to_le_bytes());
+        out
+    }
+}
+
+/// One hourly point of a `RespondPriceSeries` (20 bytes on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RespondPriceSeriesPoint {
+    pub hour: u32,
+    pub append_tick: u32,
+    /// Bit flags; [`PRICE_POINT_FLAG_FILLED`] marks a filled hour.
+    pub flags: u32,
+    /// Price scaled by 1e8.
+    pub price_e8: i64,
+}
+
+impl RespondPriceSeriesPoint {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() != RESPOND_PRICE_SERIES_POINT_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "respond price series point needs {RESPOND_PRICE_SERIES_POINT_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let mut r = Reader::new(payload);
+        Ok(Self {
+            hour: r.u32()?,
+            append_tick: r.u32()?,
+            flags: r.u32()?,
+            price_e8: r.i64()?,
+        })
+    }
+
+    pub fn encode(&self) -> [u8; RESPOND_PRICE_SERIES_POINT_SIZE] {
+        let mut out = [0u8; RESPOND_PRICE_SERIES_POINT_SIZE];
+        out[0..4].copy_from_slice(&self.hour.to_le_bytes());
+        out[4..8].copy_from_slice(&self.append_tick.to_le_bytes());
+        out[8..12].copy_from_slice(&self.flags.to_le_bytes());
+        out[12..20].copy_from_slice(&self.price_e8.to_le_bytes());
+        out
+    }
+}
+
+/// `RespondPriceSeries` (`network_messages/price_feed.h`).
+///
+/// Only the first `count` points are present on the wire; hours the node does
+/// not hold are left out. The payload is exactly
+/// [`RESPOND_PRICE_SERIES_HEADER_SIZE`] + `count * RESPOND_PRICE_SERIES_POINT_SIZE`
+/// bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RespondPriceSeries {
+    pub tick: u32,
+    pub epoch: u16,
+    pub synced: bool,
+    pub bound: bool,
+    pub source: u32,
+    pub next_hour: u32,
+    pub failed_attempts: u32,
+    pub first_fail_ms: i64,
+    pub last_fail_ms: i64,
+    pub series_digest: [u8; 32],
+    pub num_success: u64,
+    pub num_timeout: u64,
+    pub num_unresolvable: u64,
+    pub num_invalid_reply: u64,
+    pub num_start_failed: u64,
+    pub num_filled: u64,
+    pub base_hour: u32,
+    pub count: u32,
+    pub points: Vec<RespondPriceSeriesPoint>,
+}
+
+impl RespondPriceSeries {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() < RESPOND_PRICE_SERIES_HEADER_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "respond price series needs at least {RESPOND_PRICE_SERIES_HEADER_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let mut r = Reader::new(payload);
+        let tick = r.u32()?;
+        let epoch = r.u16()?;
+        let synced = r.u8()? != 0;
+        let bound = r.u8()? != 0;
+        let source = r.u32()?;
+        let next_hour = r.u32()?;
+        let failed_attempts = r.u32()?;
+        let first_fail_ms = r.i64()?;
+        let last_fail_ms = r.i64()?;
+        let series_digest = r.array()?;
+        let num_success = r.u64()?;
+        let num_timeout = r.u64()?;
+        let num_unresolvable = r.u64()?;
+        let num_invalid_reply = r.u64()?;
+        let num_start_failed = r.u64()?;
+        let num_filled = r.u64()?;
+        let base_hour = r.u32()?;
+        let count = r.u32()?;
+
+        let point_count = count as usize;
+        if point_count > PRICE_SERIES_MAX_POINTS {
+            return Err(Error::InvalidPacket(format!(
+                "respond price series count {count} exceeds {PRICE_SERIES_MAX_POINTS}"
+            )));
+        }
+        let expected =
+            RESPOND_PRICE_SERIES_HEADER_SIZE + point_count * RESPOND_PRICE_SERIES_POINT_SIZE;
+        if payload.len() != expected {
+            return Err(Error::InvalidPacket(format!(
+                "respond price series with count {count} needs {expected} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let mut points = Vec::with_capacity(point_count);
+        for _ in 0..point_count {
+            points.push(RespondPriceSeriesPoint::decode(
+                r.bytes(RESPOND_PRICE_SERIES_POINT_SIZE)?,
+            )?);
+        }
+        Ok(Self {
+            tick,
+            epoch,
+            synced,
+            bound,
+            source,
+            next_hour,
+            failed_attempts,
+            first_fail_ms,
+            last_fail_ms,
+            series_digest,
+            num_success,
+            num_timeout,
+            num_unresolvable,
+            num_invalid_reply,
+            num_start_failed,
+            num_filled,
+            base_hour,
+            count,
+            points,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(
+            RESPOND_PRICE_SERIES_HEADER_SIZE + self.points.len() * RESPOND_PRICE_SERIES_POINT_SIZE,
+        );
+        out.extend_from_slice(&self.tick.to_le_bytes());
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        out.push(self.synced as u8);
+        out.push(self.bound as u8);
+        out.extend_from_slice(&self.source.to_le_bytes());
+        out.extend_from_slice(&self.next_hour.to_le_bytes());
+        out.extend_from_slice(&self.failed_attempts.to_le_bytes());
+        out.extend_from_slice(&self.first_fail_ms.to_le_bytes());
+        out.extend_from_slice(&self.last_fail_ms.to_le_bytes());
+        out.extend_from_slice(&self.series_digest);
+        out.extend_from_slice(&self.num_success.to_le_bytes());
+        out.extend_from_slice(&self.num_timeout.to_le_bytes());
+        out.extend_from_slice(&self.num_unresolvable.to_le_bytes());
+        out.extend_from_slice(&self.num_invalid_reply.to_le_bytes());
+        out.extend_from_slice(&self.num_start_failed.to_le_bytes());
+        out.extend_from_slice(&self.num_filled.to_le_bytes());
+        out.extend_from_slice(&self.base_hour.to_le_bytes());
+        out.extend_from_slice(&self.count.to_le_bytes());
+        for point in &self.points {
+            out.extend_from_slice(&point.encode());
+        }
+        debug_assert_eq!(
+            out.len(),
+            RESPOND_PRICE_SERIES_HEADER_SIZE + self.points.len() * RESPOND_PRICE_SERIES_POINT_SIZE
+        );
+        out
+    }
+}
+
 pub fn exchange_public_peers(peers: &[PeerAddress; 4]) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
     for peer in peers {
@@ -1867,6 +2089,10 @@ pub fn request_possessed_assets(public_key: [u8; 32]) -> Vec<u8> {
 
 pub fn request_assets(request: &RequestAssets) -> Vec<u8> {
     request.encode().to_vec()
+}
+
+pub fn request_price_series(from_hour: u32, count: u32) -> Vec<u8> {
+    RequestPriceSeries { from_hour, count }.encode().to_vec()
 }
 
 pub fn request_contract_ipo(contract_index: u32) -> Vec<u8> {
@@ -2037,5 +2263,118 @@ mod tests {
         let mut too_many = status.encode();
         too_many[8..12].copy_from_slice(&(TX_PER_TICK as u32 + 1).to_le_bytes());
         assert!(RespondTxStatus::decode(&too_many).is_err());
+    }
+
+    fn price_series(points: Vec<RespondPriceSeriesPoint>) -> RespondPriceSeries {
+        RespondPriceSeries {
+            tick: 91_915_000,
+            epoch: 240,
+            synced: true,
+            bound: false,
+            source: 3,
+            next_hour: 500,
+            failed_attempts: 2,
+            first_fail_ms: 1_700_000_000_000,
+            last_fail_ms: 1_700_000_123_456,
+            series_digest: [0xab; 32],
+            num_success: 400,
+            num_timeout: 3,
+            num_unresolvable: 4,
+            num_invalid_reply: 5,
+            num_start_failed: 6,
+            num_filled: 7,
+            base_hour: 100,
+            count: points.len() as u32,
+            points,
+        }
+    }
+
+    #[test]
+    fn request_price_series_round_trip() {
+        let request = RequestPriceSeries {
+            from_hour: 123_456,
+            count: 24,
+        };
+        let bytes = request.encode();
+        assert_eq!(bytes.len(), REQUEST_PRICE_SERIES_SIZE);
+        assert_eq!(RequestPriceSeries::decode(&bytes).unwrap(), request);
+        assert_eq!(request_price_series(123_456, 24), bytes.to_vec());
+        assert!(RequestPriceSeries::decode(&bytes[..4]).is_err());
+    }
+
+    #[test]
+    fn price_series_empty_response_round_trip() {
+        let series = price_series(Vec::new());
+        let bytes = series.encode();
+        assert_eq!(bytes.len(), RESPOND_PRICE_SERIES_HEADER_SIZE);
+        assert_eq!(RespondPriceSeries::decode(&bytes).unwrap(), series);
+    }
+
+    #[test]
+    fn price_series_two_point_round_trip() {
+        let series = price_series(vec![
+            RespondPriceSeriesPoint {
+                hour: 500,
+                append_tick: 91_915_001,
+                flags: PRICE_POINT_FLAG_FILLED,
+                price_e8: 6_712_345_678_900,
+            },
+            RespondPriceSeriesPoint {
+                hour: 501,
+                append_tick: 91_915_002,
+                flags: 0,
+                price_e8: -12_345,
+            },
+        ]);
+        let bytes = series.encode();
+        assert_eq!(
+            bytes.len(),
+            RESPOND_PRICE_SERIES_HEADER_SIZE + 2 * RESPOND_PRICE_SERIES_POINT_SIZE
+        );
+        let decoded = RespondPriceSeries::decode(&bytes).unwrap();
+        assert_eq!(decoded, series);
+        assert_eq!(decoded.points[0].flags & PRICE_POINT_FLAG_FILLED, 1);
+        assert_eq!(decoded.points[1].price_e8, -12_345);
+
+        let point = series.points[0].encode();
+        assert_eq!(point.len(), RESPOND_PRICE_SERIES_POINT_SIZE);
+        assert_eq!(
+            RespondPriceSeriesPoint::decode(&point).unwrap(),
+            series.points[0]
+        );
+        assert!(RespondPriceSeriesPoint::decode(&point[..19]).is_err());
+    }
+
+    #[test]
+    fn price_series_rejects_trailing_bytes() {
+        let mut bytes = price_series(vec![RespondPriceSeriesPoint::default()]).encode();
+        bytes.push(0);
+        assert!(RespondPriceSeries::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn price_series_rejects_wrong_count() {
+        let mut bytes = price_series(vec![RespondPriceSeriesPoint::default()]).encode();
+        // Claim two points while only one is present.
+        let count_offset = RESPOND_PRICE_SERIES_HEADER_SIZE - 4;
+        bytes[count_offset..count_offset + 4].copy_from_slice(&2u32.to_le_bytes());
+        assert!(RespondPriceSeries::decode(&bytes).is_err());
+
+        // Claim zero points while one is present.
+        bytes[count_offset..count_offset + 4].copy_from_slice(&0u32.to_le_bytes());
+        assert!(RespondPriceSeries::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn price_series_rejects_too_many_points() {
+        let mut bytes = price_series(Vec::new()).encode();
+        let count_offset = RESPOND_PRICE_SERIES_HEADER_SIZE - 4;
+        let too_many = PRICE_SERIES_MAX_POINTS + 1;
+        bytes[count_offset..count_offset + 4].copy_from_slice(&(too_many as u32).to_le_bytes());
+        bytes.resize(
+            RESPOND_PRICE_SERIES_HEADER_SIZE + too_many * RESPOND_PRICE_SERIES_POINT_SIZE,
+            0,
+        );
+        assert!(RespondPriceSeries::decode(&bytes).is_err());
     }
 }

@@ -79,12 +79,12 @@ The values are the `u8` on the wire. `MessageType::from_u8` in
 | 33 | `RequestContractIpo` | client to peer | No |
 | 34 | `RespondContractIpo` | peer to client | No |
 | 35 | `EndResponse` | peer to client | Yes, terminates a multi-packet response |
-| 36 | `RequestIssuedAssets` | client to peer | No |
-| 37 | `RespondIssuedAssets` | peer to client | No |
-| 38 | `RequestOwnedAssets` | client to peer | No |
-| 39 | `RespondOwnedAssets` | peer to client | No |
-| 40 | `RequestPossessedAssets` | client to peer | No |
-| 41 | `RespondPossessedAssets` | peer to client | No |
+| 36 | `RequestIssuedAssets` | client to peer | Yes, issued-asset lookup |
+| 37 | `RespondIssuedAssets` | peer to client | Yes |
+| 38 | `RequestOwnedAssets` | client to peer | Yes, owned-asset lookup |
+| 39 | `RespondOwnedAssets` | peer to client | Yes |
+| 40 | `RequestPossessedAssets` | client to peer | Yes, possessed-asset lookup |
+| 41 | `RespondPossessedAssets` | peer to client | Yes |
 | 42 | `RequestContractFunction` | client to peer | Yes, read-only contract queries |
 | 43 | `RespondContractFunction` | peer to client | Yes |
 | 44 | `RequestLog` | client to peer | Yes |
@@ -95,8 +95,8 @@ The values are the `u8` on the wire. `MessageType::from_u8` in
 | 49 | `RespondLogIdRangeFromTx` | peer to client | Planned |
 | 50 | `RequestAllLogIdRangesFromTx` | client to peer | Yes |
 | 51 | `RespondAllLogIdRangesFromTx` | peer to client | Yes |
-| 52 | `RequestAssets` | client to peer | Planned |
-| 53 | `RespondAssets` | peer to client | Planned |
+| 52 | `RequestAssets` | client to peer | Yes, filtered asset lookup |
+| 53 | `RespondAssets` | peer to client | Yes |
 | 54 | `TryAgain` | peer to client | Yes, back off |
 | 56 | `RequestPruningLog` | client to peer | No |
 | 57 | `RespondPruningLog` | peer to client | No |
@@ -108,8 +108,8 @@ The values are the `u8` on the wire. `MessageType::from_u8` in
 | 67 | `RespondOracleData` | peer to client | No |
 | 70 | `RequestRevenueData` | client to peer | No |
 | 71 | `RespondRevenueData` | peer to client | No |
-| 78 | `RequestPriceSeries` | client to peer | No |
-| 79 | `RespondPriceSeries` | peer to client | No |
+| 78 | `RequestPriceSeries` | client to peer | Yes, BTC price series |
+| 79 | `RespondPriceSeries` | peer to client | Yes |
 | 255 | `SpecialCommand` | both | No |
 
 `EndResponse` is a complete packet with the same `dejavu` as the request and an empty
@@ -263,6 +263,106 @@ lowercase base-26 string.
 `input_size` is a `u16` on the wire but the protocol limit is 1,024. Reject larger values
 before allocation.
 
+### `AssetRecord` (48 bytes)
+
+Asset responses share a 48-byte tagged record. The remaining 16 bytes are interpreted by
+`record_type`; keep all 48 bytes when re-encoding an unknown type.
+
+| Offset | Type | Field |
+| --- | --- | --- |
+| 0 | `[u8; 32]` | `public_key`, the issuer, owner, or possessor |
+| 32 | `u8` | `record_type`: `0` empty, `1` issuance, `2` ownership, `3` possession |
+| 33 | `[u8; 7]` | issuance only: `name` |
+| 40 | `u8` | issuance only: `decimals` |
+| 41 | `[u8; 7]` | issuance only: `unit`, SI powers stored as bytes offset by 48 |
+| 34 | `u16` | ownership/possession: `managing_contract_index` |
+| 36 | `u32` | ownership: `issuance_index`; possession: `ownership_index` |
+| 40 | `i64` | ownership/possession: `shares` |
+
+Offset 33 is padding for ownership and possession records. An empty record has no payload
+beyond `record_type` and a zeroed remainder. The asset name is ASCII, at most seven bytes,
+and is decoded by stopping at the first zero. The unit is not trimmed: all seven bytes are
+meaningful SI exponents, and a zero byte renders as the digit `0`.
+
+### Asset requests and responses
+
+`RequestIssuedAssets`, `RequestOwnedAssets`, and `RequestPossessedAssets` each carry one
+32-byte public key. A peer streams every matching record as a separate response packet and
+terminates the stream with `EndResponse`. A peer with no matches sends `EndResponse`
+immediately. There is no count field; keep reading until `EndResponse`.
+
+| Response | Size | Layout |
+| --- | --- | --- |
+| `RespondIssuedAssets` | 824 | `asset`, `u32 tick`, `u32 universe_index`, 24 sibling digests |
+| `RespondOwnedAssets` | 872 | `asset`, `issuance_asset`, `u32 tick`, `u32 universe_index`, 24 siblings |
+| `RespondPossessedAssets` | 920 | `asset`, `ownership_asset`, `issuance_asset`, `u32 tick`, `u32 universe_index`, 24 siblings |
+
+`RequestAssets` adds server-side filtering. Its 112-byte filter form is:
+
+| Offset | Type | Field |
+| --- | --- | --- |
+| 0 | `u16` | `asset_request_type`: `0` issuance, `1` ownership, `2` possession, `3` by universe index |
+| 2 | `u16` | `flags` |
+| 4 | `u16` | `ownership_managing_contract` |
+| 6 | `u16` | `possession_managing_contract` |
+| 8 | `[u8; 32]` | `issuer` |
+| 40 | `u64` | `asset_name`, packed eight-byte name |
+| 48 | `[u8; 32]` | `owner` |
+| 80 | `[u8; 32]` | `possessor` |
+
+For `asset_request_type = 3`, only the first eight bytes are meaningful: `u16` type,
+`u16` flags, `u32 universe_index`. A core accepts that eight-byte payload even though the
+filter form is 112 bytes.
+
+Flags are: `0b1` include Merkle siblings, `0b10` any issuer, `0b100` any asset name,
+`0b1000` any owner, `0b10000` any ownership managing contract, `0b100000` any possessor,
+`0b1000000` any possession managing contract. Unset filter fields must match exactly.
+
+Without the siblings flag the response is a 56-byte `RespondAssets`: `asset`, `u32 tick`,
+`u32 universe_index`. With the flag it is an 824-byte `RespondAssetsWithSiblings`: the same
+56-byte prefix followed by 24 sibling digests. A single `RequestAssets` can produce many
+response packets, terminated by `EndResponse`.
+
+### `RequestPriceSeries` (8 bytes) and `RespondPriceSeries` (variable)
+
+The price series is the node's hourly BTC/USDT feed. `RequestPriceSeries` carries
+`u32 from_hour` and `u32 count`. A core clamps `count` to 256
+(`PRICE_SERIES_MAX_POINTS_PER_RESPONSE`).
+
+The response starts with a 124-byte header:
+
+| Offset | Type | Field |
+| --- | --- | --- |
+| 0 | `u32` | `tick` at response time |
+| 4 | `u16` | `epoch` |
+| 6 | `u8` | `synced`, `1` when the series is usable |
+| 7 | `u8` | `bound`, `1` while an oracle query is bound |
+| 8 | `u32` | `source`: `1` bootstrap, `2` epoch switch, `3` F6, `4` snapshot |
+| 12 | `u32` | `next_hour`, the first hour not yet appended |
+| 16 | `u32` | `failed_attempts` for `next_hour` |
+| 20 | `i64` | `first_fail_ms` |
+| 28 | `i64` | `last_fail_ms` |
+| 36 | `[u8; 32]` | `series_digest` |
+| 68 | `u64` | `num_success` |
+| 76 | `u64` | `num_timeout` |
+| 84 | `u64` | `num_unresolvable` |
+| 92 | `u64` | `num_invalid_reply` |
+| 100 | `u64` | `num_start_failed` |
+| 108 | `u64` | `num_filled` |
+| 116 | `u32` | `base_hour`, the last hour known when the epoch began |
+| 120 | `u32` | `count`, number of points that follow |
+
+Each point is 20 bytes: `u32 hour`, `u32 append_tick`, `u32 flags`, `i64 price_e8`.
+`price_e8` is the whole-USDT price scaled by `1e8`. Bit `0` of `flags`
+(`BTC_PRICE_FLAG_FILLED`) marks an hour whose price was filled from the previous hour after
+the feed gave up. The payload is exactly `124 + count * 20` bytes: a node omits hours it
+does not hold, so `count` can be less than the requested count and a point's `hour` can
+skip ahead.
+
+`base_hour` anchors the epoch task window. For target `t` of an epoch, the relevant hour is
+`base_hour - 8759 + t`; hours before `base_hour` are fixed for that epoch. Never assume
+`from_hour + i == points[i].hour`.
+
 ### `LogRanges` (65,632 bytes)
 
 | Offset | Type | Field |
@@ -342,6 +442,42 @@ Recognized custom op codes:
 The `END_EPOCH` custom event is the signal used to synthesize the virtual end-epoch tick.
 It is not a normal transaction and does not have a transaction slot.
 
+### Price series (variable)
+
+`RespondPriceSeries` starts with a 124-byte header followed by `count` 20-byte points.
+The payload is exactly `124 + count * 20` bytes; a peer omits hours it does not hold and
+sets `count` to the number of points actually present.
+
+| Offset | Type | Field |
+| --- | --- | --- |
+| 0 | `u32` | `tick`, the peer's current tick |
+| 4 | `u16` | `epoch` |
+| 6 | `u8` | `synced`, 1 when the peer holds a usable series |
+| 7 | `u8` | `bound`, 1 while a query for `next_hour` is running |
+| 8 | `u32` | `source`, 1 bootstrap, 2 epoch switch, 3 F6, 4 snapshot |
+| 12 | `u32` | `next_hour`, first hour not stored yet |
+| 16 | `u32` | `failed_attempts` for `next_hour` |
+| 20 | `i64` | `first_fail_ms` |
+| 28 | `i64` | `last_fail_ms` |
+| 36 | `[u8; 32]` | `series_digest` |
+| 68 | `u64` | `num_success` |
+| 76 | `u64` | `num_timeout` |
+| 84 | `u64` | `num_unresolvable` |
+| 92 | `u64` | `num_invalid_reply` |
+| 100 | `u64` | `num_start_failed` |
+| 108 | `u64` | `num_filled` |
+| 116 | `u32` | `base_hour`, last hour known when the epoch began |
+| 120 | `u32` | `count`, points that follow |
+| 124 | point * `count` | points |
+
+Each point is `u32 hour`, `u32 append_tick`, `u32 flags`, `i64 price_e8`. Flag bit 0 marks
+an hour filled with the previous hour's price. `price_e8` is the price in 0.00000001 USDT.
+Hours are counted from 2022-04-13 12:00:00 UTC. A peer returns at most 256 points per
+response, so request a larger range in pages.
+
+`RequestPriceSeries` is `u32 from_hour`, `u32 count`. A count above 256 is clamped by the
+peer. Hours before `from_hour` are never included.
+
 ## Request payloads
 
 | Request | Payload | Total |
@@ -353,6 +489,9 @@ It is not a normal transaction and does not have a transaction slot.
 | `RequestTickTransactions` | `u32 tick`, 512-byte known-tx bitmap | 516 |
 | `RequestAllLogIdRangesFromTx` | passcode `[u64; 4]`, `u32 tick` | 36 |
 | `RequestLog` | passcode `[u64; 4]`, `u64 from_log_id`, `u64 to_log_id` | 48 |
+| `RequestPriceSeries` | `u32 from_hour`, `u32 count` | 8 |
+| `RequestIssuedAssets`, `RequestOwnedAssets`, `RequestPossessedAssets` | `[u8; 32] public_key` | 32 |
+| `RequestAssets` | `u16 request_type`, `u16 flags`, type-specific filter fields | 8 or 112 |
 | `ExchangePublicPeers` | four `[u8; 4]` IPv4 addresses | 16 |
 
 The known-vote and known-transaction bitmaps let the client ask only for entries it does

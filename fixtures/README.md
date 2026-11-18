@@ -31,7 +31,11 @@ epoch `240`), except `computors.bin` and `logs.bin` from `109.123.229.239`.
 | `contract_ipo.bin` | `REQUEST_CONTRACT_IPO` (33) | `RESPOND_CONTRACT_IPO` (34) | 27056 | contract 1 |
 | `contract_function_empty.bin` | `REQUEST_CONTRACT_FUNCTION` (42) | `RESPOND_CONTRACT_FUNCTION` (43) | 8 | empty output |
 | `logs.bin` | `REQUEST_LOG` (44) | `RESPOND_LOG` (45) | 1186 | 11 records at tick 91910000 |
+| `issued_assets.bin` | `REQUEST_ISSUED_ASSETS` (36) | `RESPOND_ISSUED_ASSETS` (37) | 832 | zero public key, one of 31 records |
+| `price_series.bin` | `REQUEST_PRICE_SERIES` (78) | `RESPOND_PRICE_SERIES` (79) | 532 | 20 hourly points from hour 40300 |
 
 The fixtures are unmodified protocol frames. `crates/qubic/tests/wire_vectors.rs`
 contains golden tests that decode each payload, round-trip it through the Rust
-codec, and re-encode `logs.bin` byte-for-byte.
+codec, and re-encode `logs.bin` byte-for-byte. The price series frame is covered
+by `crates/qubic/tests/price_series.rs`, which also checks the variable
+`124 + count * 20` payload size.

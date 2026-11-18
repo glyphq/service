@@ -31,6 +31,10 @@ fn core_sizes_match_headers() {
     assert_eq!(RESPOND_ISSUED_ASSETS_SIZE, 824);
     assert_eq!(RESPOND_OWNED_ASSETS_SIZE, 872);
     assert_eq!(RESPOND_POSSESSED_ASSETS_SIZE, 920);
+    assert_eq!(REQUEST_PRICE_SERIES_SIZE, 8);
+    assert_eq!(RESPOND_PRICE_SERIES_HEADER_SIZE, 124);
+    assert_eq!(RESPOND_PRICE_SERIES_POINT_SIZE, 20);
+    assert_eq!(PRICE_SERIES_MAX_POINTS, 256);
     assert_eq!(ENTITY_RECORD_SIZE, 64);
     assert_eq!(RESPOND_ENTITY_SIZE, 840);
     assert_eq!(RESPOND_SYSTEM_INFO_SIZE, 128);
@@ -1060,6 +1064,36 @@ fn golden_live_query_packets_round_trip() {
         asset.asset.kind,
         AssetRecordKind::Issuance(_) | AssetRecordKind::Empty
     ));
+
+    let Some(bytes) = live_fixture("issued_assets.bin") else {
+        return;
+    };
+    let packet = Packet::decode(&bytes).unwrap();
+    assert_eq!(packet.kind, MessageType::RespondIssuedAssets);
+    let issued = RespondIssuedAssets::decode(&packet.payload).unwrap();
+    assert_eq!(issued.encode(), packet.payload);
+    assert_eq!(issued.siblings.len(), ASSETS_DEPTH);
+
+    let Some(bytes) = live_fixture("price_series.bin") else {
+        return;
+    };
+    let packet = Packet::decode(&bytes).unwrap();
+    assert_eq!(packet.kind, MessageType::RespondPriceSeries);
+    let series = RespondPriceSeries::decode(&packet.payload).unwrap();
+    assert_eq!(series.encode(), packet.payload);
+    assert_eq!(series.tick, 91_919_063);
+    assert_eq!(series.epoch, 240);
+    assert!(series.synced);
+    assert!(!series.bound);
+    assert_eq!(series.source, PRICE_SERIES_SOURCE_BOOTSTRAP);
+    assert_eq!(series.base_hour, 40_316);
+    assert_eq!(series.next_hour, 40_325);
+    assert_eq!(series.count, 20);
+    assert_eq!(series.points.len(), 20);
+    assert_eq!(series.points[0].hour, 40_300);
+    assert_eq!(series.points[0].append_tick, 0);
+    assert_eq!(series.points[0].flags & PRICE_POINT_FLAG_FILLED, 0);
+    assert_eq!(series.points[0].price_e8, 6_411_509_000_000);
 
     let Some(bytes) = live_fixture("contract_ipo.bin") else {
         return;

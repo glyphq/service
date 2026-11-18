@@ -5,12 +5,15 @@ use std::time::Duration;
 use qubic::LogEvent;
 use qubic::crypto::schnorrq;
 use qubic::messages::{
-    COMPUTOR_COUNT, Computors, CurrentTickInfo, LOG_TX_PER_TICK, LogRanges, MAX_AMOUNT,
-    MAX_INPUT_SIZE, PeerAddress, RespondContractFunction, RespondEntity, RespondTxStatus,
-    TX_PER_TICK, Tick, TickData, Transaction, request_all_log_ranges, request_computors,
-    request_contract_function, request_current_tick_info, request_entity, request_logs,
-    request_quorum_tick, request_tick_data, request_tick_transactions, request_transaction_info,
-    request_tx_status,
+    ASSET_REQUEST_GET_SIBLINGS, COMPUTOR_COUNT, Computors, CurrentTickInfo, LOG_TX_PER_TICK,
+    LogRanges, MAX_AMOUNT, MAX_INPUT_SIZE, PRICE_SERIES_MAX_POINTS, PeerAddress, RequestAssets,
+    RespondAssets, RespondAssetsWithSiblings, RespondContractFunction, RespondEntity,
+    RespondIssuedAssets, RespondOwnedAssets, RespondPossessedAssets, RespondPriceSeries,
+    RespondTxStatus, TX_PER_TICK, Tick, TickData, Transaction, request_all_log_ranges,
+    request_assets, request_computors, request_contract_function, request_current_tick_info,
+    request_entity, request_issued_assets, request_logs, request_owned_assets,
+    request_possessed_assets, request_price_series, request_quorum_tick, request_tick_data,
+    request_tick_transactions, request_transaction_info, request_tx_status,
 };
 use qubic::wire::{HEADER_SIZE, MessageType, Packet};
 use serde::Serialize;
@@ -32,6 +35,9 @@ const LOG_FALLBACK_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Guard against a peer that keeps returning a partial log page forever.
 const MAX_LOG_PAGES: u32 = 1024;
+
+/// Guard against a peer that streams an unbounded asset response.
+const MAX_ASSET_RECORDS: usize = 1_000_000;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -164,6 +170,70 @@ impl TransactionStatus {
 
     pub fn contains(&self, digest: &[u8; 32]) -> bool {
         self.money_flew_for(digest).is_some()
+    }
+}
+
+/// One record from a `RequestAssets` response.
+///
+/// The peer sends the fixed [`RespondAssets`] record unless the request set
+/// [`ASSET_REQUEST_GET_SIBLINGS`], in which case the payload also carries the
+/// asset-tree proof as [`RespondAssetsWithSiblings`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssetRecordResponse {
+    Asset(RespondAssets),
+    WithSiblings(RespondAssetsWithSiblings),
+}
+
+/// Common fields of a plain or sibling asset response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AssetRecordView<'a> {
+    pub asset: &'a qubic::messages::AssetRecord,
+    pub tick: u32,
+    pub universe_index: u32,
+}
+
+impl AssetRecordResponse {
+    pub fn asset(&self) -> AssetRecordView<'_> {
+        match self {
+            Self::Asset(asset) => AssetRecordView {
+                asset: &asset.asset,
+                tick: asset.tick,
+                universe_index: asset.universe_index,
+            },
+            Self::WithSiblings(asset) => AssetRecordView {
+                asset: &asset.asset,
+                tick: asset.tick,
+                universe_index: asset.universe_index,
+            },
+        }
+    }
+
+    pub fn record(&self) -> &qubic::messages::AssetRecord {
+        match self {
+            Self::Asset(asset) => &asset.asset,
+            Self::WithSiblings(asset) => &asset.asset,
+        }
+    }
+
+    pub fn tick(&self) -> u32 {
+        match self {
+            Self::Asset(asset) => asset.tick,
+            Self::WithSiblings(asset) => asset.tick,
+        }
+    }
+
+    pub fn universe_index(&self) -> u32 {
+        match self {
+            Self::Asset(asset) => asset.universe_index,
+            Self::WithSiblings(asset) => asset.universe_index,
+        }
+    }
+
+    pub fn siblings(&self) -> Option<&[[u8; 32]]> {
+        match self {
+            Self::Asset(_) => None,
+            Self::WithSiblings(asset) => Some(&asset.siblings),
+        }
     }
 }
 
@@ -460,6 +530,111 @@ impl Peer {
                 .map(|(digest, money_flew)| TransactionStatusEntry { digest, money_flew })
                 .collect(),
         })
+    }
+
+    /// Requests up to [`PRICE_SERIES_MAX_POINTS`] hourly price points starting
+    /// at `from_hour`.
+    ///
+    /// `count` is clamped to 256, which is what a core enforces on its side.
+    pub async fn price_series(&mut self, from_hour: u32, count: u32) -> Result<RespondPriceSeries> {
+        let count = count.min(PRICE_SERIES_MAX_POINTS as u32);
+        let packet = self
+            .request_single(
+                MessageType::RequestPriceSeries,
+                request_price_series(from_hour, count),
+                MessageType::RespondPriceSeries,
+            )
+            .await?;
+        Ok(RespondPriceSeries::decode(&packet.payload)?)
+    }
+
+    /// Requests every asset issued by `public_key`, in peer order.
+    ///
+    /// A peer with no matches answers `EndResponse` directly, giving an empty
+    /// result. Responses are streamed until `EndResponse`, with an upper bound
+    /// of [`MAX_ASSET_RECORDS`] records.
+    pub async fn issued_assets(
+        &mut self,
+        public_key: [u8; 32],
+    ) -> Result<Vec<RespondIssuedAssets>> {
+        let packets = self
+            .request_stream_bounded(
+                MessageType::RequestIssuedAssets,
+                request_issued_assets(public_key),
+                MessageType::RespondIssuedAssets,
+                MAX_ASSET_RECORDS,
+            )
+            .await?;
+        packets
+            .iter()
+            .map(|packet| Ok(RespondIssuedAssets::decode(&packet.payload)?))
+            .collect()
+    }
+
+    /// Requests every asset owned by `public_key`, in peer order.
+    pub async fn owned_assets(&mut self, public_key: [u8; 32]) -> Result<Vec<RespondOwnedAssets>> {
+        let packets = self
+            .request_stream_bounded(
+                MessageType::RequestOwnedAssets,
+                request_owned_assets(public_key),
+                MessageType::RespondOwnedAssets,
+                MAX_ASSET_RECORDS,
+            )
+            .await?;
+        packets
+            .iter()
+            .map(|packet| Ok(RespondOwnedAssets::decode(&packet.payload)?))
+            .collect()
+    }
+
+    /// Requests every asset possessed by `public_key`, in peer order.
+    pub async fn possessed_assets(
+        &mut self,
+        public_key: [u8; 32],
+    ) -> Result<Vec<RespondPossessedAssets>> {
+        let packets = self
+            .request_stream_bounded(
+                MessageType::RequestPossessedAssets,
+                request_possessed_assets(public_key),
+                MessageType::RespondPossessedAssets,
+                MAX_ASSET_RECORDS,
+            )
+            .await?;
+        packets
+            .iter()
+            .map(|packet| Ok(RespondPossessedAssets::decode(&packet.payload)?))
+            .collect()
+    }
+
+    /// Requests asset records matching an arbitrary [`RequestAssets`] filter or
+    /// universe index, in peer order.
+    pub async fn asset_records(
+        &mut self,
+        request: &RequestAssets,
+    ) -> Result<Vec<AssetRecordResponse>> {
+        let with_siblings = request.flags() & ASSET_REQUEST_GET_SIBLINGS != 0;
+        let packets = self
+            .request_stream_bounded(
+                MessageType::RequestAssets,
+                request_assets(request),
+                MessageType::RespondAssets,
+                MAX_ASSET_RECORDS,
+            )
+            .await?;
+        packets
+            .iter()
+            .map(|packet| {
+                if with_siblings {
+                    Ok(AssetRecordResponse::WithSiblings(
+                        RespondAssetsWithSiblings::decode(&packet.payload)?,
+                    ))
+                } else {
+                    Ok(AssetRecordResponse::Asset(RespondAssets::decode(
+                        &packet.payload,
+                    )?))
+                }
+            })
+            .collect()
     }
 
     /// Validates and broadcasts a signed transaction.
@@ -809,12 +984,26 @@ impl Peer {
         payload: Vec<u8>,
         expected: MessageType,
     ) -> Result<Vec<Packet>> {
+        self.request_stream_bounded(request, payload, expected, usize::MAX)
+            .await
+    }
+
+    async fn request_stream_bounded(
+        &mut self,
+        request: MessageType,
+        payload: Vec<u8>,
+        expected: MessageType,
+        max_packets: usize,
+    ) -> Result<Vec<Packet>> {
         let attempts = self.config.retries.saturating_add(1);
         let mut attempt = 0;
         loop {
             attempt += 1;
             let dejavu = self.send(request, payload.clone()).await?;
-            match self.receive_stream(dejavu, request, expected).await {
+            match self
+                .receive_stream(dejavu, request, expected, max_packets)
+                .await
+            {
                 Ok(packets) => return Ok(packets),
                 Err(Error::TryAgain(_)) if attempt < attempts => {
                     tracing::debug!(?request, "peer asked to try again");
@@ -896,6 +1085,7 @@ impl Peer {
         dejavu: u32,
         request: MessageType,
         expected: MessageType,
+        max_packets: usize,
     ) -> Result<Vec<Packet>> {
         let mut packets = Vec::new();
         let timeout = self.config.timeout;
@@ -923,7 +1113,19 @@ impl Peer {
                     self.pending.remove(&dejavu);
                     return Err(Error::TryAgain(request));
                 }
-                kind if kind == expected => packets.push(packet),
+                kind if kind == expected => {
+                    if packets.len() >= max_packets {
+                        // Stop reading mid-stream; the connection is no longer
+                        // at a packet boundary, so reconnect before the next
+                        // request.
+                        self.pending.remove(&dejavu);
+                        self.desynced = true;
+                        return Err(Error::InvalidRequest(format!(
+                            "peer sent more than {max_packets} {expected:?} packets"
+                        )));
+                    }
+                    packets.push(packet);
+                }
                 actual => {
                     self.pending.remove(&dejavu);
                     return Err(Error::UnexpectedPacket { expected, actual });
@@ -1058,6 +1260,44 @@ impl NodePool {
     /// Requests the confirmed transaction status for one tick.
     pub async fn tx_status(&self, tick: u32) -> Result<TransactionStatus> {
         self.connect_best().await?.tx_status(tick).await
+    }
+
+    /// Requests an hourly price series from the best currently reachable peer.
+    pub async fn price_series(&self, from_hour: u32, count: u32) -> Result<RespondPriceSeries> {
+        self.connect_best()
+            .await?
+            .price_series(from_hour, count)
+            .await
+    }
+
+    /// Requests every asset issued by `public_key` from the best currently
+    /// reachable peer.
+    pub async fn issued_assets(&self, public_key: [u8; 32]) -> Result<Vec<RespondIssuedAssets>> {
+        self.connect_best().await?.issued_assets(public_key).await
+    }
+
+    /// Requests every asset owned by `public_key` from the best currently
+    /// reachable peer.
+    pub async fn owned_assets(&self, public_key: [u8; 32]) -> Result<Vec<RespondOwnedAssets>> {
+        self.connect_best().await?.owned_assets(public_key).await
+    }
+
+    /// Requests every asset possessed by `public_key` from the best currently
+    /// reachable peer.
+    pub async fn possessed_assets(
+        &self,
+        public_key: [u8; 32],
+    ) -> Result<Vec<RespondPossessedAssets>> {
+        self.connect_best()
+            .await?
+            .possessed_assets(public_key)
+            .await
+    }
+
+    /// Requests asset records matching a filter from the best currently
+    /// reachable peer.
+    pub async fn asset_records(&self, request: &RequestAssets) -> Result<Vec<AssetRecordResponse>> {
+        self.connect_best().await?.asset_records(request).await
     }
 
     /// Validates and broadcasts a signed transaction via the best currently
@@ -1212,7 +1452,11 @@ fn first_vote_or_synthetic(votes: &[Tick], data: &TickData, tick: u32) -> Result
 mod tests {
     use super::*;
     use qubic::messages::{
-        EntityRecord, LOG_TX_PER_TICK, MAX_CONTRACTS, SPECTRUM_DEPTH, TX_PER_TICK,
+        ASSET_REQUEST_GET_SIBLINGS, ASSETS_DEPTH, AssetIssuanceRecord, AssetOwnershipRecord,
+        AssetPossessionRecord, AssetRecord, AssetRecordKind, EntityRecord, LOG_TX_PER_TICK,
+        MAX_CONTRACTS, PRICE_SERIES_MAX_POINTS, RESPOND_PRICE_SERIES_HEADER_SIZE,
+        RESPOND_PRICE_SERIES_POINT_SIZE, RespondPriceSeries, RespondPriceSeriesPoint,
+        SPECTRUM_DEPTH, TX_PER_TICK,
     };
     use qubic::wire::{Header, MessageType, Packet};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1311,6 +1555,14 @@ mod tests {
         out.extend_from_slice(&0u64.to_le_bytes());
         out.extend_from_slice(&body);
         out
+    }
+
+    const PRICE_SERIES_FIXTURE: &[u8] = include_bytes!("../../../fixtures/price_series.bin");
+    const ISSUED_ASSETS_FIXTURE: &[u8] = include_bytes!("../../../fixtures/issued_assets.bin");
+    const ASSETS_SIBLINGS_FIXTURE: &[u8] = include_bytes!("../../../fixtures/assets_issuance.bin");
+
+    fn fixture_payload(bytes: &[u8]) -> Vec<u8> {
+        Packet::decode(bytes).unwrap().payload
     }
 
     async fn fake_peer(listener: TcpListener) {
@@ -1515,6 +1767,35 @@ mod tests {
                         send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
                     }
                 }
+                MessageType::RequestPriceSeries => {
+                    send(
+                        &mut stream,
+                        MessageType::RespondPriceSeries,
+                        dejavu,
+                        fixture_payload(PRICE_SERIES_FIXTURE),
+                    )
+                    .await;
+                }
+                MessageType::RequestIssuedAssets => {
+                    send(
+                        &mut stream,
+                        MessageType::RespondIssuedAssets,
+                        dejavu,
+                        fixture_payload(ISSUED_ASSETS_FIXTURE),
+                    )
+                    .await;
+                    send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                }
+                MessageType::RequestAssets => {
+                    send(
+                        &mut stream,
+                        MessageType::RespondAssets,
+                        dejavu,
+                        fixture_payload(ASSETS_SIBLINGS_FIXTURE),
+                    )
+                    .await;
+                    send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                }
                 _ => {}
             }
         }
@@ -1552,6 +1833,35 @@ mod tests {
         assert_eq!(head.epoch, 240);
         assert_eq!(head.initial_tick, 900);
         assert_eq!(head.tick_duration, 1000);
+    }
+
+    #[tokio::test]
+    async fn price_series_and_asset_requests_use_fixtures() {
+        let mut peer = peer_and_server().await;
+
+        let series = peer.price_series(40_300, 1000).await.unwrap();
+        assert_eq!(series.count, 20);
+        assert_eq!(series.points.len(), 20);
+        assert_eq!(series.points[0].hour, 40_300);
+        assert_eq!(series.base_hour, 40_316);
+        assert!(series.synced);
+
+        let issued = peer.issued_assets([0; 32]).await.unwrap();
+        assert_eq!(issued.len(), 1);
+        assert_eq!(issued[0].siblings.len(), ASSETS_DEPTH);
+        assert!(matches!(
+            issued[0].asset.kind,
+            AssetRecordKind::Issuance(_) | AssetRecordKind::Empty
+        ));
+
+        let request = RequestAssets::ByUniverseIndex {
+            flags: ASSET_REQUEST_GET_SIBLINGS,
+            universe_index: 0,
+        };
+        let records = peer.asset_records(&request).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].universe_index(), 0);
+        assert_eq!(records[0].siblings().unwrap().len(), ASSETS_DEPTH);
     }
 
     #[tokio::test]
@@ -1952,6 +2262,46 @@ mod tests {
             .expect("fixture transaction decodes")
     }
 
+    fn issuance_record(key: u8, name: &[u8; 7]) -> AssetRecord {
+        AssetRecord {
+            public_key: [key; 32],
+            kind: AssetRecordKind::Issuance(AssetIssuanceRecord {
+                public_key: [key; 32],
+                name: *name,
+                decimals: 0,
+                unit: *b"0000000",
+            }),
+        }
+    }
+
+    fn ownership_record(key: u8, shares: i64) -> AssetRecord {
+        AssetRecord {
+            public_key: [key; 32],
+            kind: AssetRecordKind::Ownership(AssetOwnershipRecord {
+                public_key: [key; 32],
+                managing_contract_index: 1,
+                issuance_index: 10,
+                shares,
+            }),
+        }
+    }
+
+    fn possession_record(key: u8, shares: i64) -> AssetRecord {
+        AssetRecord {
+            public_key: [key; 32],
+            kind: AssetRecordKind::Possession(AssetPossessionRecord {
+                public_key: [key; 32],
+                managing_contract_index: 2,
+                ownership_index: 5,
+                shares,
+            }),
+        }
+    }
+
+    fn assets_siblings() -> Vec<[u8; 32]> {
+        vec![[0u8; 32]; ASSETS_DEPTH]
+    }
+
     async fn fake_peer_advanced(
         listener: TcpListener,
         sent: tokio::sync::mpsc::UnboundedSender<(MessageType, u32, Vec<u8>)>,
@@ -2043,6 +2393,141 @@ mod tests {
                     )
                     .await;
                 }
+                MessageType::RequestIssuedAssets => {
+                    assert_eq!(payload.len(), 32);
+                    let public_key: [u8; 32] = payload.as_slice().try_into().unwrap();
+                    if public_key != [0u8; 32] {
+                        for (index, universe_index) in [10u32, 11].into_iter().enumerate() {
+                            let response = RespondIssuedAssets {
+                                asset: issuance_record(
+                                    index as u8 + 1,
+                                    if index == 0 {
+                                        b"QX\0\0\0\0\0"
+                                    } else {
+                                        b"QY\0\0\0\0\0"
+                                    },
+                                ),
+                                tick: 1000,
+                                universe_index,
+                                siblings: assets_siblings(),
+                            };
+                            send(
+                                &mut stream,
+                                MessageType::RespondIssuedAssets,
+                                dejavu,
+                                response.encode(),
+                            )
+                            .await;
+                        }
+                    }
+                    send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                }
+                MessageType::RequestOwnedAssets => {
+                    assert_eq!(payload.len(), 32);
+                    for (index, universe_index) in [20u32, 21].into_iter().enumerate() {
+                        let response = RespondOwnedAssets {
+                            asset: ownership_record(index as u8 + 1, 100 + index as i64),
+                            issuance_asset: issuance_record(index as u8 + 1, b"QX\0\0\0\0\0"),
+                            tick: 1000,
+                            universe_index,
+                            siblings: assets_siblings(),
+                        };
+                        send(
+                            &mut stream,
+                            MessageType::RespondOwnedAssets,
+                            dejavu,
+                            response.encode(),
+                        )
+                        .await;
+                    }
+                    send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                }
+                MessageType::RequestPossessedAssets => {
+                    assert_eq!(payload.len(), 32);
+                    for (index, universe_index) in [30u32, 31].into_iter().enumerate() {
+                        let response = RespondPossessedAssets {
+                            asset: possession_record(index as u8 + 1, 200 + index as i64),
+                            ownership_asset: ownership_record(index as u8 + 1, 100),
+                            issuance_asset: issuance_record(index as u8 + 1, b"QX\0\0\0\0\0"),
+                            tick: 1000,
+                            universe_index,
+                            siblings: assets_siblings(),
+                        };
+                        send(
+                            &mut stream,
+                            MessageType::RespondPossessedAssets,
+                            dejavu,
+                            response.encode(),
+                        )
+                        .await;
+                    }
+                    send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                }
+                MessageType::RequestAssets => {
+                    assert_eq!(payload.len(), qubic::messages::REQUEST_ASSETS_SIZE);
+                    let request = RequestAssets::decode(&payload).unwrap();
+                    for universe_index in [40u32, 41] {
+                        let response = RespondAssets {
+                            asset: issuance_record(1, b"QX\0\0\0\0\0"),
+                            tick: 1000,
+                            universe_index,
+                        };
+                        let payload =
+                            if request.flags() & qubic::messages::ASSET_REQUEST_GET_SIBLINGS != 0 {
+                                RespondAssetsWithSiblings {
+                                    asset: response.asset,
+                                    tick: response.tick,
+                                    universe_index: response.universe_index,
+                                    siblings: assets_siblings(),
+                                }
+                                .encode()
+                            } else {
+                                response.encode()
+                            };
+                        send(&mut stream, MessageType::RespondAssets, dejavu, payload).await;
+                    }
+                    send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                }
+                MessageType::RequestPriceSeries => {
+                    let request = qubic::messages::RequestPriceSeries::decode(&payload).unwrap();
+                    assert!(request.count <= PRICE_SERIES_MAX_POINTS as u32);
+                    let points = (0..request.count)
+                        .map(|offset| RespondPriceSeriesPoint {
+                            hour: request.from_hour + offset,
+                            append_tick: 1000 + offset,
+                            flags: if offset % 2 == 0 { 1 } else { 0 },
+                            price_e8: 1_000_000_000 + offset as i64,
+                        })
+                        .collect::<Vec<_>>();
+                    let response = RespondPriceSeries {
+                        tick: 1000,
+                        epoch: 240,
+                        synced: true,
+                        bound: false,
+                        source: 3,
+                        next_hour: request.from_hour + request.count,
+                        failed_attempts: 0,
+                        first_fail_ms: 0,
+                        last_fail_ms: 0,
+                        series_digest: [0xab; 32],
+                        num_success: 1,
+                        num_timeout: 0,
+                        num_unresolvable: 0,
+                        num_invalid_reply: 0,
+                        num_start_failed: 0,
+                        num_filled: points.len() as u64,
+                        base_hour: 100,
+                        count: points.len() as u32,
+                        points,
+                    };
+                    send(
+                        &mut stream,
+                        MessageType::RespondPriceSeries,
+                        dejavu,
+                        response.encode(),
+                    )
+                    .await;
+                }
                 MessageType::BroadcastTransaction => {
                     sent.send((kind, dejavu, payload)).unwrap();
                 }
@@ -2131,6 +2616,179 @@ mod tests {
         assert!(!status.transactions[1].money_flew);
         assert_eq!(status.money_flew_for(&[2; 32]), Some(false));
         assert!(!status.contains(&[3; 32]));
+    }
+
+    #[tokio::test]
+    async fn issued_assets_empty_then_multiple_in_order() {
+        let (mut peer, _sent) = advanced_peer().await;
+        let empty = peer.issued_assets([0; 32]).await.unwrap();
+        assert!(empty.is_empty());
+
+        let issued = peer.issued_assets([7; 32]).await.unwrap();
+        assert_eq!(issued.len(), 2);
+        assert_eq!(issued[0].universe_index, 10);
+        assert_eq!(issued[1].universe_index, 11);
+        assert_eq!(issued[0].asset, issuance_record(1, b"QX\0\0\0\0\0"));
+        assert_eq!(issued[1].asset, issuance_record(2, b"QY\0\0\0\0\0"));
+        assert_eq!(issued[0].siblings.len(), ASSETS_DEPTH);
+    }
+
+    #[tokio::test]
+    async fn owned_and_possessed_assets_keep_peer_order() {
+        let (mut peer, _sent) = advanced_peer().await;
+
+        let owned = peer.owned_assets([7; 32]).await.unwrap();
+        assert_eq!(owned.len(), 2);
+        assert_eq!(owned[0].universe_index, 20);
+        assert_eq!(owned[1].universe_index, 21);
+        match &owned[0].asset.kind {
+            AssetRecordKind::Ownership(record) => assert_eq!(record.shares, 100),
+            other => panic!("unexpected owned asset kind: {other:?}"),
+        }
+        match &owned[1].asset.kind {
+            AssetRecordKind::Ownership(record) => assert_eq!(record.shares, 101),
+            other => panic!("unexpected owned asset kind: {other:?}"),
+        }
+
+        let possessed = peer.possessed_assets([7; 32]).await.unwrap();
+        assert_eq!(possessed.len(), 2);
+        assert_eq!(possessed[0].universe_index, 30);
+        assert_eq!(possessed[1].universe_index, 31);
+        match &possessed[1].asset.kind {
+            AssetRecordKind::Possession(record) => assert_eq!(record.shares, 201),
+            other => panic!("unexpected possessed asset kind: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn asset_records_decode_plain_and_sibling_responses() {
+        let (mut peer, _sent) = advanced_peer().await;
+        let plain = peer
+            .asset_records(&RequestAssets::ByUniverseIndex {
+                flags: 0,
+                universe_index: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(plain.len(), 2);
+        assert!(matches!(
+            &plain[0],
+            AssetRecordResponse::Asset(asset) if asset.universe_index == 40
+        ));
+        assert!(matches!(
+            &plain[1],
+            AssetRecordResponse::Asset(asset) if asset.universe_index == 41
+        ));
+
+        let with_siblings = peer
+            .asset_records(&RequestAssets::ByFilter {
+                request_type: qubic::messages::ASSET_REQUEST_ISSUANCE,
+                flags: qubic::messages::ASSET_REQUEST_GET_SIBLINGS,
+                ownership_managing_contract: 0,
+                possession_managing_contract: 0,
+                issuer: [1; 32],
+                asset_name: 0,
+                owner: [0; 32],
+                possessor: [0; 32],
+            })
+            .await
+            .unwrap();
+        assert_eq!(with_siblings.len(), 2);
+        assert!(matches!(
+            &with_siblings[0],
+            AssetRecordResponse::WithSiblings(asset)
+                if asset.universe_index == 40 && asset.siblings.len() == ASSETS_DEPTH
+        ));
+        assert_eq!(with_siblings[0].universe_index(), 40);
+    }
+
+    #[tokio::test]
+    async fn price_series_round_trip_and_clamps_count() {
+        let (mut peer, _sent) = advanced_peer().await;
+        let series = peer.price_series(500, 3).await.unwrap();
+        assert_eq!(series.tick, 1000);
+        assert_eq!(series.epoch, 240);
+        assert!(series.synced);
+        assert!(!series.bound);
+        assert_eq!(series.count, 3);
+        assert_eq!(series.points.len(), 3);
+        assert_eq!(series.points[0].hour, 500);
+        assert_eq!(series.points[0].flags, 1);
+        assert_eq!(series.points[1].hour, 501);
+        assert_eq!(series.points[1].append_tick, 1001);
+        assert_eq!(series.points[2].price_e8, 1_000_000_002);
+
+        let clamped = peer.price_series(500, 10_000).await.unwrap();
+        assert_eq!(clamped.count, PRICE_SERIES_MAX_POINTS as u32);
+        assert_eq!(clamped.points.len(), PRICE_SERIES_MAX_POINTS);
+    }
+
+    async fn malformed_price_peer() -> Peer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            send(
+                &mut stream,
+                MessageType::ExchangePublicPeers,
+                77,
+                vec![0u8; 16],
+            )
+            .await;
+            let mut served = 0;
+            while let Some((kind, dejavu, _payload)) = read_request(&mut stream).await {
+                if kind != MessageType::RequestPriceSeries {
+                    continue;
+                }
+                served += 1;
+                let count_offset = RESPOND_PRICE_SERIES_HEADER_SIZE - 4;
+                let payload = if served == 1 {
+                    let count = PRICE_SERIES_MAX_POINTS + 1;
+                    let mut bytes = vec![
+                        0u8;
+                        RESPOND_PRICE_SERIES_HEADER_SIZE
+                            + count * RESPOND_PRICE_SERIES_POINT_SIZE
+                    ];
+                    bytes[count_offset..count_offset + 4]
+                        .copy_from_slice(&(count as u32).to_le_bytes());
+                    bytes
+                } else {
+                    // Claims two points but only one is present.
+                    let mut bytes = vec![
+                        0u8;
+                        RESPOND_PRICE_SERIES_HEADER_SIZE
+                            + RESPOND_PRICE_SERIES_POINT_SIZE
+                    ];
+                    bytes[count_offset..count_offset + 4].copy_from_slice(&2u32.to_le_bytes());
+                    bytes
+                };
+                send(
+                    &mut stream,
+                    MessageType::RespondPriceSeries,
+                    dejavu,
+                    payload,
+                )
+                .await;
+            }
+        });
+        Peer::connect(
+            PeerConfig::new(addr)
+                .with_timeout(Duration::from_secs(2))
+                .with_connect_timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn price_series_rejects_oversized_and_short_responses() {
+        let mut peer = malformed_price_peer().await;
+        for _ in 0..2 {
+            assert!(matches!(
+                peer.price_series(500, 2).await,
+                Err(Error::Wire(qubic::Error::InvalidPacket(_)))
+            ));
+        }
     }
 
     #[tokio::test]
