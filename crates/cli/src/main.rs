@@ -27,6 +27,9 @@ enum Command {
     Peers {
         #[arg(long, default_value = "157.180.10.49:21841")]
         peer: SocketAddr,
+        /// Discover peers and print per-peer health, score, and quarantine.
+        #[arg(long)]
+        health: bool,
     },
     /// Fetch one tick bundle, verify it, and print a summary.
     Tick {
@@ -39,8 +42,14 @@ enum Command {
     },
     /// Run the indexer from the current epoch initial tick.
     Sync {
-        /// Peer addresses; repeat the flag to configure failover.
-        #[arg(long = "peer", default_value = "157.180.10.49:21841")]
+        /// Peer addresses; repeat the flag to configure failover. QUBIC_PEERS
+        /// is a comma-separated fallback.
+        #[arg(
+            long = "peer",
+            env = "QUBIC_PEERS",
+            value_delimiter = ',',
+            default_value = "157.180.10.49:21841"
+        )]
         peers: Vec<SocketAddr>,
         #[arg(long)]
         from: Option<u32>,
@@ -58,8 +67,9 @@ enum Command {
     DbInit,
     /// Serve the HTTP API.
     Serve {
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        bind: String,
+        /// Bind address. Defaults to BIND, then 127.0.0.1:8080.
+        #[arg(long, env = "BIND")]
+        bind: Option<String>,
     },
 }
 
@@ -81,14 +91,27 @@ async fn main() -> anyhow::Result<()> {
                 serde_json::to_string_pretty(&serde_json::json!(head))?
             );
         }
-        Command::Peers { peer } => {
-            let connection = node::Peer::connect(PeerConfig::new(peer)).await?;
-            let peers: Vec<String> = connection
-                .public_peers()
-                .iter()
-                .map(ToString::to_string)
-                .collect();
-            println!("{}", serde_json::to_string_pretty(&peers)?);
+        Command::Peers { peer, health } => {
+            if health {
+                let mut pool = NodePool::new(vec![PeerConfig::new(peer)]);
+                let discovered = pool.discover().await?;
+                let discovered: Vec<String> = discovered.iter().map(ToString::to_string).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "discovered": discovered,
+                        "health": pool.health(),
+                    }))?
+                );
+            } else {
+                let connection = node::Peer::connect(PeerConfig::new(peer)).await?;
+                let peers: Vec<String> = connection
+                    .public_peers()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&peers)?);
+            }
         }
         Command::Tick {
             tick,
@@ -138,7 +161,10 @@ async fn main() -> anyhow::Result<()> {
             progress_every,
         } => {
             if peers.is_empty() {
-                bail!("at least one --peer is required");
+                bail!("at least one --peer or QUBIC_PEERS entry is required");
+            }
+            if peers.len() > 64 {
+                bail!("at most 64 peers may be configured");
             }
             let config = IndexerConfig {
                 peers: peers.iter().copied().map(PeerConfig::new).collect(),
@@ -192,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
             let db = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "glyph".into());
             let store: Arc<dyn Store> = Arc::new(ClickHouseStore::new(&url, &db)?);
             store.init().await.context("initialize ClickHouse")?;
+            let bind = bind.unwrap_or_else(|| "127.0.0.1:8080".to_string());
             api::serve(store, &bind).await?;
         }
     }
@@ -296,7 +323,7 @@ mod tests {
     fn serve_defaults_to_loopback_8080() {
         let cli = Cli::try_parse_from(["glyph", "serve"]).unwrap();
         match cli.command {
-            Command::Serve { bind } => assert_eq!(bind, "127.0.0.1:8080"),
+            Command::Serve { bind } => assert_eq!(bind, None),
             _ => panic!("expected serve command"),
         }
     }
