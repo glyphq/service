@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -48,8 +47,7 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -58,12 +56,19 @@ async fn main() -> anyhow::Result<()> {
         Command::Head { peer } => {
             let pool = NodePool::new(vec![PeerConfig::new(peer)]);
             let head = pool.head().await?;
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!(head))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!(head))?
+            );
         }
         Command::Peers { peer } => {
-            let pool = NodePool::new(vec![PeerConfig::new(peer)]);
-            let _head = pool.head().await?;
-            println!("peer exchange is implemented by the node crate");
+            let connection = node::Peer::connect(PeerConfig::new(peer)).await?;
+            let peers: Vec<String> = connection
+                .public_peers()
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&peers)?);
         }
         Command::Tick { tick, peer } => {
             let pool = NodePool::new(vec![PeerConfig::new(peer)]);
@@ -83,12 +88,16 @@ async fn main() -> anyhow::Result<()> {
         Command::Sync { peer, from } => {
             let pool = NodePool::new(vec![PeerConfig::new(peer)]);
             let head = pool.head().await?;
-            println!("syncing from {} to {}", from.unwrap_or(head.initial_tick), head.tick);
+            println!(
+                "syncing from {} to {}",
+                from.unwrap_or(head.initial_tick),
+                head.tick
+            );
             anyhow::bail!("indexer sync loop is not wired yet");
         }
         Command::DbInit => {
-            let url = std::env::var("CLICKHOUSE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8123".into());
+            let url =
+                std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
             let db = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "glyph".into());
             let store = ClickHouseStore::new(&url, &db)?;
             store.init().await.context("initialize ClickHouse")?;

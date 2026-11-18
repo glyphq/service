@@ -7,12 +7,12 @@ license.workspace = true
 
 [dependencies]
 qubic = { path = "../qubic" }
-bytes.workspace = true
-dashmap.workspace = true
-futures.workspace = true
-parking_lot.workspace = true
 rand.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+hex.workspace = true
