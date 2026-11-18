@@ -18,7 +18,10 @@ a load balancer; see [Scaling the API](#scaling-the-api).
 ## Prerequisites
 
 - Docker Engine 24 or newer with the Compose v2 plugin (`docker compose`).
-- About 4 GB of RAM for ClickHouse, MinIO, the API, and the indexer together.
+- 8 GB of RAM is the practical minimum for ClickHouse, MinIO, the API, and the
+  indexer together; 16 GB is recommended for production. Two vCPUs are workable
+  for testing, but 4 vCPUs are recommended for full signature verification,
+  ClickHouse merges, and API traffic at the same time.
 - Disk for ClickHouse data. Budget roughly **20 GB per retained epoch** at
   current activity. See [Capacity estimates](ARCHITECTURE.md#capacity-estimates)
   and the sizing notes in the [README](../README.md#system-requirements).
@@ -99,9 +102,15 @@ and the stack is reachable only from the same machine.
 | `QUBIC_PEERS` | `157.180.10.49:21841` | Comma-separated peer addresses used by the indexer and by peer-backed API routes. |
 | `ALLOW_BROADCAST` | `false` | Set `true` to enable `POST /v1/transactions`. Keep disabled unless the API is trusted. |
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval. |
+| `PRICE_POLL_MS` | `60000` | Live QUBIC/USDT oracle price refresh interval in the API. |
 | `GLYPH_FROM_TICK` | unset | Optional first tick when there is no stored cursor. |
 | `INDEXER_POLL_MS` | `750` | Head poll interval once caught up. |
 | `INDEXER_PROGRESS_EVERY` | `100` | Log progress every N indexed ticks. |
+| `INDEXER_FETCH_CONCURRENCY` | `32` | Concurrent peer connections used by fetch workers. Raise for backfill, lower on a small host. |
+| `INDEXER_FETCH_WINDOW` | `512` | Maximum ticks in flight or buffered before the ordered writer. Memory scales with this value. |
+| `INDEXER_WRITE_BATCH` | `128` | Maximum ticks per ClickHouse insert batch. |
+| `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before an idle partial batch is flushed. |
+| `INDEXER_DISCOVER_PEERS` | `false` | Append IPv4 peers advertised through `ExchangePublicPeers`, using port `21841`. |
 | `GLYPH_VERIFY_SIGNATURES` | `true` | Set `false` to skip SchnorrQ checks. Keep enabled for live ingest. |
 | `S3_ENDPOINT` | `http://minio:9000` | S3 endpoint inside the Compose network, passed to the archive client and `minio-init`. |
 | `S3_BUCKET` | `glyph-archive` | Bucket created by `minio-init` and used by the archive client. |
@@ -403,3 +412,64 @@ platform.
 The non-Docker workflow (`scripts/dev-up.sh`, `scripts/dev-down.sh`, and a local
 ClickHouse binary) remains available for development. The Docker stack and the
 host stack must not run at the same time with default ports.
+
+## Bare-metal systemd + Caddy
+
+Production can run the same two processes without Docker. This is the intended
+layout for a small dedicated host:
+
+| Path | Contents |
+| --- | --- |
+| `/opt/glyph/glyph`, `/opt/glyph/glyph-api` | Release binaries |
+| `/etc/glyph/api.env`, `/etc/glyph/indexer.env` | Environment files from `deploy/systemd/` |
+| `/var/lib/glyph` | Optional filesystem archive |
+| `/etc/systemd/system/glyph-*.service` | Units from `deploy/systemd/` |
+
+Build both binaries with the pinned toolchain and install them as an
+unprivileged `glyph` user:
+
+```bash
+cargo build --release --locked -p cli -p api
+sudo useradd --system --home /var/lib/glyph \
+  --shell /usr/sbin/nologin glyph 2>/dev/null || true
+sudo install -d -o glyph -g glyph /opt/glyph /etc/glyph /var/lib/glyph
+sudo install -m 0755 target/release/glyph target/release/glyph-api /opt/glyph/
+sudo install -m 0640 -o root -g glyph \
+  deploy/systemd/api.env.example /etc/glyph/api.env
+sudo install -m 0640 -o root -g glyph \
+  deploy/systemd/indexer.env.example /etc/glyph/indexer.env
+sudo install -m 0644 deploy/systemd/glyph-api.service \
+  deploy/systemd/glyph-indexer.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now clickhouse-server glyph-indexer glyph-api
+```
+
+Edit both env files first. `QUBIC_PEERS` is a comma-separated failover list;
+`BIND` stays on `127.0.0.1:8080` so only the reverse proxy is public. The API
+creates or migrates its own ClickHouse schema at startup.
+
+Terminate TLS with Caddy. `deploy/Caddyfile` proxies `api.glyphq.org` to the
+loopback listener, enables compression and HSTS, and writes a rotated access
+log:
+
+```bash
+sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+curl -fsS https://api.glyphq.org/healthz
+```
+
+The DNS record for `api.glyphq.org` must point at the host before Caddy can
+obtain a certificate. Ports 80 and 443 must be reachable from the internet.
+
+Operational checks:
+
+```bash
+systemctl status glyph-indexer glyph-api
+journalctl -u glyph-indexer -f
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS https://api.glyphq.org/v1/status | jq .data.head
+```
+
+The indexer is the only writer. Never run two indexers against the same
+ClickHouse database. To upgrade, replace the binaries and restart in order:
+`glyph-indexer`, then `glyph-api`.

@@ -1,79 +1,60 @@
 # Glyph API
 
-Glyph API is the from-scratch Rust indexer and read API for the Glyph ecosystem. It talks
-directly to Qubic peers over TCP, verifies ticks and votes, stores normalized history in
-ClickHouse, and serves a resource-oriented HTTP API.
+Glyph API is a self-hosted indexer and read API for Qubic. It connects to Qubic peers
+over TCP, verifies what they return, stores normalized history in ClickHouse, and serves
+a resource-oriented HTTP API. There is no hosted RPC dependency and no compatibility
+layer for core-bob or other Qubic API services.
 
-The index starts at the epoch that is current on first run and moves forward. There is no
-backfill before that epoch and no compatibility layer for core-bob or other Qubic API
-services.
+The index starts at the current epoch on first run and moves forward. It can catch up
+within that epoch, follow the live network, and serve reads while ingestion continues.
 
-## Status
+## Why this exists
 
-The core loop is implemented and has been exercised against live peers:
+Most Qubic tooling treats a node or an RPC service as a black box. Glyph treats the
+protocol as the source of truth:
 
-- Direct TCP transport, `ExchangePublicPeers` handshake, current head, computors, tick
-  data, quorum votes, transactions, log ranges, and log bodies.
-- In-repo K12 and SchnorrQ. Live tick data and 451+ vote signatures verify.
+- **Direct peers.** Tick data, votes, transactions, computors, logs, entities, and
+  assets are requested from Qubic peers over the native TCP protocol.
+- **Verification at ingest.** Quorum vote groups are checked before a tick is written.
+  K12 and SchnorrQ are implemented in this repository, so verification does not depend
+  on an external RPC or a pre-verified database.
+- **Normalized history.** Transactions, typed events, identity activity, assets, and
+  prices live in ClickHouse with stable keys and projections for the read paths.
+- **Reads that match the data.** Cursor pagination, RFC 9457 errors, immutable point
+  reads, live streams, and an OpenAPI 3.1 description are part of the service.
+
+## What it provides
+
+- Live indexing from direct Qubic peers, with bounded concurrent fetch and ordered
+  writes.
 - Quorum and data verification tiers. Every stored tick records the tier it reached.
-- ClickHouse persistence with idempotent replay, cursor resume, and per-tick rows for
-  transactions, typed events, and identity flow.
-- Optional raw tick archive to local disk or S3/MinIO. One zstd-compressed QBB1 bundle
-  per verified tick, written before the tick is persisted.
-- Resource API with typed event bodies, cursor pagination, problem-details errors,
-  OpenAPI, recent activity feeds, identity transaction history, batch lookup, and
-  pre-aggregated analytics.
-- SSE and WebSocket streams that follow the verified local index head, plus optional
-  direct-peer routes for entity lookup, transaction status, contract queries, and
-  signed transaction broadcast.
-- Docker Compose stack with ClickHouse, MinIO, schema migration, API, and indexer.
-
-Current limits are deliberate:
-
-- Ingestion starts at the current epoch on first run. Earlier history is not fetched.
-- Identity `balance` is net QU flow over the indexed range, not a spectrum snapshot.
-- The `state` verification tier is reserved; ticks reach `quorum` or `data`.
-- The peer pool reconnects across configured seeds. `glyph peers` exposes addresses
-  learned through `ExchangePublicPeers`, but the indexer does not merge them into its
-  candidate set yet.
-- Broadcast is disabled unless `ALLOW_BROADCAST=true`. It is an explicit opt-in because
-  it changes network state.
-- Asset and epoch responses are derived from indexed events and ticks. Dedicated
-  materialized tables remain future work.
-
-Run `scripts/smoke.sh` to exercise the stack on your host.
-
-## System requirements
-
-| Component | Minimum | Notes |
-| --- | --- | --- |
-| OS | Linux x86_64/aarch64 or macOS | Dev scripts assume Bash. Windows is supported through WSL. |
-| Rust | 1.85 | Workspace MSRV. `rust-toolchain.toml` tracks stable; the Docker image pins 1.88. |
-| ClickHouse | 26.x | Tested with 26.11. A local binary is used, no Docker required. |
-| Memory | 2 GB RAM | 4 GB or more recommended when ClickHouse and the indexer share a host. |
-| Disk | 20 GB free | Roughly 16 GB per epoch at current activity, so size for the epochs you retain. |
-| Network | Outbound TCP | Qubic core peers on `21841`, Bob peers on `21842`. |
-| Local ports | `8080`, `8123`, `9000` | API, ClickHouse HTTP, ClickHouse native (local scripts) or MinIO S3 API (Compose). All are configurable. |
-| Tools | `cargo`, `bash`, `curl` | `jq` is optional and improves the smoke output. |
-
-An epoch is 604,800 ticks. A sizing run with 1,000 synthetic ticks at current activity
-(6.5 transactions and 13 events per tick) measured about 26 MB per 1,000 ticks with the
-schema and its projections. That is approximately **16 GB per epoch**. Budget about
-**20 GB per retained epoch** for headroom; payload sizes and activity move the number.
+- Raw tick archive as zstd-compressed QBB1 bundles on local disk or S3/MinIO.
+- REST resources for ticks, transactions, events, identities, wallets, assets, epochs,
+  the on-chain QUBIC/USDT price, analytics, search, and network status.
+- SSE and WebSocket streams that follow the verified local head.
+- Optional direct-peer routes for entity lookup, transaction status, contract queries,
+  and signed transaction broadcast.
+- A server-rendered status dashboard at `/status` and a Scalar API reference at `/docs`.
+- Docker Compose deployment with ClickHouse, MinIO, schema migration, API, and indexer,
+  plus local scripts for development without Docker.
 
 ## Quick start
 
-```bash
-# 1. Install a local ClickHouse binary (skip if ~/.local/bin/clickhouse exists).
-scripts/install-clickhouse.sh
+Requirements: Rust 1.85 or newer, Bash, and `curl`. ClickHouse is installed by the
+first script if it is missing.
 
-# 2. Start ClickHouse, apply the schema, build the binaries, start the API and indexer.
+```bash
+# Start ClickHouse, apply the schema, build, and start the API and indexer.
 scripts/dev-up.sh
 
-# 3. Check the stack: ClickHouse, API status, peer head, and a tick fetch.
+# Check ClickHouse, API status, peer head, and a sample tick.
 scripts/smoke.sh
 
-# 4. Stop everything. Add --wipe to delete local ClickHouse data.
+# Open the API reference and status page.
+open http://127.0.0.1:8080/docs
+open http://127.0.0.1:8080/status
+
+# Stop everything. Add --wipe to delete local ClickHouse data.
 scripts/dev-down.sh
 ```
 
@@ -85,7 +66,7 @@ scripts/dev-up.sh --peer 157.180.10.49:21841 --bind 127.0.0.1:8080
 scripts/dev-down.sh --wipe
 ```
 
-Logs and pid files live under `.data/`:
+Logs and runtime files are written under `.data/`:
 
 ```text
 .data/logs/clickhouse.log
@@ -100,49 +81,164 @@ Logs and pid files live under `.data/`:
 
 ```bash
 scripts/clickhouse.sh start
-
 cargo run -p cli --bin glyph -- db-init
 
 cargo run -p api --bin glyph-api
-# in another shell
+
+# In another shell:
 cargo run -p cli --bin glyph -- sync --peer 157.180.10.49:21841
 ```
 
 The API listens on `127.0.0.1:8080` by default.
 
-## Peer configuration
+## System requirements
 
-| Setting | Default | Meaning |
+| Component | Minimum | Recommended | Notes |
+| --- | --- | --- | --- |
+| OS | Linux x86_64/aarch64 or macOS | Linux x86_64 | Windows works through WSL. Dev scripts assume Bash. |
+| Rust | 1.85 | Current stable | The Docker image pins 1.88. |
+| ClickHouse | 26.x | 26.11 or newer | Local binary or Compose service. |
+| Memory | 2 GB | 16 GB | 8 GB is workable for the full stack. |
+| CPU | 2 vCPU | 4 vCPU | Live ingestion is I/O-bound. Signature verification and ClickHouse merges use the rest. |
+| Disk | 20 GB free | Sized per retained epoch | About 16 GB of indexed data per epoch. Budget 20 GB per epoch. |
+| Network | Outbound TCP | Low-latency route to peers | Qubic core peers use port `21841`; Bob peers use `21842`. |
+| Local ports | `8080`, `8123`, `9000` | Same | API, ClickHouse HTTP, ClickHouse native or MinIO S3. All are configurable. |
+
+An epoch is 604,800 ticks. At current activity, a sizing run of 1,000 ticks measured
+about 26 MB with the schema and its projections, or roughly **16 GB per epoch**. Raw
+archiving is much larger: expect about **213 GiB per epoch uncompressed** before zstd
+compression. Size archive storage separately and enable it only when replay matters.
+
+## How ingestion works
+
+The indexer separates fetching from writing:
+
+1. A coordinator polls the shared head and keeps the current epoch's computor set.
+2. Fetch workers pull tick bundles in parallel over independent peer connections.
+   Each worker reuses the cached head and computors, and caches whether a peer supports
+   all-ranges log requests.
+3. Results may arrive out of order. A bounded ordered buffer holds them until the next
+   tick is available, so verification and identity snapshots stay sequential.
+4. The writer verifies quorum, builds one batch, and persists many ticks per ClickHouse
+   insert. Cursors advance only after the batch is durable.
+
+Relevant settings:
+
+| Variable | Default | Meaning |
 | --- | --- | --- |
-| `GLYPH_PEER` | `157.180.10.49:21841` | Seed peer used by `dev-up.sh` and `smoke.sh` |
-| `--peer ADDR` | command default | Peer for `glyph head`, `peers`, `tick`, and `sync` |
-| Core port | `21841` | Qubic core peer TCP |
-| Bob port | `21842` | Bob peer TCP |
+| `INDEXER_FETCH_CONCURRENCY` | `32` | Concurrent peer connections used for fetching |
+| `INDEXER_FETCH_WINDOW` | `512` | Maximum ticks in flight or buffered |
+| `INDEXER_WRITE_BATCH` | `128` | Maximum ticks per ClickHouse insert batch |
+| `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before a partial batch is flushed |
+| `INDEXER_POLL_MS` | `750` | Head poll interval when caught up |
+| `GLYPH_VERIFY_SIGNATURES` | `true` | Verify SchnorrQ signatures in addition to quorum digests |
 
-Peer selection rules:
+Live Qubic traffic is a few ticks per second, so full verification is comfortable.
+Historical backfill is CPU-bound by signature verification. On one core this
+implementation verifies roughly 6,500 signatures per second in release mode, so a
+4 vCPU machine tops out near 58 ticks per second if every vote is checked. A live
+multi-peer run on a 12-core host measured about 32 ticks per second with signatures on
+and 110 ticks per second with signatures off at 96 fetch workers. With the default 32
+workers, signatures off reached about 42 ticks per second, which is fetch-latency bound.
+Use `--no-verify-signatures` only for a deliberate bulk catch-up of finalized ticks,
+then turn verification back on for live ingestion.
 
-- Start with one or more configured seeds. `NodePool::connect_best` chooses the peer with
-  the fastest handshake; the indexer reconnects across the configured seeds on failure.
-- `glyph peers` prints the addresses a seed advertises through `ExchangePublicPeers`.
-- Never request a tick above a peer's advertised head. The peer rejects it and the
-  indexer retries after refreshing the head.
-- A peer that returns malformed packets, wrong fixed sizes, or invalid signatures fails
-  bundle verification. The indexer does not persist that tick and reconnects.
-- Do not put a hosted RPC URL in the peer list. The CLI expects a socket address.
+## Configuration
 
-## Workspace map
+The most common variables are below. The full list is in
+[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+
+| Variable | Default | Used by |
+| --- | --- | --- |
+| `BIND` | `127.0.0.1:8080` | API listen address |
+| `CLICKHOUSE_URL` | `http://127.0.0.1:8123` | API, CLI, store |
+| `CLICKHOUSE_DB` | `glyph` | API, CLI, store |
+| `QUBIC_PEERS` | unset | Indexer peers, peer-backed API routes, and broadcast |
+| `ALLOW_BROADCAST` | `false` | Enables `POST /v1/transactions` |
+| `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval |
+| `PRICE_POLL_MS` | `60000` | Live price feed refresh interval |
+| `ARCHIVE_DIR` | unset | Filesystem raw archive when S3 is unset |
+| `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PREFIX` | unset | Raw archive to S3/MinIO |
+| `ARCHIVE_FAIL_CLOSED` | `false` | Fail a tick instead of indexing when archiving fails |
+
+Peer selection starts from the configured seeds. `NodePool::connect_best` picks the
+peer with the fastest handshake, and the indexer reconnects across the seed list on
+failure. `glyph peers` prints addresses advertised through `ExchangePublicPeers`;
+those learned addresses are informational until they are added to the configuration.
+Do not put a hosted RPC URL in the peer list. The CLI expects a socket address.
+
+## API
+
+The v1 contract is in [docs/API.md](docs/API.md). A short tour:
+
+```bash
+# Service and index state
+curl -sS localhost:8080/healthz
+curl -sS localhost:8080/v1/status
+curl -sS localhost:8080/v1/network/stats
+
+# Ticks and transactions
+curl -sS 'localhost:8080/v1/ticks?epoch=240&limit=25'
+curl -sS localhost:8080/v1/ticks/91915000
+curl -sS 'localhost:8080/v1/ticks/91915000/events?limit=25'
+curl -sS localhost:8080/v1/transactions/<hash>
+curl -sS localhost:8080/v1/transactions/<hash>/status
+
+# Identity history, including contract-originated effects
+curl -sS 'localhost:8080/v1/identities/<identity>/activity?limit=25'
+curl -sS 'localhost:8080/v1/identities/<identity>/events?limit=25'
+
+# Wallets and assets
+curl -sS localhost:8080/v1/wallets/<identity>
+curl -sS 'localhost:8080/v1/assets/<issuer>/<name>/holders?limit=25'
+
+# Prices, analytics, and streams
+curl -sS 'localhost:8080/v1/prices/history?hours=24'
+curl -sS 'localhost:8080/v1/analytics/activity?interval=3600&limit=24'
+curl -sS -N 'localhost:8080/v1/stream?types=tick,event'
+
+# Validation, broadcast, archive, docs
+curl -sS -X POST localhost:8080/v1/transactions/validate \
+  -H 'content-type: application/json' -d '{"raw":"0x..."}'
+curl -sS -X POST localhost:8080/v1/transactions \
+  -H 'content-type: application/json' -d '{"raw":"0x..."}'
+curl -sS 'localhost:8080/v1/ticks/91915000/raw?section=transactions' -o tick.bin
+curl -sS localhost:8080/docs
+```
+
+Response conventions:
+
+- `snake_case` JSON fields and RFC 3339 UTC timestamps.
+- Amounts and balances are JSON integers. Use a 64-bit-safe parser.
+- Identities are uppercase base-26; transaction hashes are lowercase base-26.
+- Errors use RFC 9457 problem documents with a stable `code`.
+- Collections use cursor pagination with `limit` (default 50, maximum 200) and
+  `meta.next_cursor`. `offset` remains available as a deprecated fallback.
+- Tick and transaction point reads are immutable and cacheable. Collection feeds are
+  short-lived.
+
+Peer-backed routes and broadcast use direct TCP peers. Streaming, batch lookup,
+analytics, prices, and raw bundle reads use only local state. `/docs` is the Scalar API
+reference backed by an embedded bundle, so it works offline.
+
+The price routes report QUBIC/USDT from the Qubic Price oracle. They return
+`meta.available: false` until an active QUBIC/USDT oracle subscription has a revealed
+reply, or QPayhub's `GetQuUsdPrice` has a usable value. The mining price series is not
+served as QUBIC.
+
+## Workspace
 
 | Crate | Binary | Responsibility |
 | --- | --- | --- |
 | [`crates/qubic`](crates/qubic) | none | Wire framing, message payloads, identity base-26, log decoding, K12, SchnorrQ |
-| [`crates/node`](crates/node) | none | Direct TCP peer connections, handshake, request/response correlation, peer pool, bundle assembly |
-| [`crates/indexer`](crates/indexer) | none | Sync loop, quorum and data verification, checkpointing, batching |
-| [`crates/store`](crates/store) | none | ClickHouse schema, row types, batch writer, queries |
-| [`crates/archive`](crates/archive) | none | Raw QBB1 bundle encoding and local/S3 archive backends |
-| [`crates/api`](crates/api) | `glyph-api` | Axum router, response models, RFC 9457 errors, OpenAPI, cursor pagination, streaming, search |
+| [`crates/node`](crates/node) | none | Direct TCP connections, handshake, request correlation, peer pool, bundle assembly |
+| [`crates/indexer`](crates/indexer) | none | Fetch pipeline, verification, ordered buffering, cursor checkpoints |
+| [`crates/store`](crates/store) | none | ClickHouse schema, row types, batched writer, queries |
+| [`crates/archive`](crates/archive) | none | QBB1 bundle encoding and local/S3 archive backends |
+| [`crates/api`](crates/api) | `glyph-api` | Axum router, response models, OpenAPI, pagination, streaming, search |
 | [`crates/cli`](crates/cli) | `glyph` | Operator commands: `head`, `peers`, `tick`, `sync`, `db-init`, `serve` |
 
-The dependency direction is acyclic: `cli` depends on `api`, `archive`, `indexer`,
+The dependency direction is acyclic. `cli` depends on `api`, `archive`, `indexer`,
 `node`, `store`, and `qubic`. `api` depends on `archive`, `node`, `store`, and `qubic`.
 `indexer` depends on `archive`, `node`, `store`, and `qubic`. `node` and `store` depend
 on `qubic`. `qubic` has no I/O.
@@ -153,117 +249,51 @@ on `qubic`. `qubic` has no I/O.
 # Current head from a peer
 cargo run -p cli --bin glyph -- head --peer 157.180.10.49:21841
 
-# Peers discovered through ExchangePublicPeers
+# Peers advertised through ExchangePublicPeers
 cargo run -p cli --bin glyph -- peers --peer 157.180.10.49:21841
 
 # Fetch and summarize one tick bundle
 cargo run -p cli --bin glyph -- tick 91915000 --peer 157.180.10.49:21841
 
-# Run the indexer from the current epoch initial tick
+# Index from the current epoch initial tick
 cargo run -p cli --bin glyph -- sync --peer 157.180.10.49:21841
 
-# Apply ClickHouse schema
+# Backfill without signature checks, then restart with verification on
+cargo run -p cli --bin glyph -- sync --peer 157.180.10.49:21841 --no-verify-signatures
+
+# Apply the ClickHouse schema
 cargo run -p cli --bin glyph -- db-init
 
-# Serve the API (equivalently: cargo run -p api --bin glyph-api)
+# Serve the API
 cargo run -p cli --bin glyph -- serve
 ```
 
-## Environment
+## Operations
 
-| Variable | Default | Used by |
-| --- | --- | --- |
-| `BIND` | `127.0.0.1:8080` | API listen address |
-| `CLICKHOUSE_URL` | `http://127.0.0.1:8123` | API, CLI, store |
-| `CLICKHOUSE_DB` | `glyph` | API, CLI, store |
-| `CLICKHOUSE_TEST_URL` | `http://127.0.0.1:8123` | Store integration tests |
-| `RUST_LOG` | `info,tower_http=info` for API, `info` for CLI | Tracing filter |
-| `QUBIC_PEERS`, `QUBIC_PEER` | unset | Peer-backed API routes and broadcast |
-| `ALLOW_BROADCAST` | `false` | Enables `POST /v1/transactions` |
-| `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval |
-| `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PREFIX` | unset | Raw archive to S3/MinIO |
-| `ARCHIVE_DIR` | unset | Filesystem raw archive when S3 is unset |
-| `ARCHIVE_FAIL_CLOSED` | `false` | Fail a tick instead of indexing when archiving fails |
-| `GLYPH_PEER` | `157.180.10.49:21841` | Dev and smoke scripts |
-| `GLYPH_BIN` | `target/debug/glyph` | Smoke script |
-| `API_URL` | `http://127.0.0.1:8080` | Smoke script |
-| `CH_BIN` | `~/.local/bin/clickhouse` | ClickHouse helper |
-| `CH_DATA_DIR` | `.data/clickhouse` | ClickHouse helper |
-
-## API
-
-The v1 contract is in [docs/API.md](docs/API.md). Implemented today:
-
-```bash
-curl -sS localhost:8080/healthz
-curl -sS localhost:8080/v1/status
-curl -sS localhost:8080/v1/network/stats
-curl -sS 'localhost:8080/v1/epochs?limit=25'
-curl -sS 'localhost:8080/v1/ticks?epoch=240&limit=25'
-curl -sS localhost:8080/v1/ticks/91915000
-curl -sS 'localhost:8080/v1/ticks/91915000/transactions?limit=25'
-curl -sS 'localhost:8080/v1/ticks/91915000/events?limit=25'
-curl -sS 'localhost:8080/v1/transactions?limit=25'
-curl -sS 'localhost:8080/v1/events?limit=25'
-curl -sS localhost:8080/v1/transactions/<hash>
-curl -sS 'localhost:8080/v1/identities?limit=25'
-curl -sS localhost:8080/v1/identities/<identity>
-curl -sS 'localhost:8080/v1/identities/<identity>/transactions?limit=25'
-curl -sS 'localhost:8080/v1/assets?limit=25'
-curl -sS localhost:8080/v1/assets/<issuer>/<name>
-curl -sS 'localhost:8080/v1/search?q=91915000'
-curl -sS -X POST localhost:8080/v1/transactions/batch \
-  -H 'content-type: application/json' -d '{"hashes":["<hash>"]}'
-curl -sS 'localhost:8080/v1/analytics/activity?interval=3600&limit=24'
-curl -sS 'localhost:8080/v1/analytics/top-identities?limit=25'
-curl -sS 'localhost:8080/v1/analytics/event-types?limit=50'
-curl -sS -N 'localhost:8080/v1/stream?types=tick,event'
-curl -sS localhost:8080/v1/ticks/91915000/tx-status
-curl -sS 'localhost:8080/v1/ticks/91915000/raw?section=transactions' -o tick.bin
-curl -sS localhost:8080/openapi.json
-```
-
-Peer-backed routes and broadcast use direct TCP peers. Streaming, batch lookup,
-analytics, and raw bundle reads use only local state.
-
-Response conventions:
-
-- `snake_case` JSON fields.
-- Amounts and balances as JSON integers. Use a 64-bit-safe parser.
-- RFC 3339 UTC timestamps with milliseconds.
-- Canonical identities in uppercase base-26 and transaction hashes in lowercase base-26.
-- RFC 9457 problem documents with a stable `code`.
-- Cursor pagination with `limit` (default 50, maximum 200) and `meta.nextCursor`.
-  `offset` is still accepted as a deprecated fallback.
-- Event `body` is a JSON object; `type_name` is a typed event name.
-- Tick and transaction point reads are immutable-cacheable. Collection feeds
-  are short-lived.
-
-## Documentation
-
-| Document | Contents |
-| --- | --- |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Goals, non-goals, direct-peer rationale, options, split ingest and API, diagrams, verification tiers, epoch handling, failure modes, capacity, operations |
-| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Framing, message types, struct offsets, identity encoding, ingestion sequence, quorum rules, logs, end-epoch virtual tick, gotchas |
-| [docs/API.md](docs/API.md) | Implemented endpoints, cursor pagination, RFC 9457 errors, caching, search, examples |
-| [docs/DATA_MODEL.md](docs/DATA_MODEL.md) | Entities, invariants, ClickHouse keys and projections, capacity math, retention, replay |
-| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker image, Compose stack, configuration, health, backups, upgrades, security |
-| [docs/ROADMAP.md](docs/ROADMAP.md) | Phased milestones with exit criteria |
+- ClickHouse is the only hot store. Epoch partitions make retention and replay cheap.
+- The raw archive is the cold store and replay source. Each verified tick can be written
+  as a zstd-compressed QBB1 bundle before it is persisted.
+- Log IDs are epoch-scoped. The canonical event identifier is `{epoch}:{logId}`.
+- Epochs below 240 are not indexed. Tick lookups outside the indexed range return
+  `404 not_found`.
+- Backfills resume from the stored cursor. Replaying a range is idempotent because every
+  row is versioned.
+- Compose is optional. `deploy/docker/env.example` lists every setting, and
+  [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) covers health, backups, upgrades, and
+  security.
 
 ## Development
 
 ```bash
-# Format, lint, test
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
 
-# Scripts must parse
 for script in scripts/*.sh; do bash -n "$script"; done
 ```
 
-CI runs format, clippy, and tests without services. ClickHouse integration tests skip when
-`CLICKHOUSE_TEST_URL` is unreachable, so a clean runner does not need a database.
+CI runs format, clippy, and tests without services. ClickHouse integration tests skip
+when `CLICKHOUSE_TEST_URL` is unreachable, so a clean runner does not need a database.
 
 ### Scripts
 
@@ -275,35 +305,23 @@ CI runs format, clippy, and tests without services. ClickHouse integration tests
 | [`scripts/dev-down.sh`](scripts/dev-down.sh) | Stop API, indexer, and ClickHouse. `--wipe` deletes data |
 | [`scripts/smoke.sh`](scripts/smoke.sh) | Check ClickHouse, API status, peer head, and a tick fetch |
 | [`scripts/docker-up.sh`](scripts/docker-up.sh) | Build and start the Compose stack, then wait for health |
-| [`scripts/docker-down.sh`](scripts/docker-down.sh) | Stop the Compose stack; `--wipe` deletes volumes |
+| [`scripts/docker-down.sh`](scripts/docker-down.sh) | Stop the Compose stack. `--wipe` deletes volumes |
 
 `deploy/clickhouse/config.xml` and `deploy/clickhouse/users.xml` define the local
 ClickHouse instance. The data directory is `.data/clickhouse`, the HTTP port is `8123`,
 and the native port is `9000`. The configuration is development-only and binds to
 `127.0.0.1`.
 
-## Data and retention
+## Documentation
 
-- ClickHouse is the only store today. Epoch partitions make retention cheap.
-- The raw archive is the cold store and replay source. Each verified tick can be written
-  as a zstd-compressed QBB1 bundle to local disk or S3/MinIO before it is persisted.
-- Raw archiving is much larger than the indexed store: each tick contributes a 139,376-byte
-  `TickData` payload plus up to 676 vote headers, about 238 KB uncompressed. One epoch is
-  roughly 213 GiB before compression. Budget archive capacity separately and enable it
-  only when replay matters.
-- Log IDs are epoch-scoped. The canonical event identifier is `{epoch}:{logId}`.
-- Epochs below 240 are not indexed. Tick lookups outside the indexed range return
-  `404 not_found`.
-- Amounts fit in `i64` and are returned as JSON numbers. Use a 64-bit-safe parser.
-
-See [docs/DATA_MODEL.md](docs/DATA_MODEL.md) for capacity math and replay procedures.
-
-## Deployment
-
-[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) covers the Docker image and Compose stack:
-ClickHouse, MinIO with bucket bootstrap, a one-shot schema migration, the API, and the
-indexer. `deploy/docker/env.example` lists every Compose setting. The stack is optional;
-the local scripts remain the fastest development path.
+| Document | Contents |
+| --- | --- |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Goals, non-goals, direct-peer rationale, verification tiers, epoch handling, failure modes, capacity |
+| [docs/PROTOCOL.md](docs/PROTOCOL.md) | Framing, message types, struct offsets, identity encoding, ingestion sequence, quorum rules, logs |
+| [docs/API.md](docs/API.md) | Endpoints, cursor pagination, RFC 9457 errors, caching, search, examples |
+| [docs/DATA_MODEL.md](docs/DATA_MODEL.md) | Entities, invariants, ClickHouse keys and projections, capacity math, retention, replay |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | Docker image, Compose stack, configuration, health, backups, upgrades, security |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Phased milestones with exit criteria |
 
 ## License
 

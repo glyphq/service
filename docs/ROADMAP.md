@@ -12,17 +12,21 @@ the original phase boundaries:
 - Implemented: direct peer transport, K12 and SchnorrQ, quorum and data verification,
   ClickHouse persistence and checkpointing, the v1 resource API, typed events, cursor
   pagination, asset and epoch reads derived from indexed rows, search, OpenAPI, batch
-  transaction lookup, analytics, SSE and WebSocket streaming, peer-backed entity,
-  transaction, status, and contract routes, opt-in broadcast, the raw bundle archive, and
-  the Docker Compose stack.
+  transaction lookup, analytics, SSE and WebSocket streaming, local transaction
+  validation, peer-backed entity, transaction, network status, and contract routes,
+  opt-in broadcast, the raw bundle archive, the Docker Compose stack, a bounded
+  multi-peer fetch pipeline with batched ClickHouse writes, the normalized event
+  participant index and identity activity feed, wallet and asset-holder reads, a status
+  dashboard, the Scalar API reference, per-tick quorum evidence, persisted computor sets,
+  and the QUBIC/USDT oracle price series.
 - Partial: streaming has no `Last-Event-ID` replay, only a lag event and current-head
   continuation. The batch route looks up transaction hashes, not arbitrary GET requests.
   The archive writes and reads bundles but has no spool, manifest, or replay command yet.
   Operations have health probes, request IDs, tracing, and graceful shutdown, but no
-  Prometheus metrics or fuzz targets.
-- Not started: dedicated quorum evidence, epoch, computor, asset, and participant tables;
-  a generic batch endpoint; Prometheus metrics; multi-peer quorum cross-checking; a
-  seven-day soak.
+  Prometheus metrics or fuzz targets. Peer health is improving, but the indexer still
+  assumes a single logical writer.
+- Not started: state digest-chain verification, a generic batch endpoint, Prometheus
+  metrics, multi-peer quorum cross-checking, archive replay, and a seven-day soak.
 
 ## Phase 0: Foundations
 
@@ -137,7 +141,7 @@ the original phase boundaries:
   `/openapi.json`, and `/docs`.
 - `snake_case` response fields, JSON integer amounts, RFC 3339 timestamps.
 - Pagination with `limit` (default 50, maximum 200). The implemented surface uses opaque
-  cursors in `meta.nextCursor`; `offset` remains a deprecated fallback.
+  cursors in `meta.next_cursor`; `offset` remains a deprecated fallback.
 - RFC 9457 problem documents with `bad_request`, `invalid_identity`,
   `invalid_transaction_hash`, `not_found`, and `internal_error`.
 - Immutable `Cache-Control` on tick and transaction reads.
@@ -278,7 +282,7 @@ These items are tracked in every phase, not deferred to the end.
 - Full historical backfill before the epoch present at first start.
 - Compatibility endpoints for core-bob or the official RPC.
 - Smart contract execution or state simulation.
-- Price or oracle services beyond indexed log data.
+- Oracle or price services beyond the QUBIC/USDT oracle reader.
 
 ## Release gates
 

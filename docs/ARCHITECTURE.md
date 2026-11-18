@@ -141,16 +141,22 @@ fetching one tick bundle, initializing the schema, and running the sync loop. Th
 
 ### Ingest
 
+Ingestion is a bounded prefetch pipeline, not a serial tick loop.
+
 1. Load the seed peer list and open one TCP connection per peer. Send
    `ExchangePublicPeers` and merge discovered IPv4 addresses into the candidate set.
-2. Send `RequestCurrentTickInfo`. Record `epoch`, `tick`, `initialTick`, and
-   `tickDuration`. If the epoch changed, fetch `RequestComputors` for the new epoch and
-   verify the computor set.
-3. Choose the next tick number. The first tick is the current epoch `initialTick`. After
-   that it is `lastIndexed + 1`. A gap is never skipped.
-4. For that tick, request `TickData`, `QuorumTick` votes, `TickTransactions`, and the log
-   ranges. Any request that returns `EndResponse` is retried or treated as empty only
-   where the protocol says empty is valid.
+2. A coordinator polls `RequestCurrentTickInfo` and keeps the head in shared state. When
+   the epoch changes it fetches and verifies `RequestComputors` for the new epoch and
+   caches the set by epoch.
+3. A dispatcher hands tick numbers to workers from a bounded window,
+   `[nextWrite, nextWrite + INDEXER_FETCH_WINDOW - 1]`, capped at the coordinator's head.
+   The first tick is the epoch `initialTick`; after that it is the last persisted tick plus
+   one. A gap is never skipped.
+4. `INDEXER_FETCH_CONCURRENCY` workers fetch in parallel. Each worker reuses the shared
+   head and cached computors through `Peer::bundle_with`, then requests `TickData`,
+   `QuorumTick` votes, `TickTransactions`, and log ranges. Any request that returns
+   `EndResponse` is retried or treated as empty only where the protocol says empty is
+   valid.
 5. Compute the quorum group by matching vote digests. A non-empty tick needs 451
    matching votes, an empty tick needs 226. Refuse to write a below-threshold tick.
 6. Verify the data tier. The `TickData` digest must match the quorum digest. Every
@@ -159,12 +165,29 @@ fetching one tick bundle, initializing the schema, and running the sync loop. Th
    tick data, and transaction signatures are also checked.
 7. If raw archiving is configured, encode the verified tick's header, tick data, votes,
    transactions, log ranges, logs, and computors into a zstd-compressed QBB1 bundle and
-   write it before the ClickHouse batch. An archive failure is logged and indexing
+   write it before the ClickHouse write. An archive failure is logged and indexing
    continues unless `ARCHIVE_FAIL_CLOSED=true`.
-8. Encode one insert batch for the tick, its transactions, its events, and absolute
-   identity snapshots. Write the batch and advance the ingest cursor. The cursor never
-   moves backwards.
-9. Repeat. On an epoch change, move `next` forward to the new `initialTick`.
+8. Fetch results complete out of order. An ordered buffer keyed by tick, also bounded by
+   `INDEXER_FETCH_WINDOW`, holds them until `nextWrite` is present. A failed or missing
+   tick blocks the cursor instead of being skipped; failed ticks are retried with
+   backoff.
+9. The writer drains the ordered buffer into `TickBatch`es. It writes when
+   `INDEXER_WRITE_BATCH` ticks have accumulated or when the pipeline has been idle for
+   `INDEXER_WRITE_FLUSH_MS`. Each flush is one batched insert per table, in dependency
+   order: transactions, events, `event_participants`, identity snapshots, quorum
+   evidence when present, then ticks. The head and ingest cursors advance after the tick
+   rows. Every row in a batch shares one `version`, so a retry is idempotent.
+10. On an epoch change, move the dispatcher forward to the new `initialTick` once the
+    previous range is persisted.
+
+Default tuning, overridable by environment:
+
+| Variable | Default | Bounds |
+| --- | --- | --- |
+| `INDEXER_FETCH_CONCURRENCY` | 32 | 1..128 |
+| `INDEXER_FETCH_WINDOW` | 512 | 1..8192 |
+| `INDEXER_WRITE_BATCH` | 128 | 1..4096 |
+| `INDEXER_WRITE_FLUSH_MS` | 250 | 10..10000 |
 
 ### Query
 
@@ -256,6 +279,7 @@ tick is not written.
 | Transaction missing or hash mismatch | A non-zero digest has no fetched transaction whose K12 hash matches | Verification completes as `quorum` with a warning, not `data` | Tick is stored at `quorum` |
 | Log digest mismatch | `K12_8(body)` differs from header | Reject the log set, retry the range | No write |
 | Logs not ready | Fewer logs fetched than the ranges declare | Verification completes as `quorum` with a warning | Tick is stored at `quorum` |
+| Log outside declared ranges | The peer's range table does not cover a log that still carries this tick and a valid digest | Keep the log, downgrade to `quorum`, and record a warning. A peer that returns inconsistent ranges is not allowed to stall the pipeline. | Tick is stored at `quorum`; the event has an empty transaction link |
 | Epoch rollover during fetch | `CurrentTickInfo.epoch` changes | Move `next` forward to the new `initialTick` and refresh computors | No cross-epoch write |
 | ClickHouse unavailable | Insert or query error | The indexer exits with an error. The API returns `internal_error` for reads that fail | Head stops advancing. No retry queue |
 | API process down | Load balancer health check | Restart, no ingest impact | None |
@@ -341,9 +365,10 @@ development values. Production needs separate tuning.
 ### Backups and recovery
 
 - ClickHouse backups per epoch partition.
-- When the raw archive is enabled, a dropped partition can be rebuilt from archived
-  bundles. Otherwise it can be rebuilt by re-indexing from peers, subject to peer
-  retention.
+- When the raw archive is enabled, archived QBB1 bundles can be read through
+  `GET /v1/ticks/{tick}/raw?section=`. There is no automated archive-to-ClickHouse
+  replay command yet, so a dropped partition is rebuilt by re-indexing from peers while
+  they still retain the range.
 - The checkpoint lives in `glyph.ingest_state` under the `head` and `ingest` keys. Losing
   it is recoverable by taking the maximum indexed tick from `glyph.ticks` and resuming
   forward.

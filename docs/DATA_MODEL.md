@@ -3,7 +3,8 @@
 The index lives in ClickHouse. This document defines the entities, the invariants the
 indexer must preserve, the physical keys and projections, retention, capacity, and replay.
 The canonical DDL is [`crates/store/src/schema.rs`](../crates/store/src/schema.rs). Tables
-marked **planned** are required by the API contract but are not yet in that file.
+described as derived are computed from the canonical tables at query time and have no
+physical DDL of their own.
 
 ## Design rules
 
@@ -47,11 +48,12 @@ epoch 1---* tick
 | Tick | `(epoch, tick)`, `tick` globally monotonic | Immutable once quorum reached | `Tick`, `TickData`, votes |
 | Transaction | `hash`, unique, and `(tick, txIndex)` | Immutable once quorum final | `RespondLog` transaction stream |
 | Event | `(epoch, logId)` | Immutable once digest verified | `RespondLog` |
-| Quorum evidence | `(epoch, tick)` | Not stored in the hot tables; full vote sets are in the raw archive | `Tick` vote set |
+| Quorum evidence | `(epoch, tick)` | Summary row in `quorum_evidence`; full vote sets are written to the raw archive when it is enabled | `Tick` vote set |
 | Identity | 60-character identity | Derived, updated as activity arrives | Transfers and burns |
-| Asset | `(issuer, name)` | Derived from events; dedicated table planned | Asset events |
-| Computor | `(epoch, index)` | Cached in memory and archived per tick | `Computors` |
+| Asset | `(issuer, name)` | Derived from `events`; no dedicated table | Asset events |
+| Computor | `(epoch, index)` | Cached in memory, persisted in `computors`, and archived per tick | `Computors` |
 | Ingest checkpoint | key | Updated per batch | Indexer |
+| Price point | `hour` | Latest row per hour wins | QUBIC/USDT oracle poller |
 
 ## `glyph.ticks`
 
@@ -212,10 +214,12 @@ ADD PROJECTION IF NOT EXISTS by_type
 );
 ```
 
-Identity-filtered event queries cannot use the body blob efficiently. Add a normalized
-`glyph.event_participants` table (planned) with `(epoch, log_id, identity, role)` where
-role is `from`, `to`, `issuer`, `owner`, `possessor`, or `contract`. It is populated from
-the typed decoder in the same batch as the event.
+Identity-filtered event queries cannot use the body blob efficiently. The normalized
+`glyph.event_participants` table stores `(epoch, log_id, identity, role)` where role is
+`from`, `to`, `issuer`, `owner`, `possessor`, `burner`, `querier`, or `solver`. The
+indexer populates it from the typed decoder in the same batch as the event. Its order key
+is `(identity, tick, log_id)`, so a wallet history query reads only that identity's rows
+and joins back to `events` for the decoded body.
 
 ## `glyph.identities`
 
@@ -294,23 +298,29 @@ same batch replaces them, and the head only advances after the tick row exists.
 Only one writer should run against a database. There is no lease enforcement yet; this is
 an operational rule.
 
-## Quorum evidence (planned)
+## `glyph.quorum_evidence`
 
-The hot store keeps the winning tick header, the vote count, and a signer bitmap. It does
-not keep 676 full vote headers, because that would cost about 134 GiB per epoch.
+One row per stored tick when the producer supplies quorum evidence. The hot store keeps
+the winning digests, vote counts, and verification tier. It does not keep 676 full vote
+headers, because that would cost about 134 GiB per epoch; the full vote set is preserved
+in the raw archive when archiving is enabled.
 
 ```sql
 CREATE TABLE IF NOT EXISTS glyph.quorum_evidence
 (
     epoch UInt16,
     tick UInt32,
-    winning_digest FixedString(32),
-    vote_count UInt16,
-    required_votes UInt16,
-    signer_bitmap String CODEC(ZSTD(3)),
-    aligned_votes UInt16,
-    misaligned_votes UInt16,
-    verified_at DateTime64(3, 'UTC'),
+    quorum_digest FixedString(32),
+    tick_data_digest FixedString(32),
+    required_votes UInt32,
+    aligned_votes UInt32,
+    fetched_votes UInt32,
+    unique_votes UInt32,
+    verified_votes UInt32,
+    verification LowCardinality(String),
+    warning_count UInt32,
+    warnings String,
+    timestamp DateTime64(3, 'UTC'),
     version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
@@ -318,61 +328,75 @@ PARTITION BY epoch
 ORDER BY (epoch, tick)
 ```
 
-`signer_bitmap` is a 676-bit bitmap, run-length encoded and stored as hex. The full vote
-headers can be written to the raw archive for audit. This table is **planned** and is not
-in the current `schema.rs`.
+The store and writer support this table. A `TickBatch` without evidence simply omits the
+row. Evidence is inserted before the tick row, so a visible tick never has a half-written
+audit row. `GET /v1/ticks/{tick}/evidence` returns this row and reports `404 not_found`
+when no evidence is stored.
 
-## Epoch and computor tables (planned)
+## `glyph.computors` and epoch summaries
+
+The elected computor set is stored per epoch:
 
 ```sql
-CREATE TABLE IF NOT EXISTS glyph.epochs
-(
-    epoch UInt16,
-    initial_tick UInt32,
-    end_tick UInt32,
-    first_indexed_tick UInt32,
-    last_indexed_tick UInt32,
-    computor_count UInt16,
-    closed UInt8,
-    version UInt64
-)
-ENGINE = ReplacingMergeTree(version)
-ORDER BY epoch;
-
 CREATE TABLE IF NOT EXISTS glyph.computors
 (
     epoch UInt16,
     computor_index UInt16,
-    public_key FixedString(32),
-    version UInt64
+    public_key String,
+    identity String,
+    version UInt64,
+    timestamp DateTime64(3, 'UTC')
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (epoch, computor_index);
+ORDER BY (epoch, computor_index)
 ```
 
-These tables are planned. There are no epoch or computor endpoints today. The indexer
-caches the computor set in memory per epoch and does not persist it.
+There is no `glyph.epochs` table. `GET /v1/epochs` and `GET /v1/epochs/{epoch}` aggregate
+`glyph.ticks` (tick counts, first/last tick, transaction and event sums) at query time.
+The indexer also caches computor sets in memory for verification.
+`GET /v1/epochs/{epoch}/computors` returns the persisted set ordered by
+`computor_index`.
 
-## Asset tables (planned)
+## Assets (derived)
+
+There is no `glyph.assets` table. The assets API derives issuance, ownership, and
+possession rows from the JSON bodies in `glyph.events` with
+`ORDER BY version DESC LIMIT 1 BY` per asset key. A dedicated holdings table would only be
+needed if the API had to answer "who holds asset X at tick N" without scanning events; it
+does not exist.
+
+## `glyph.price_points`
+
+The API price poller stores hourly QUBIC/USDT oracle readings. The primary source is an
+active `OI::Price` oracle subscription (interface index 0); the QPayhub
+`GetQuUsdPrice` read function (contract 29, input type 4) is a fallback. This is not the
+core node's BTC/USDT `RequestPriceSeries` feed. `hour` is the logical key; a later
+`version` replaces an earlier revision of the same hour.
 
 ```sql
-CREATE TABLE IF NOT EXISTS glyph.assets
+CREATE TABLE IF NOT EXISTS glyph.price_points
 (
-    issuer String,
-    name String,
-    decimals UInt8,
-    unit String,
-    managing_contract Int64,
-    issued_tick UInt32,
+    hour UInt32,
+    append_tick UInt32,
+    source_tick UInt32,
+    epoch UInt16,
+    flags UInt32,
+    price_e8 Int64,
+    source UInt32,
+    synced UInt8,
+    bound UInt8,
+    series_digest FixedString(32) DEFAULT '',
+    observed_at DateTime64(3, 'UTC'),
     version UInt64
 )
 ENGINE = ReplacingMergeTree(version)
-ORDER BY (issuer, name);
+ORDER BY hour
 ```
 
-Ownership and possession histories are derived from asset events. A separate holdings
-table is only needed if the API must answer "who holds asset X at tick N" without scanning
-events. That is planned, not current.
+`price_e8` is the QUBIC price in USDT scaled by `1e8`. `source` is `0` for the price
+oracle and `29` for the QPayhub fallback. Flag bit 0 marks a filled hour and bit 1 marks a
+stale reading. The API price routes read the newest row per hour. Price ingestion runs in
+the API process, not in the tick indexer.
 
 ## Invariants
 
@@ -438,11 +462,15 @@ in-flight duplicates omit `FINAL` and deduplicate with `argMax` or a subquery. N
 | `ticks` | `epoch` | `(epoch, tick)` | `by_tick` | Tick by number, head, epoch ranges |
 | `transactions` | `epoch` | `(tick, tx_index)` | `by_hash`, `by_source`, `by_destination` | Hash lookup, tick list, identity history |
 | `events` | `epoch` | `(epoch, log_id)` | `by_tick`, `by_recent`, `by_type` | Event by ID, tick list, type scans, activity buckets |
+| `event_participants` | `epoch` | `(identity, tick, log_id)` | none | Identity activity and contract effects |
 | `identities` | none | `identity` | `by_activity` | Identity lookup, top identities |
 | `ingest_state` | none | `key` | none | Internal |
-| `quorum_evidence` (planned) | `epoch` | `(epoch, tick)` | none | Verification details |
-| `epochs` (planned) | none | `epoch` | none | Epoch list |
-| `computors` (planned) | none | `(epoch, computor_index)` | none | Computor list |
+| `quorum_evidence` | `epoch` | `(epoch, tick)` | none | Verification details |
+| `computors` | none | `(epoch, computor_index)` | none | Elected computor set per epoch |
+| `price_points` | none | `hour` | none | Hourly QUBIC/USDT prices |
+
+`quorum_evidence` is partitioned by epoch, while `price_points` is not partitioned. Both
+are small relative to the tick tables and are read by a single key or by hour.
 
 `ticks` has a `by_tick` projection because the order key starts with `epoch`. Without it,
 `WHERE tick = ?` scans every epoch partition. It is created by
@@ -498,7 +526,7 @@ Constants:
 | --- | --- | --- | --- |
 | Winning tick header | 352 B | 203 MiB | Indexed |
 | Full vote set, 676 headers | 237,952 B per tick | 134 GiB | Not stored |
-| Quorum evidence bitmap | 85 B per tick | 49 MiB | Planned, not stored |
+| Quorum evidence row | about 110 B plus warnings per tick | about 63 MiB | Indexed when provided |
 | `TickData` | 139,376 B | 78.5 GiB | Not stored |
 | Transaction, average 128 B input | 272 B | Depends on count | Indexed |
 | Transaction, worst case | 1,168 B | Depends on count | Max input |
@@ -548,7 +576,12 @@ There are three replay paths.
 
 ### 2. Rebuild a partition from peers
 
-This is the only rebuild path today. The raw archive is planned but not implemented.
+There is no automated archive-to-ClickHouse replay command, so re-fetching from peers is
+the rebuild path today. The raw archive itself is implemented: when enabled it stores one
+QBB1 bundle per verified tick before the ClickHouse write, and
+`GET /v1/ticks/{tick}/raw?section=` serves those bundles on demand. Keeping the archive
+lets an operator copy evidence out before it leaves peer retention; it does not yet
+re-ingest automatically.
 
 1. Stop the indexer.
 2. Drop the affected partitions from `ticks`, `transactions`, `events`, and `identities`.

@@ -91,8 +91,8 @@ The values are the `u8` on the wire. `MessageType::from_u8` in
 | 45 | `RespondLog` | peer to client | Yes |
 | 46 | `RequestSystemInfo` | client to peer | No |
 | 47 | `RespondSystemInfo` | peer to client | No |
-| 48 | `RequestLogIdRangeFromTx` | client to peer | Planned |
-| 49 | `RespondLogIdRangeFromTx` | peer to client | Planned |
+| 48 | `RequestLogIdRangeFromTx` | client to peer | Yes, per-transaction fallback |
+| 49 | `RespondLogIdRangeFromTx` | peer to client | Yes |
 | 50 | `RequestAllLogIdRangesFromTx` | client to peer | Yes |
 | 51 | `RespondAllLogIdRangesFromTx` | peer to client | Yes |
 | 52 | `RequestAssets` | client to peer | Yes, filtered asset lookup |
@@ -104,12 +104,12 @@ The values are the `u8` on the wire. `MessageType::from_u8` in
 | 59 | `RespondLogStateDigest` | peer to client | Planned |
 | 64 | `RequestActiveIpos` | client to peer | No |
 | 65 | `RespondActiveIpo` | peer to client | No |
-| 66 | `RequestOracleData` | client to peer | No |
-| 67 | `RespondOracleData` | peer to client | No |
+| 66 | `RequestOracleData` | client to peer | Yes, QUBIC/USDT price poller |
+| 67 | `RespondOracleData` | peer to client | Yes |
 | 70 | `RequestRevenueData` | client to peer | No |
 | 71 | `RespondRevenueData` | peer to client | No |
-| 78 | `RequestPriceSeries` | client to peer | Yes, BTC price series |
-| 79 | `RespondPriceSeries` | peer to client | Yes |
+| 78 | `RequestPriceSeries` | client to peer | Node only; core BTC/USDT series |
+| 79 | `RespondPriceSeries` | peer to client | Node only |
 | 255 | `SpecialCommand` | both | No |
 
 `EndResponse` is a complete packet with the same `dejavu` as the request and an empty
@@ -325,8 +325,9 @@ response packets, terminated by `EndResponse`.
 
 ### `RequestPriceSeries` (8 bytes) and `RespondPriceSeries` (variable)
 
-The price series is the node's hourly BTC/USDT feed. `RequestPriceSeries` carries
-`u32 from_hour` and `u32 count`. A core clamps `count` to 256
+This message is the node's hourly BTC/USDT feed. It is separate from the QUBIC/USDT
+`OI::Price` oracle used by the `/v1/prices` routes (see [Oracle data](#oracle-data-variable)).
+`RequestPriceSeries` carries `u32 from_hour` and `u32 count`. A core clamps `count` to 256
 (`PRICE_SERIES_MAX_POINTS_PER_RESPONSE`).
 
 The response starts with a 124-byte header:
@@ -354,9 +355,9 @@ The response starts with a 124-byte header:
 
 Each point is 20 bytes: `u32 hour`, `u32 append_tick`, `u32 flags`, `i64 price_e8`.
 `price_e8` is the whole-USDT price scaled by `1e8`. Bit `0` of `flags`
-(`BTC_PRICE_FLAG_FILLED`) marks an hour whose price was filled from the previous hour after
-the feed gave up. The payload is exactly `124 + count * 20` bytes: a node omits hours it
-does not hold, so `count` can be less than the requested count and a point's `hour` can
+(`PRICE_POINT_FLAG_FILLED`) marks an hour whose price was filled from the previous hour
+after the feed gave up. The payload is exactly `124 + count * 20` bytes: a node omits hours
+it does not hold, so `count` can be less than the requested count and a point's `hour` can
 skip ahead.
 
 `base_hour` anchors the epoch task window. For target `t` of an epoch, the relevant hour is
@@ -478,6 +479,42 @@ response, so request a larger range in pages.
 `RequestPriceSeries` is `u32 from_hour`, `u32 count`. A count above 256 is clamped by the
 peer. Hours before `from_hour` are never included.
 
+### Oracle data (variable)
+
+`RequestOracleData` is a 16-byte request: `u32 req_type`, `u32 padding`, `i64 tick_or_id`.
+The client uses reqType 9 (active subscriptions, `tick_or_id` ignored), reqType 6
+(subscription info, `tick_or_id` is the subscription ID), and reqType 5 (query and
+response, `tick_or_id` is the query ID).
+
+Each `RespondOracleData` packet starts with `u32 res_type`:
+
+| resType | Meaning |
+| --- | --- |
+| 1 | Query metadata, 72 bytes |
+| 2 | Query data, size defined by the oracle interface |
+| 3 | Reply data, size defined by the oracle interface |
+| 5 | Subscription info, 28 bytes of fields padded to 32 in the core |
+| 6 | Subscriber info, 16 bytes |
+| 10 | Active subscription IDs, an array of `i32` |
+
+Query metadata is `i64 query_id`, `u8 type`, `u8 status`, `u16 status_flags`,
+`u32 query_tick`, `[u8; 32] querying_entity`, `u64 timeout`, `u32 interface_index`,
+`i32 subscription_id`, `u32 reveal_tick`, `u16 total_commits`, `u16 agreeing_commits`.
+Status 3 means the reply was revealed successfully.
+
+Subscription info is `i32 subscription_id`, `u32 interface_index`,
+`i64 last_pending_query_id`, `i64 last_revealed_query_id`, `u32 generated_queries_count`.
+
+Oracle interface 0 (`OI::Price`) has a 104-byte query (`[u8; 32] oracle`, `u64 timestamp`,
+`[u8; 32] currency1`, `[u8; 32] currency2`) and a 16-byte reply (`i64 numerator`,
+`i64 denominator`). The reply means `currency1 = currency2 * numerator / denominator`.
+Currency IDs are ASCII packed at the start of the 32-byte ID, so QUBIC is `QUBIC` followed
+by zero bytes and USDT is `USDT` followed by zero bytes.
+
+The `/v1/prices` routes read the QUBIC/USDT orientation from this oracle. When no active
+Price subscription with a revealed QUBIC/USDT reply is found, the poller falls back to the
+QPayhub `GetQuUsdPrice` contract read (contract 29, input type 4).
+
 ## Request payloads
 
 | Request | Payload | Total |
@@ -490,6 +527,7 @@ peer. Hours before `from_hour` are never included.
 | `RequestAllLogIdRangesFromTx` | passcode `[u64; 4]`, `u32 tick` | 36 |
 | `RequestLog` | passcode `[u64; 4]`, `u64 from_log_id`, `u64 to_log_id` | 48 |
 | `RequestPriceSeries` | `u32 from_hour`, `u32 count` | 8 |
+| `RequestOracleData` | `u32 req_type`, `u32 padding`, `i64 tick_or_id` | 16 |
 | `RequestIssuedAssets`, `RequestOwnedAssets`, `RequestPossessedAssets` | `[u8; 32] public_key` | 32 |
 | `RequestAssets` | `u16 request_type`, `u16 flags`, type-specific filter fields | 8 or 112 |
 | `ExchangePublicPeers` | four `[u8; 4]` IPv4 addresses | 16 |
@@ -571,7 +609,10 @@ Steps:
 6. **Log ranges.** Send `RequestAllLogIdRangesFromTx(n)` with a zero passcode. The
    response is exactly 65,632 bytes. If any slot is `-3`, wait and retry. Otherwise
    compute the minimum `from` and maximum `from + length - 1` across valid slots. If no
-   slot has logs, the tick has no events and the log fetch is complete.
+   slot has logs, the tick has no events and the log fetch is complete. Peers that answer
+   `EndResponse` or time out on the all-ranges request fall back to
+   `RequestLogIdRangeFromTx` for each non-empty transaction slot and the six special
+   slots; Glyph caches that rejection per connection and pipelines the probes.
 7. **Logs.** `RequestLog(from, to)` can return at most one packet, and a packet is at most
    16,777,215 bytes including the header. Split large ranges into chunks that fit. Decode
    all records, verify each digest, and map each `log_id` back to the slot using the

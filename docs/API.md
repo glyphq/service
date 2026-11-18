@@ -40,9 +40,9 @@ Collections use `data` plus `meta`:
     "limit": 50,
     "offset": 0,
     "count": 0,
-    "nextOffset": null,
-    "nextCursor": null,
-    "hasMore": false
+    "next_offset": null,
+    "next_cursor": null,
+    "has_more": false
   }
 }
 ```
@@ -75,7 +75,7 @@ Every collection uses opaque cursor pagination.
 | Parameter | Default | Bounds |
 | --- | --- | --- |
 | `limit` | `50` | `1..200` |
-| `cursor` | none | Opaque token from `meta.nextCursor`. |
+| `cursor` | none | Opaque token from `meta.next_cursor`. |
 | `offset` | `0` | Legacy, deprecated. Ignored when `cursor` is present. |
 
 The response `meta` contains:
@@ -85,14 +85,14 @@ The response `meta` contains:
 | `limit` | Effective limit after clamping. |
 | `offset` | Effective offset used for this page. |
 | `count` | Rows returned in this page. |
-| `nextOffset` | Legacy next offset when `hasMore`, otherwise `null`. |
-| `nextCursor` | Cursor for the next page when `hasMore`, otherwise `null`. |
-| `hasMore` | Whether another page exists. |
+| `next_offset` | Legacy next offset when `has_more`, otherwise `null`. |
+| `next_cursor` | Cursor for the next page when `has_more`, otherwise `null`. |
+| `has_more` | Whether another page exists. |
 
 A cursor is bound to the route and its normalized filters. Reusing a cursor
 with a different filter set, or sending a malformed token, returns
 `400 invalid_cursor`. Clients must treat cursors as opaque and follow
-`nextCursor` until it is `null`.
+`next_cursor` until it is `null`.
 
 Collections are ordered newest first unless the endpoint says otherwise. Tick
 and transaction point reads are immutable and cacheable; list feeds are
@@ -107,6 +107,15 @@ Liveness only. Does not touch ClickHouse.
 ```json
 { "ok": true }
 ```
+
+### `GET /status`
+
+Server-rendered operations dashboard, intended for humans and for uptime checks
+that prefer HTML over JSON. It shows API version, process uptime, indexed head,
+data lag, counts, ingest cursor, peer count, and whether streaming, broadcast,
+and the raw archive are enabled. The page refreshes every five seconds and does
+not require JavaScript or external assets. Storage failures are rendered on the
+page while `/healthz` and the JSON API keep their normal status codes.
 
 ### `GET /v1/status`
 
@@ -200,9 +209,9 @@ pagination.
     "limit": 50,
     "offset": 0,
     "count": 1,
-    "nextOffset": null,
-    "nextCursor": null,
-    "hasMore": false
+    "next_offset": null,
+    "next_cursor": null,
+    "has_more": false
   }
 }
 ```
@@ -214,6 +223,29 @@ still receive ticks.
 
 One epoch summary. An epoch with no indexed ticks returns `404 not_found`.
 
+### `GET /v1/epochs/{epoch}/computors`
+
+The elected computor set for one epoch, ordered by `computor_index`. The list
+has one row per computor and is not paginated. `public_key` is the 0x-prefixed
+hex form of the 32-byte key; `identity` is its canonical uppercase base-26
+form.
+
+```json
+{
+  "data": [
+    {
+      "epoch": 240,
+      "computor_index": 0,
+      "public_key": "0x0100000000000000000000000000000000000000000000000000000000000000",
+      "identity": "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK"
+    }
+  ],
+  "meta": { "epoch": 240, "count": 676 }
+}
+```
+
+An epoch with no stored computor set returns `404 not_found`.
+
 ### `GET /v1/ticks`
 
 Ticks newest first, optionally filtered by `epoch`. Uses cursor pagination.
@@ -222,7 +254,7 @@ Ticks newest first, optionally filtered by `epoch`. Uses cursor pagination.
 | --- | --- |
 | `epoch` | Restrict to one epoch. |
 | `limit` | Page size. |
-| `cursor` | Cursor from `meta.nextCursor`. |
+| `cursor` | Cursor from `meta.next_cursor`. |
 
 ### `GET /v1/ticks/{tick}`
 
@@ -246,6 +278,36 @@ One tick by number.
   `Cache-Control: public, max-age=31536000, immutable`.
 - An unindexed tick is `404 not_found`.
 - The tick number is globally unique; the response does not require an epoch.
+
+### `GET /v1/ticks/{tick}/evidence`
+
+The quorum evidence recorded when a tick was verified. `quorum_digest` is the
+hex K12 digest the winning vote group agreed on, and `tick_data_digest` is the
+hex digest of the persisted tick data. Vote counts describe how the quorum was
+assembled. `warnings` is the producer's serialized warning list and
+`warning_count` is its length.
+
+```json
+{
+  "data": {
+    "epoch": 240,
+    "tick": 91916480,
+    "quorum_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "tick_data_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "required_votes": 451,
+    "aligned_votes": 500,
+    "fetched_votes": 600,
+    "unique_votes": 550,
+    "verified_votes": 480,
+    "verification": "data",
+    "warning_count": 1,
+    "warnings": "[\"lagging peer\"]",
+    "timestamp": "2026-11-18T15:10:00.000Z"
+  }
+}
+```
+
+A tick or evidence row that is not indexed returns `404 not_found`.
 
 ### `GET /v1/ticks/{tick}/transactions`
 
@@ -277,8 +339,8 @@ Transactions in slot order.
     "limit": 50,
     "offset": 0,
     "count": 1,
-    "nextOffset": null,
-    "hasMore": false
+    "next_offset": null,
+    "has_more": false
   }
 }
 ```
@@ -321,8 +383,8 @@ Events in log id order.
     "limit": 50,
     "offset": 0,
     "count": 1,
-    "nextOffset": null,
-    "hasMore": false
+    "next_offset": null,
+    "has_more": false
   }
 }
 ```
@@ -367,8 +429,8 @@ and the same `meta` shape.
     "limit": 50,
     "offset": 0,
     "count": 1,
-    "nextOffset": null,
-    "hasMore": false
+    "next_offset": null,
+    "has_more": false
   }
 }
 ```
@@ -397,6 +459,31 @@ first. Uses cursor pagination and the same `meta` shape.
 A malformed identity returns `400 invalid_identity`. A valid identity with no
 history returns an empty list.
 
+### `GET /v1/identities/{identity}/activity`
+
+Linear history that merges direct transactions with contract-originated effects.
+A contract payout or asset movement is an event, not a transaction submitted by
+the identity, so `/transactions` alone hides it. `activity` joins the normalized
+event participant index and returns both kinds in one timeline:
+
+- `kind: "transaction"` for transactions where the identity is source or
+  destination.
+- `kind: "event"` for decoded events where the identity is a participant
+  (`from`, `to`, `issuer`, `owner`, `possessor`, `burner`, `querier`, or
+  `solver`).
+
+Rows are ordered by tick, log id, and transaction slot, newest first. Event rows
+carry `type_name`, `body`, `role`, `log_id`, and the originating `tx_hash`.
+Fields that do not apply to a row are omitted rather than returned as `null` or
+`""`. A transaction row has no `log_id`, `type_name`, `body`, or `role`. An
+event row has no transaction `status` or `input_data`, and `source`,
+`destination`, and `input_type` appear only when that row has them.
+
+### `GET /v1/identities/{identity}/events`
+
+The event-only projection of the same participant index, newest first. Use this
+when a client wants contract effects without direct transaction rows.
+
 ### `GET /v1/identities`
 
 Indexed identity summaries ordered by most recent activity, then canonical
@@ -416,7 +503,7 @@ identity. Uses cursor pagination.
       "last_seen_tick": 91916480
     }
   ],
-  "meta": { "limit": 50, "offset": 0, "count": 1, "nextCursor": null, "hasMore": false }
+  "meta": { "limit": 50, "offset": 0, "count": 1, "next_cursor": null, "has_more": false }
 }
 ```
 
@@ -441,7 +528,7 @@ Uses cursor pagination. `issuer` optionally filters by canonical identity.
       "timestamp": "2026-11-18T15:10:00.000Z"
     }
   ],
-  "meta": { "limit": 50, "offset": 0, "count": 1, "nextCursor": null, "hasMore": false }
+  "meta": { "limit": 50, "offset": 0, "count": 1, "next_cursor": null, "has_more": false }
 }
 ```
 
@@ -593,7 +680,7 @@ of `types`. The server sends a keep-alive comment every 15 seconds. If a client
 falls behind the internal 4096-event buffer, it receives a `lag` event with the
 number of dropped events and the stream continues from the current head. When
 the hub itself is catching up after an index jump, it emits a `catchup` event
-with `lastPublishedTick`, `headTick`, and `pending` before continuing.
+with `last_published_tick`, `head_tick`, and `pending` before continuing.
 
 The polling cadence is controlled by `STREAM_POLL_MS`. A hub that is not running
 returns `503 unavailable`.
@@ -608,11 +695,253 @@ separate from the indexed read path. Configure peers with `QUBIC_PEERS`
 | --- | --- |
 | `GET /v1/identities/{identity}/entity` | Entity record (balance, incoming/outgoing amount, number of transfers) as reported by a peer. |
 | `GET /v1/transactions/{hash}/network` | Peer view of a transaction, including whether the peer knows it. |
+| `GET /v1/transactions/{hash}/network/status` | Peer confirmation state for one transaction, including the money-flew flag when the peer runs the tx-status add-on. |
+| `GET /v1/wallets/{identity}` | Indexed identity and recent transactions joined with the peer spectrum entity and asset lists. |
+| `GET /v1/wallets/{identity}/assets?kind=` | Issued, owned, and possessed assets for a wallet from the peer asset tree. |
+| `GET /v1/wallets/{identity}/snapshot` | Point-in-time peer entity, assets, counts, and head for a wallet. |
+| `GET /v1/assets/{issuer}/{name}/holders?limit=` | Ownership holders for an asset, ranked by shares. |
 | `GET /v1/ticks/{tick}/tx-status` | Peer transaction confirmation status with money-flew flags. |
-| `POST /v1/contracts/{contract_index}/query` | Read-only contract function call. Body is `{"inputType": 0, "input": "hex"}`. Output is hex. |
+| `POST /v1/contracts/{contract_index}/query` | Read-only contract function call. Body is `{"input_type": 0, "input": "hex"}`. Output is hex. |
 
 An unavailable peer returns `503 unavailable`. Invalid input returns
 `400 bad_request`. Peer responses are not persisted or merged into the index.
+
+### Prices
+
+The price routes serve the on-chain QUBIC/USDT price. Hour `0` is
+`2022-04-13T12:00:00Z`; each point carries `price_e8` (1e-8 USDT per QUBIC) and a
+rounded `price_usdt`. A background poller reads the latest verified reply of an
+active `OI::Price` oracle subscription (interface index 0) discovered through
+`RequestOracleData`. The QPayhub `GetQuUsdPrice` read function (contract index
+29, input type 4) is a secondary source. The poller stores one point per hour in
+ClickHouse and publishes a `price` stream event when a stored hour changes. It
+never substitutes the mining price series.
+
+| Route | Meaning |
+| --- | --- |
+| `GET /v1/prices?from_hour=&limit=` | Ascending hourly points. Default limit 168, maximum 1000. |
+| `GET /v1/prices/history?hours=24` | Convenience window ending at the latest stored hour. |
+| `GET /v1/prices/latest` | Latest stored point, including `filled`, `stale`, `source`, `synced`, `bound`, and the reply digest. |
+| `GET /v1/prices/snapshot` | Latest point plus total point count and source metadata. Returns `200` with `data: null`, `meta.available: false`, and a `meta.warning` before a usable on-chain price exists. |
+
+The oracle reply is verified by the Qubic network; the poller selects the
+QUBIC/USDT pair and scales `numerator / denominator` to 1e-8 units. `meta.pair`
+is always `QUBIC/USDT`. `meta.source` is `0` for the Price oracle interface and
+`29` for the QPayhub fallback; `meta.source_name` gives the matching name.
+`meta.stale` is true when the on-chain source marks the value stale. `PRICE_POLL_MS`
+controls the refresh cadence (default 60 seconds).
+
+Points use snake_case fields: `hour`, `timestamp`, `price_e8` (1e-8 USDT per
+QUBIC), `price_usdt` (rounded to eight decimals), `append_tick`, `source_tick`,
+`epoch`, `flags`, `filled`, `stale`, `source`, `source_name`, `synced`, `bound`,
+`series_digest`, and `observed_at`. `append_tick` is the reveal tick of the oracle
+reply or the QPayhub update tick; `source_tick` is the query tick or update tick.
+`series_digest` is the K12 digest of the reply payload that produced the point.
+
+### Wallets and snapshots
+
+Wallet routes combine the local index with a direct peer snapshot. They are
+read-only and never sign or submit anything.
+
+| Route | Meaning |
+| --- | --- |
+| `GET /v1/wallets/{identity}` | Peer spectrum entity plus issued, owned, and possessed assets, plus the last 10 indexed transactions. |
+| `GET /v1/wallets/{identity}/assets?kind=issued\|owned\|possessed` | Typed asset lists from one peer snapshot. |
+| `GET /v1/wallets/{identity}/snapshot` | Point-in-time entity and asset snapshot with peer tick and epoch. |
+| `GET /v1/assets/{issuer}/{name}/holders?limit=100` | Ownership snapshot for one asset, ranked by shares and deduplicated by identity. |
+
+The wallet overview returns `404` only when the identity is absent from both the
+index and the peer spectrum. A peer that does not expose a spectrum entry
+returns the indexed view with a warning. Snapshot and holder responses use
+`Cache-Control: no-store` because the peer head moves.
+
+### Contract queries
+
+`POST /v1/contracts/{contract_index}/query` is deliberately generic:
+
+```json
+{ "input_type": 2, "input": "0x..." }
+```
+
+It sends the exact function selector and input bytes to a direct peer, enforces
+`MAX_INPUT_SIZE`, and returns both the hex output and byte count. The API does
+not hardcode a contract ABI or contract list, because deployed contracts and
+function tables change over time. Use the contract's own published interface to
+build `input_type` and `input`.
+
+### `GET /v1/transactions/{hash}/network/status`
+
+Confirms one transaction through a direct peer and reports whether it moved
+value or assets.
+
+```json
+{
+  "data": {
+    "hash": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
+    "tick": 91916480,
+    "source": "BZBQ...EXK",
+    "destination": "AAAA...AAA",
+    "amount": 1000000,
+    "input_type": 0,
+    "input_data": "",
+    "confirmed": true,
+    "money_flew": true,
+    "execution": "transferred",
+    "current_tick": 91916490,
+    "confirmations": 10
+  },
+  "meta": { "source": "peer", "status_source": "tx-status" }
+}
+```
+
+`execution` is `transferred` when `money_flew` is `true`, `no_effect` when it is
+`false`, and `unknown` when the peer does not expose the tx-status add-on. In
+the `unknown` case the route still returns `200`, with `money_flew`, `current_tick`,
+and `confirmations` set to `null` and `meta.status_source` set to `unavailable`.
+
+- A malformed hash returns `400 invalid_transaction_hash`.
+- A hash the peer does not retain as a confirmed transaction returns
+  `404 not_found`; it may be unknown or still pending.
+- No reachable peer returns `503 unavailable`.
+
+### `GET /v1/wallets/{identity}`
+
+Joins the local index with one direct peer connection. The index supplies the
+identity summary and its ten newest transactions; the peer supplies the live
+spectrum entity and the issued, owned, and possessed asset lists.
+
+```json
+{
+  "data": {
+    "identity": "BZBQ...EXK",
+    "public_key": "0x0000...0000",
+    "entity": {
+      "spectrum_index": 1204,
+      "tick": 91916480,
+      "public_key": "0x0000...0000",
+      "balance": 42000000,
+      "incoming_amount": 90000000,
+      "outgoing_amount": 48000000,
+      "incoming_transfers": 20,
+      "outgoing_transfers": 17,
+      "latest_incoming_tick": 91916000,
+      "latest_outgoing_tick": 91915000
+    },
+    "assets": {
+      "issued": [],
+      "owned": [],
+      "possessed": []
+    },
+    "recent": []
+  },
+  "meta": {
+    "source": "peer+index",
+    "peer_tick": 91916480,
+    "warning": null
+  }
+}
+```
+
+- One peer connection serves the whole request.
+- `meta.warning` is set when the peer has no spectrum entry; in that case the
+  peer entity amounts are zero.
+- A malformed identity returns `400 invalid_identity`.
+- `404 not_found` is returned only when the identity is absent from both the
+  index and the peer spectrum.
+- No reachable peer returns `503 unavailable`. Responses are `no-store`.
+
+### `GET /v1/wallets/{identity}/assets?kind=issued|owned|possessed`
+
+Returns the peer asset lists for one wallet. `kind` defaults to `all` and may
+be `issued`, `owned`, `possessed`, or `all`.
+
+Issued entries carry `issuer`, `name`, `decimals`, `unit`, `universe_index`, and
+`tick`. Owned entries add `owner`, `shares`, `managing_contract_index`,
+`ownership_index`, and an `issuance` object. Possessed entries add `possessor`,
+the ownership `owner` and `ownership` object, `managing_contract_index`, and
+`possession_index`. Records the peer returns with an unexpected union kind are
+skipped rather than failing the request.
+
+A malformed identity or unknown `kind` returns `400`. No peer returns `503`.
+
+### `GET /v1/wallets/{identity}/snapshot`
+
+A point-in-time peer snapshot for one wallet: identity, public key, peer tick,
+epoch when the peer head is available, entity, all three asset lists, and
+counts. `meta.source` is `peer`. This route never reads the index and is always
+`Cache-Control: no-store`. A missing spectrum entry sets `meta.warning` and
+returns a zeroed entity rather than failing.
+
+### `GET /v1/assets/{issuer}/{name}/holders?limit=`
+
+Queries the peer asset tree for ownership records of one `(issuer, name)` pair.
+`name` is 1 to 7 uppercase ASCII letters or digits; input is uppercased first.
+The name is encoded into the 64-bit asset name exactly like core: each
+character stores `char - '0'` in a little-endian byte, zero-padded.
+
+Holders are deduplicated by identity, summed, sorted by shares descending then
+identity, and truncated to `limit` (default 100, clamped to `1..=1000`).
+
+```json
+{
+  "data": [
+    { "identity": "BZBQ...EXK", "shares": 1000 },
+    { "identity": "AAAA...AAA", "shares": 250 }
+  ],
+  "meta": {
+    "issuer": "BZBQ...EXK",
+    "name": "QX",
+    "count": 2,
+    "limit": 100,
+    "source": "peer",
+    "truncated": false
+  }
+}
+```
+
+An empty list is a valid `200` snapshot. A malformed issuer or an invalid
+asset name returns `400`. No reachable peer returns `503`.
+
+### `POST /v1/transactions/validate`
+
+Validates a signed transaction locally. The route never opens a peer
+connection, never broadcasts, and does not require `ALLOW_BROADCAST`, so it is
+safe for preflight checks in wallets and tooling.
+
+```json
+{ "raw": "0x..." }
+```
+
+`raw` is the full signed transaction as hex, with or without a `0x` prefix. The
+API decodes it and returns a report:
+
+```json
+{
+  "data": {
+    "valid": false,
+    "hash": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
+    "source": "BZBQ...EXK",
+    "destination": "AAAA...AAA",
+    "amount": 1000000,
+    "tick": 91916480,
+    "input_type": 0,
+    "input_data": "",
+    "input_bytes": 0,
+    "total_bytes": 144,
+    "checks": [
+      { "name": "amount", "passed": true },
+      { "name": "input_size", "passed": true },
+      { "name": "signature", "passed": false, "detail": "signature does not verify against the source public key" }
+    ]
+  },
+  "meta": { "source": "local", "broadcast": false }
+}
+```
+
+`valid` is `true` only when every check passes. Failed checks carry a `detail`
+string; passing checks omit it. Malformed hex or bytes that do not decode as a
+transaction return `400 bad_request`, because no report can be produced.
+Responses are `Cache-Control: no-store`.
 
 ### `POST /v1/transactions`
 
@@ -783,5 +1112,9 @@ curl -sS 'localhost:8080/v1/analytics/top-identities?limit=10' | jq .
 curl -sS -N 'localhost:8080/v1/stream?types=tick,event'
 curl -sS 'localhost:8080/v1/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK/entity' | jq .
 curl -sS 'localhost:8080/v1/ticks/91916480/tx-status' | jq .
+curl -sS 'localhost:8080/v1/transactions/<hash>/network/status' | jq .
+curl -sS -X POST localhost:8080/v1/transactions/validate \
+  -H 'content-type: application/json' \
+  -d '{"raw":"0x..."}' | jq .
 curl -sS -o tick.bin 'localhost:8080/v1/ticks/91916480/raw?section=transactions'
 ```
