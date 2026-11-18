@@ -622,18 +622,31 @@ impl ClickHouseStore {
             return Err(Error::Config("clickhouse url is empty".into()));
         }
         schema::validate_database(database).map_err(Error::Config)?;
+        let (url, user, password) = split_url_credentials(url)?;
         // ClickHouse 26 answers `compress=1` with ZSTD while clickhouse-rs 0.13
         // can only decode LZ4. Leave the wire uncompressed until the client
         // supports ZSTD responses.
-        let client = clickhouse::Client::default()
-            .with_url(url)
+        let mut client = clickhouse::Client::default()
+            .with_url(&url)
             .with_database(database)
             .with_compression(clickhouse::Compression::None);
+        if let Some(user) = user.clone() {
+            client = client.with_user(user);
+        }
+        if let Some(password) = password.clone() {
+            client = client.with_password(password);
+        }
         // DDL that creates the database cannot be scoped to a database that
         // does not exist yet.
-        let bootstrap = clickhouse::Client::default()
-            .with_url(url)
+        let mut bootstrap = clickhouse::Client::default()
+            .with_url(&url)
             .with_compression(clickhouse::Compression::None);
+        if let Some(user) = user {
+            bootstrap = bootstrap.with_user(user);
+        }
+        if let Some(password) = password {
+            bootstrap = bootstrap.with_password(password);
+        }
         Ok(Self {
             client,
             bootstrap,
@@ -660,6 +673,69 @@ impl ClickHouseStore {
     fn timestamp_version(timestamp: DateTime<Utc>) -> u64 {
         u64::try_from(timestamp.timestamp_micros()).unwrap_or(0)
     }
+}
+
+/// Splits `http://user:password@host:port` into the bare URL and credentials.
+///
+/// Percent-encoded userinfo is decoded, so a password can contain `:`, `@`, or
+/// `/` when it is encoded. A URL without userinfo is returned unchanged.
+fn split_url_credentials(url: &str) -> Result<(String, Option<String>, Option<String>)> {
+    let Some(scheme_end) = url.find("://") else {
+        return Err(Error::Config(
+            "clickhouse url must start with http:// or https://".into(),
+        ));
+    };
+    let authority_start = scheme_end + 3;
+    let Some(at) = url[authority_start..].rfind('@') else {
+        return Ok((url.to_owned(), None, None));
+    };
+    let at = authority_start + at;
+    let userinfo = &url[authority_start..at];
+    let (user, password) = match userinfo.split_once(':') {
+        Some((user, password)) => (user, Some(password)),
+        None => (userinfo, None),
+    };
+    if user.is_empty() {
+        return Err(Error::Config(
+            "clickhouse url contains credentials without a user name".into(),
+        ));
+    }
+    let user = percent_decode(user)?;
+    let password = password.map(percent_decode).transpose()?;
+    let host = &url[at + 1..];
+    if host.is_empty() {
+        return Err(Error::Config(
+            "clickhouse url contains credentials but no host".into(),
+        ));
+    }
+    let base = format!("{}://{}", &url[..scheme_end], host);
+    Ok((base, Some(user), password))
+}
+
+fn percent_decode(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let hex = bytes.get(index + 1..index + 3).ok_or_else(|| {
+                Error::Config("clickhouse credentials contain a truncated percent escape".into())
+            })?;
+            let hex = std::str::from_utf8(hex).map_err(|_| {
+                Error::Config("clickhouse credentials contain an invalid percent escape".into())
+            })?;
+            let byte = u8::from_str_radix(hex, 16).map_err(|_| {
+                Error::Config("clickhouse credentials contain an invalid percent escape".into())
+            })?;
+            decoded.push(byte);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| Error::Config("clickhouse credentials are not valid UTF-8".into()))
 }
 
 #[async_trait]
@@ -1733,5 +1809,25 @@ mod tests {
     fn version_tracks_tick() {
         let batch = TickBatch::new(1, 42, Utc::now(), 3, "quorum");
         assert_eq!(batch.version, 42);
+    }
+
+    #[test]
+    fn splits_clickhouse_url_credentials() {
+        let (url, user, password) =
+            split_url_credentials("http://glyph:s3cret@127.0.0.1:8123").unwrap();
+        assert_eq!(url, "http://127.0.0.1:8123");
+        assert_eq!(user.as_deref(), Some("glyph"));
+        assert_eq!(password.as_deref(), Some("s3cret"));
+
+        let (url, user, password) =
+            split_url_credentials("https://user:p%40ss%3Aword@db.example:8443").unwrap();
+        assert_eq!(url, "https://db.example:8443");
+        assert_eq!(user.as_deref(), Some("user"));
+        assert_eq!(password.as_deref(), Some("p@ss:word"));
+
+        let (url, user, password) = split_url_credentials("http://127.0.0.1:8123").unwrap();
+        assert_eq!(url, "http://127.0.0.1:8123");
+        assert_eq!(user, None);
+        assert_eq!(password, None);
     }
 }
