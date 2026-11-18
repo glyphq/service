@@ -13,6 +13,7 @@ qubic = { path = "../qubic" }
 store = { path = "../store" }
 anyhow.workspace = true
 clap.workspace = true
+hex.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

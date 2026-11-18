@@ -27,11 +27,14 @@ enum Command {
         #[arg(long, default_value = "157.180.10.49:21841")]
         peer: SocketAddr,
     },
-    /// Fetch one tick bundle and print a summary.
+    /// Fetch one tick bundle, verify it, and print a summary.
     Tick {
         tick: u32,
         #[arg(long, default_value = "157.180.10.49:21841")]
         peer: SocketAddr,
+        /// Skip SchnorrQ signature checks (faster, but only quorum-tier evidence).
+        #[arg(long)]
+        no_verify_signatures: bool,
     },
     /// Run the indexer from the current epoch initial tick.
     Sync {
@@ -46,6 +49,9 @@ enum Command {
         /// Skip SchnorrQ signature checks (faster, but weaker verification).
         #[arg(long)]
         no_verify_signatures: bool,
+        /// Log progress every N indexed ticks.
+        #[arg(long, default_value_t = 100)]
+        progress_every: u64,
     },
     /// Initialize ClickHouse tables.
     DbInit,
@@ -83,18 +89,43 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             println!("{}", serde_json::to_string_pretty(&peers)?);
         }
-        Command::Tick { tick, peer } => {
+        Command::Tick {
+            tick,
+            peer,
+            no_verify_signatures,
+        } => {
             let pool = NodePool::new(vec![PeerConfig::new(peer)]);
             let mut connection = pool.connect_best().await?;
-            let summary = connection.bundle(tick).await?;
+            let bundle = connection.bundle(tick).await?;
+            let verified = indexer::verify_bundle(bundle, !no_verify_signatures)
+                .with_context(|| format!("verify tick {tick}"))?;
+            let transactions = verified
+                .transactions
+                .iter()
+                .map(|tx| {
+                    serde_json::json!({
+                        "hash": qubic::encode_tx_hash(&tx.hash()),
+                        "source": qubic::PublicKey(tx.source).to_identity(),
+                        "destination": qubic::PublicKey(tx.destination).to_identity(),
+                        "amount": tx.amount,
+                        "input_type": tx.input_type,
+                    })
+                })
+                .collect::<Vec<_>>();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "epoch": summary.head.epoch,
-                    "tick": summary.tick.tick,
-                    "transactions": summary.transactions.len(),
-                    "votes": summary.votes.len(),
-                    "logs": summary.logs.len(),
+                    "epoch": verified.tick.epoch,
+                    "tick": verified.tick.tick,
+                    "timestamp": verified.tick.display_time(),
+                    "computor_index": verified.tick.computor_index,
+                    "verification": verified.verification,
+                    "tick_digest": hex::encode(verified.tick_data.digest()),
+                    "transactions": verified.transactions.len(),
+                    "votes": verified.votes.len(),
+                    "logs": verified.logs.len(),
+                    "warnings": verified.warnings,
+                    "transaction_list": transactions,
                 }))?
             );
         }
@@ -103,6 +134,7 @@ async fn main() -> anyhow::Result<()> {
             from,
             poll_ms,
             no_verify_signatures,
+            progress_every,
         } => {
             if peers.is_empty() {
                 bail!("at least one --peer is required");
@@ -112,7 +144,7 @@ async fn main() -> anyhow::Result<()> {
                 start_tick: from,
                 poll_interval: std::time::Duration::from_millis(poll_ms),
                 verify_signatures: !no_verify_signatures,
-                ..IndexerConfig::default()
+                progress_every: progress_every.max(1),
             };
             let url =
                 std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
@@ -189,6 +221,7 @@ mod tests {
                 from,
                 poll_ms,
                 no_verify_signatures,
+                progress_every,
             } => {
                 assert_eq!(
                     peers,
@@ -200,6 +233,7 @@ mod tests {
                 assert_eq!(from, Some(12345));
                 assert_eq!(poll_ms, 250);
                 assert!(no_verify_signatures);
+                assert_eq!(progress_every, 100);
             }
             _ => panic!("expected sync command"),
         }
@@ -214,13 +248,31 @@ mod tests {
                 from,
                 poll_ms,
                 no_verify_signatures,
+                progress_every,
             } => {
                 assert_eq!(peers, vec!["157.180.10.49:21841".parse().unwrap()]);
                 assert_eq!(from, None);
                 assert_eq!(poll_ms, 750);
                 assert!(!no_verify_signatures);
+                assert_eq!(progress_every, 100);
             }
             _ => panic!("expected sync command"),
+        }
+    }
+
+    #[test]
+    fn tick_verifies_signatures_by_default() {
+        let cli = Cli::try_parse_from(["glyph", "tick", "42"]).unwrap();
+        match cli.command {
+            Command::Tick {
+                tick,
+                no_verify_signatures,
+                ..
+            } => {
+                assert_eq!(tick, 42);
+                assert!(!no_verify_signatures);
+            }
+            _ => panic!("expected tick command"),
         }
     }
 
