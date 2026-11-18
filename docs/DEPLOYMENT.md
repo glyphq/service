@@ -101,6 +101,7 @@ and the stack is reachable only from the same machine.
 | `API_PORT` | `8080` | Host port for the API. |
 | `QUBIC_PEERS` | `157.180.10.49:21841` | Comma-separated peer addresses used by the indexer and by peer-backed API routes. |
 | `ALLOW_BROADCAST` | `false` | Set `true` to enable `POST /v1/transactions`. Keep disabled unless the API is trusted. |
+| `BROADCAST_PEERS` | `3` | Peers contacted concurrently per broadcast. Capped at `8`; each connection is a direct peer socket. |
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval. |
 | `PRICE_POLL_MS` | `60000` | Live QUBIC/USDT oracle price refresh interval in the API. |
 | `GLYPH_FROM_TICK` | unset | Optional first tick when there is no stored cursor. |

@@ -302,6 +302,17 @@ pub struct BroadcastReceipt {
     pub peer: SocketAddr,
 }
 
+/// One peer's outcome in a broadcast fan-out.
+#[derive(Debug, Clone)]
+pub struct BroadcastAttempt {
+    pub peer: SocketAddr,
+    /// True when the TCP write completed. Qubic peers do not acknowledge
+    /// broadcast packets, so this is delivery to the socket, not inclusion.
+    pub sent: bool,
+    pub error: Option<String>,
+    pub elapsed: Duration,
+}
+
 /// A direct TCP connection to a Qubic core or Bob peer.
 pub struct Peer {
     config: PeerConfig,
@@ -883,18 +894,8 @@ impl Peer {
         &mut self,
         transaction: &Transaction,
     ) -> Result<BroadcastReceipt> {
-        validate_transaction(transaction)?;
+        validate_signed_transaction(transaction)?;
         let bytes = transaction.encode();
-        let signable_len = Transaction::BASE_SIZE + transaction.input.len();
-        if !schnorrq::verify(
-            &transaction.source,
-            &bytes[..signable_len],
-            &transaction.signature,
-        ) {
-            return Err(Error::Verification(
-                "transaction signature does not verify against its source public key".into(),
-            ));
-        }
         self.send_gossip(MessageType::BroadcastTransaction, bytes)
             .await?;
         Ok(BroadcastReceipt {
@@ -1775,6 +1776,92 @@ impl NodePool {
             .await
     }
 
+    /// Sends one signed transaction to up to `max_peers` peers concurrently.
+    ///
+    /// Broader fan-out reduces the chance that a single slow or partitioned
+    /// peer drops the transaction before it propagates. Every peer validates
+    /// the signature and payload locally, so an invalid transaction fails on
+    /// every attempt rather than reaching a relay.
+    ///
+    /// Qubic has no broadcast acknowledgement. A `sent` attempt means the
+    /// packet was written to the peer socket, not that the transaction will be
+    /// included in a tick.
+    pub async fn broadcast_transaction_fanout(
+        &self,
+        transaction: &Transaction,
+        max_peers: usize,
+    ) -> Vec<BroadcastAttempt> {
+        // Validate once so an obviously bad transaction does not spend time
+        // opening sockets. Each peer validates again before sending.
+        if let Err(error) = validate_signed_transaction(transaction) {
+            return self
+                .peers
+                .iter()
+                .take(max_peers.max(1))
+                .map(|config| BroadcastAttempt {
+                    peer: config.addr,
+                    sent: false,
+                    error: Some(error.to_string()),
+                    elapsed: Duration::ZERO,
+                })
+                .collect();
+        }
+
+        let candidates: Vec<PeerConfig> = self
+            .manager
+            .attempt_order(&self.peers)
+            .into_iter()
+            .take(max_peers.max(1))
+            .collect();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for config in candidates {
+            let transaction = transaction.clone();
+            tasks.spawn(async move {
+                let started = std::time::Instant::now();
+                let addr = config.addr;
+                let result = async {
+                    let mut peer = Peer::connect(config).await?;
+                    peer.broadcast_transaction(&transaction).await
+                }
+                .await;
+                (addr, started.elapsed(), result)
+            });
+        }
+
+        let mut attempts = Vec::new();
+        while let Some(joined) = tasks.join_next().await {
+            let Ok((peer, elapsed, result)) = joined else {
+                continue;
+            };
+            match result {
+                Ok(_) => {
+                    self.manager.record_success(peer, elapsed);
+                    attempts.push(BroadcastAttempt {
+                        peer,
+                        sent: true,
+                        error: None,
+                        elapsed,
+                    });
+                }
+                Err(error) => {
+                    self.manager.record_failure(peer);
+                    attempts.push(BroadcastAttempt {
+                        peer,
+                        sent: false,
+                        error: Some(error.to_string()),
+                        elapsed,
+                    });
+                }
+            }
+        }
+        attempts.sort_by_key(|attempt| (!attempt.sent, attempt.elapsed));
+        attempts
+    }
+
     /// Connects to the best-scoring available peer, recording the handshake
     /// latency or failure for future calls. Quarantined peers are skipped.
     pub async fn connect_best(&self) -> Result<Peer> {
@@ -1821,6 +1908,23 @@ fn validate_transaction(transaction: &Transaction) -> Result<()> {
             "transaction input is {} bytes, limit is {MAX_INPUT_SIZE}",
             transaction.input.len()
         )));
+    }
+    Ok(())
+}
+
+/// Full local validation for a transaction that is about to be broadcast.
+fn validate_signed_transaction(transaction: &Transaction) -> Result<()> {
+    validate_transaction(transaction)?;
+    let bytes = transaction.encode();
+    let signable_len = Transaction::BASE_SIZE + transaction.input.len();
+    if !schnorrq::verify(
+        &transaction.source,
+        &bytes[..signable_len],
+        &transaction.signature,
+    ) {
+        return Err(Error::Verification(
+            "transaction signature does not verify against its source public key".into(),
+        ));
     }
     Ok(())
 }

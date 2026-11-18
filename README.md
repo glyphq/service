@@ -156,6 +156,7 @@ The most common variables are below. The full list is in
 | `CLICKHOUSE_DB` | `glyph` | API, CLI, store |
 | `QUBIC_PEERS` | unset | Indexer peers, peer-backed API routes, and broadcast |
 | `ALLOW_BROADCAST` | `false` | Enables `POST /v1/transactions` |
+| `BROADCAST_PEERS` | `3` | Peers per broadcast fan-out, capped at `8` |
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval |
 | `PRICE_POLL_MS` | `60000` | Live price feed refresh interval |
 | `ARCHIVE_DIR` | unset | Filesystem raw archive when S3 is unset |

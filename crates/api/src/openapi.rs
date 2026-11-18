@@ -233,17 +233,18 @@ pub fn spec() -> Value {
                 },
                 "post": {
                     "tags": ["transactions"],
-                    "summary": "Broadcast a signed transaction to a direct peer",
-                    "description": "Requires ALLOW_BROADCAST=true. The transaction is decoded and locally verified with SchnorrQ before it is sent with dejavu=0.",
+                    "summary": "Broadcast a signed transaction to direct peers",
+                    "description": "Requires ALLOW_BROADCAST=true. The transaction is decoded and locally checked for amount range, input size, byte length, and SchnorrQ signature before any socket is opened. Valid transactions are fanned out concurrently to up to `peers` peers (capped by BROADCAST_PEERS). Set `dry_run` to run the same checks without broadcasting.\n\nQubic does not acknowledge broadcasts. A `sent` peer means the packet reached the peer socket, not that the transaction will be included. Poll `meta.links.transaction`, or stream ticks, to observe inclusion.",
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BroadcastRequest" } } }
                     },
                     "responses": {
-                        "200": { "description": "Peer accepted the transaction" },
-                        "400": { "description": "Invalid transaction or broadcast rejected" },
+                        "200": { "description": "Dry run report; no peer connection was opened", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BroadcastResult" } } } },
+                        "202": { "description": "Transaction written to at least one peer socket", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BroadcastResult" } } } },
+                        "400": { "description": "Transaction failed local validation" },
                         "403": { "description": "Broadcast disabled" },
-                        "503": { "description": "No peer available" }
+                        "503": { "description": "No peer accepted the transaction" }
                     }
                 }
             },
@@ -725,7 +726,55 @@ pub fn spec() -> Value {
                     "type": "object",
                     "required": ["raw"],
                     "properties": {
-                        "raw": { "type": "string", "description": "Signed transaction bytes as hex" }
+                        "raw": { "type": "string", "description": "Signed transaction bytes as hex, with or without a 0x prefix. `transaction`, `raw_transaction`, and `signed_transaction` are accepted aliases." },
+                        "dry_run": { "type": "boolean", "default": false, "description": "Validate and describe the transaction without opening a peer connection." },
+                        "peers": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Peers to fan out to. Capped by the server's BROADCAST_PEERS setting. `max_peers` is an alias." }
+                    }
+                },
+                "BroadcastResult": {
+                    "type": "object",
+                    "required": ["data"],
+                    "properties": {
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "valid": { "type": "boolean", "description": "Dry run only." },
+                                "dry_run": { "type": "boolean", "description": "Dry run only." },
+                                "target_peers": { "type": "integer", "description": "Dry run only: peers that would be contacted." },
+                                "sent": { "type": "integer", "description": "Broadcast only: peers whose socket accepted the packet." },
+                                "targeted": { "type": "integer", "description": "Broadcast only: peers attempted." },
+                                "transaction": {
+                                    "type": "object",
+                                    "properties": {
+                                        "hash": { "type": "string" },
+                                        "source": { "type": "string" },
+                                        "destination": { "type": "string" },
+                                        "amount": { "type": "integer", "format": "int64" },
+                                        "tick": { "type": "integer" },
+                                        "input_type": { "type": "integer" },
+                                        "input_data": { "type": "string" },
+                                        "input_bytes": { "type": "integer" },
+                                        "total_bytes": { "type": "integer" }
+                                    }
+                                },
+                                "checks": { "type": "array", "items": { "$ref": "#/components/schemas/TransactionValidationCheck" } },
+                                "peers": {
+                                    "type": "array",
+                                    "description": "Broadcast only: one entry per attempted peer.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "peer": { "type": "string" },
+                                            "sent": { "type": "boolean" },
+                                            "latency_ms": { "type": "integer" },
+                                            "error": { "type": ["string", "null"] }
+                                        }
+                                    }
+                                },
+                                "warnings": { "type": "array", "items": { "type": "string" } }
+                            }
+                        },
+                        "meta": { "type": "object" }
                     }
                 },
                 "ValidateRequest": {
@@ -739,7 +788,7 @@ pub fn spec() -> Value {
                     "type": "object",
                     "required": ["name", "passed"],
                     "properties": {
-                        "name": { "type": "string", "enum": ["amount", "input_size", "signature"] },
+                        "name": { "type": "string", "enum": ["amount", "input_size", "encoding", "signature"] },
                         "passed": { "type": "boolean" },
                         "detail": { "type": "string" }
                     }

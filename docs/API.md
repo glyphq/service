@@ -978,6 +978,7 @@ API decodes it and returns a report:
     "checks": [
       { "name": "amount", "passed": true },
       { "name": "input_size", "passed": true },
+      { "name": "encoding", "passed": true },
       { "name": "signature", "passed": false, "detail": "signature does not verify against the source public key" }
     ]
   },
@@ -992,21 +993,80 @@ Responses are `Cache-Control: no-store`.
 
 ### `POST /v1/transactions`
 
-Broadcasts a signed transaction through a direct peer. Disabled by default.
+Broadcasts a signed transaction to direct peers. Disabled unless
+`ALLOW_BROADCAST=true`.
 
 ```json
-{ "raw": "0x..." }
+{
+  "raw": "0x...",
+  "dry_run": false,
+  "peers": 3
+}
 ```
 
-The body is the full signed transaction as hex. The API decodes it, checks the
-input size, and verifies the SchnorrQ signature locally before sending it with
-`dejavu=0`. A successful response echoes the transaction hash, the peer tick,
-and the peer that accepted it.
+`raw` is the full signed transaction as hex, with or without a `0x` prefix.
+`transaction`, `raw_transaction`, and `signed_transaction` are accepted aliases
+for `raw`; `max_peers` is an alias for `peers`. The API decodes the transaction
+and runs the same checks as `/v1/transactions/validate` before opening any
+socket. A transaction that fails validation is rejected with `400` and does not
+reach a peer.
+
+Valid transactions are sent with `dejavu=0` to up to `peers` peers concurrently.
+The default and ceiling come from `BROADCAST_PEERS` (default `3`, maximum `8`).
+Fan-out avoids a single slow peer dropping the transaction before it
+propagates.
+
+Set `"dry_run": true` to get the validation report, transaction summary, and
+target peer count without broadcasting. A dry run returns `200` and never opens
+a peer connection. It is also the easiest way for a wallet to show a preview
+before asking the user to sign.
+
+```json
+{
+  "data": {
+    "sent": 2,
+    "targeted": 3,
+    "transaction": {
+      "hash": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
+      "source": "BZBQ...EXK",
+      "destination": "AAAA...AAA",
+      "amount": 1000000,
+      "tick": 91916480,
+      "input_type": 0,
+      "input_data": "",
+      "input_bytes": 0,
+      "total_bytes": 144
+    },
+    "peers": [
+      { "peer": "157.180.10.49:21841", "sent": true, "latency_ms": 84, "error": null },
+      { "peer": "198.27.75.81:21841", "sent": true, "latency_ms": 121, "error": null },
+      { "peer": "87.219.84.68:21841", "sent": false, "latency_ms": 2000, "error": "connection timed out" }
+    ],
+    "warnings": [
+      "transaction reached 2 of 3 peers; propagation may be slower"
+    ]
+  },
+  "meta": {
+    "source": "direct-qubic-peers",
+    "broadcast": true,
+    "confirmed": false,
+    "links": {
+      "transaction": "/v1/transactions/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
+      "tick": "/v1/ticks/91916480"
+    },
+    "hint": "A sent peer accepted the packet at the socket. Qubic does not acknowledge broadcasts; poll the transaction link or stream new ticks to observe inclusion."
+  }
+}
+```
+
+A successful send returns `202 Accepted`. Qubic does not acknowledge
+broadcasts, so `sent` means the packet reached the peer socket, not that the
+transaction will be included. Use `meta.links.transaction`,
+`GET /v1/transactions/{hash}/status`, or the tick stream to observe inclusion.
 
 - `403 forbidden` when `ALLOW_BROADCAST` is not `true`.
-- `400 bad_request` for malformed hex, an invalid transaction, or a peer
-  rejection.
-- `503 unavailable` when no peer is reachable.
+- `400 bad_request` for malformed hex or a transaction that fails local checks.
+- `503 unavailable` when no configured peer accepts the packet.
 
 ### `GET /v1/ticks/{tick}/raw`
 

@@ -284,45 +284,7 @@ async fn validate(Json(body): Json<ValidateBody>) -> Result<impl IntoResponse, A
     let transaction = Transaction::decode(&bytes)
         .map_err(|error| ApiError::bad_request(format!("invalid transaction: {error}")))?;
 
-    let signable_len = Transaction::BASE_SIZE + transaction.input.len();
-    let amount_ok = (0..=qubic::messages::MAX_AMOUNT).contains(&transaction.amount);
-    let input_ok = transaction.input.len() <= qubic::messages::MAX_INPUT_SIZE;
-    let signature_ok = qubic::crypto::schnorrq::verify(
-        &transaction.source,
-        &bytes[..signable_len],
-        &transaction.signature,
-    );
-
-    let checks = vec![
-        ValidationCheck::new(
-            "amount",
-            amount_ok,
-            (!amount_ok).then(|| {
-                format!(
-                    "amount {} is outside 0..={}",
-                    transaction.amount,
-                    qubic::messages::MAX_AMOUNT
-                )
-            }),
-        ),
-        ValidationCheck::new(
-            "input_size",
-            input_ok,
-            (!input_ok).then(|| {
-                format!(
-                    "input is {} bytes, limit is {}",
-                    transaction.input.len(),
-                    qubic::messages::MAX_INPUT_SIZE
-                )
-            }),
-        ),
-        ValidationCheck::new(
-            "signature",
-            signature_ok,
-            (!signature_ok)
-                .then(|| "signature does not verify against the source public key".to_owned()),
-        ),
-    ];
+    let checks = transaction_checks(&transaction, &bytes);
     let valid = checks.iter().all(|check| check.passed);
 
     Ok((
@@ -432,36 +394,206 @@ async fn contract_query(
 #[derive(Debug, Deserialize)]
 pub struct BroadcastBody {
     /// Full signed transaction as lowercase or uppercase hex.
+    #[serde(
+        alias = "transaction",
+        alias = "raw_transaction",
+        alias = "signed_transaction"
+    )]
     pub raw: String,
+    /// Validate and describe the transaction without opening a peer connection.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Number of peers to fan out to. Capped by BROADCAST_PEERS and 8.
+    #[serde(default, alias = "max_peers")]
+    pub peers: Option<usize>,
 }
 
 pub async fn broadcast_transaction(
     State(state): State<AppState>,
     Json(body): Json<BroadcastBody>,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     if !state.allow_broadcast {
         return Err(ApiError::forbidden(
             "transaction broadcast is disabled; set ALLOW_BROADCAST=true",
         ));
     }
-    let bytes = hex::decode(body.raw.trim_start_matches("0x"))
+    let raw = body.raw.trim();
+    let hex_body = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    let bytes = hex::decode(hex_body)
         .map_err(|error| ApiError::bad_request(format!("raw is not hex: {error}")))?;
     let transaction = Transaction::decode(&bytes)
         .map_err(|error| ApiError::bad_request(format!("invalid transaction: {error}")))?;
-    if transaction.input.len() > qubic::messages::MAX_INPUT_SIZE {
-        return Err(ApiError::bad_request("transaction input is too large"));
+
+    let checks = transaction_checks(&transaction, &bytes);
+    let valid = checks.iter().all(|check| check.passed);
+    let hash = qubic::encode_tx_hash(&transaction.hash());
+    let peers_requested = body
+        .peers
+        .unwrap_or(state.broadcast_peers)
+        .clamp(1, state.broadcast_peers.min(8));
+    let target = state.peers.len().min(peers_requested);
+    let transaction_json = json!({
+        "hash": hash,
+        "source": qubic::PublicKey(transaction.source).to_identity(),
+        "destination": qubic::PublicKey(transaction.destination).to_identity(),
+        "amount": transaction.amount,
+        "tick": transaction.tick,
+        "input_type": transaction.input_type,
+        "input_data": hex::encode(&transaction.input),
+        "input_bytes": transaction.input.len(),
+        "total_bytes": transaction.total_size(),
+    });
+
+    if body.dry_run {
+        return Ok((
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "data": {
+                    "valid": valid,
+                    "dry_run": true,
+                    "target_peers": target,
+                    "transaction": transaction_json,
+                    "checks": checks,
+                },
+                "meta": {
+                    "source": "local",
+                    "broadcast": false,
+                    "confirmed": false,
+                }
+            })),
+        )
+            .into_response());
     }
-    let mut peer = connect(&state).await?;
-    let receipt = peer
-        .broadcast_transaction(&transaction)
-        .await
-        .map_err(|error| ApiError::bad_request(format!("broadcast rejected: {error}")))?;
-    Ok((Json(json!({
-        "data": {
-            "hash": qubic::encode_tx_hash(&receipt.digest),
-            "tick": receipt.tick,
-            "peer": receipt.peer.to_string(),
-            "bytes_sent": Transaction::BASE_SIZE + transaction.input.len(),
-        }
-    })),))
+
+    if !valid {
+        let failed = checks
+            .iter()
+            .filter(|check| !check.passed)
+            .filter_map(|check| check.detail.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::bad_request(format!(
+            "transaction failed local validation: {failed}"
+        )));
+    }
+    if state.peers.is_empty() {
+        return Err(ApiError::unavailable(
+            "no QUBIC_PEERS configured for transaction broadcast",
+        ));
+    }
+
+    let attempts = state
+        .pool
+        .broadcast_transaction_fanout(&transaction, peers_requested)
+        .await;
+    let sent = attempts.iter().filter(|attempt| attempt.sent).count();
+    let peers: Vec<Value> = attempts
+        .iter()
+        .map(|attempt| {
+            json!({
+                "peer": attempt.peer.to_string(),
+                "sent": attempt.sent,
+                "latency_ms": attempt.elapsed.as_millis() as u64,
+                "error": attempt.error.clone(),
+            })
+        })
+        .collect();
+    if sent == 0 {
+        let errors = attempts
+            .iter()
+            .filter_map(|attempt| attempt.error.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApiError::unavailable(format!(
+            "broadcast reached no peers: {errors}"
+        )));
+    }
+    let warnings = if sent < target {
+        vec![format!(
+            "transaction reached {sent} of {target} peers; propagation may be slower"
+        )]
+    } else {
+        Vec::new()
+    };
+    Ok((
+        StatusCode::ACCEPTED,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "data": {
+                "sent": sent,
+                "targeted": target,
+                "transaction": transaction_json,
+                "peers": peers,
+                "warnings": warnings,
+            },
+            "meta": {
+                "source": "direct-qubic-peers",
+                "broadcast": true,
+                "confirmed": false,
+                "links": {
+                    "transaction": format!("/v1/transactions/{hash}"),
+                    "tick": format!("/v1/ticks/{}", transaction.tick),
+                },
+                "hint": "A sent peer accepted the packet at the socket. Qubic does not acknowledge broadcasts; poll the transaction link or stream new ticks to observe inclusion."
+            }
+        })),
+    )
+        .into_response())
+}
+
+fn transaction_checks(transaction: &Transaction, bytes: &[u8]) -> Vec<ValidationCheck> {
+    let amount_ok = (0..=qubic::messages::MAX_AMOUNT).contains(&transaction.amount);
+    let input_ok = transaction.input.len() <= qubic::messages::MAX_INPUT_SIZE;
+    let size_ok = bytes.len() == transaction.total_size();
+    let signable_len = Transaction::BASE_SIZE + transaction.input.len();
+    let signature_ok = bytes.len() >= signable_len + 64
+        && qubic::crypto::schnorrq::verify(
+            &transaction.source,
+            &bytes[..signable_len],
+            &transaction.signature,
+        );
+    vec![
+        ValidationCheck::new(
+            "amount",
+            amount_ok,
+            (!amount_ok).then(|| {
+                format!(
+                    "amount {} is outside 0..={}",
+                    transaction.amount,
+                    qubic::messages::MAX_AMOUNT
+                )
+            }),
+        ),
+        ValidationCheck::new(
+            "input_size",
+            input_ok,
+            (!input_ok).then(|| {
+                format!(
+                    "input is {} bytes, limit is {}",
+                    transaction.input.len(),
+                    qubic::messages::MAX_INPUT_SIZE
+                )
+            }),
+        ),
+        ValidationCheck::new(
+            "encoding",
+            size_ok,
+            (!size_ok).then(|| {
+                format!(
+                    "raw is {} bytes, transaction declares {}",
+                    bytes.len(),
+                    transaction.total_size()
+                )
+            }),
+        ),
+        ValidationCheck::new(
+            "signature",
+            signature_ok,
+            (!signature_ok)
+                .then(|| "signature does not verify against the source public key".to_owned()),
+        ),
+    ]
 }

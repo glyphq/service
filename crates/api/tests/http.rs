@@ -932,7 +932,7 @@ async fn transaction_validation_reports_local_checks() {
         qubic::Transaction::BASE_SIZE + transaction.input.len() + 64
     );
     let checks = body["data"]["checks"].as_array().expect("checks array");
-    assert_eq!(checks.len(), 3);
+    assert_eq!(checks.len(), 4);
     assert!(checks.iter().all(|check| check["passed"] == true));
     assert_eq!(body["meta"]["source"], "local");
     assert_eq!(body["meta"]["broadcast"], false);
@@ -980,6 +980,8 @@ async fn transaction_validation_reports_failed_checks() {
     assert_eq!(checks[0]["passed"], false);
     assert_eq!(checks[1]["name"], "input_size");
     assert_eq!(checks[1]["passed"], false);
+    assert_eq!(checks[2]["name"], "encoding");
+    assert_eq!(checks[2]["passed"], true);
 }
 
 #[tokio::test]

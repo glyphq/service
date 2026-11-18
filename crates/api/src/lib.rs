@@ -37,6 +37,8 @@ pub struct AppState {
     /// Shared peer health and ordering for peer-backed routes.
     pub pool: NodePool,
     pub allow_broadcast: bool,
+    /// Maximum number of peers a broadcast is sent to concurrently.
+    pub broadcast_peers: usize,
     pub archive: Option<archive::SharedArchive>,
     pub started_at: Instant,
     /// Per-process sample used to report observed tick rates without a
@@ -52,6 +54,7 @@ impl AppState {
             peers: Vec::new(),
             pool: NodePool::new(Vec::new()),
             allow_broadcast: false,
+            broadcast_peers: 3,
             archive: None,
             started_at: Instant::now(),
             progress: Arc::new(ProgressSampler::default()),
@@ -270,6 +273,11 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         })
         .unwrap_or_default();
     let allow_broadcast = std::env::var("ALLOW_BROADCAST").is_ok_and(|value| value == "true");
+    let broadcast_peers = std::env::var("BROADCAST_PEERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3)
+        .clamp(1, 8);
     let pool = NodePool::new(peers.clone());
     let archive = archive_from_env();
     let price_interval = std::env::var("PRICE_POLL_MS")
@@ -294,6 +302,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         peers,
         pool,
         allow_broadcast,
+        broadcast_peers,
         archive,
         started_at: Instant::now(),
         progress: Arc::new(ProgressSampler::default()),
