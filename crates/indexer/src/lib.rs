@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use archive::{RawBundle, Section, SharedArchive};
 use chrono::{DateTime, Utc};
 use node::{Head, NodePool, Peer, PeerConfig, TickBundle};
 use qubic::crypto::k12::k12_32;
@@ -28,11 +29,13 @@ pub enum Error {
     Verification(String),
     #[error("configuration: {0}")]
     Config(String),
+    #[error("archive: {0}")]
+    Archive(#[from] archive::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct IndexerConfig {
     pub peers: Vec<PeerConfig>,
     /// First tick to fetch when there is no stored cursor. Defaults to the
@@ -45,6 +48,10 @@ pub struct IndexerConfig {
     pub verify_signatures: bool,
     /// Log progress every N ticks.
     pub progress_every: u64,
+    /// Optional raw bundle archive (filesystem or S3/MinIO).
+    pub archive: Option<SharedArchive>,
+    /// When true, an archive failure prevents the tick from being indexed.
+    pub archive_fail_closed: bool,
 }
 
 impl Default for IndexerConfig {
@@ -55,6 +62,8 @@ impl Default for IndexerConfig {
             poll_interval: Duration::from_millis(750),
             verify_signatures: true,
             progress_every: 100,
+            archive: None,
+            archive_fail_closed: false,
         }
     }
 }
@@ -85,6 +94,7 @@ pub struct VerifiedTick {
     pub tick_data: TickData,
     pub votes: Vec<Tick>,
     pub transactions: Vec<Transaction>,
+    pub computors: Computors,
     pub log_ranges: qubic::messages::LogRanges,
     pub logs: Vec<LogEvent>,
     pub verification: Verification,
@@ -251,6 +261,23 @@ impl<S: Store + 'static> Indexer<S> {
                 }
             };
 
+            if let Some(archive) = self.config.archive.clone() {
+                match archive_tick(&verified, archive.as_ref()).await {
+                    Ok(()) => tracing::debug!(
+                        tick = verified.tick.tick,
+                        epoch = verified.tick.epoch,
+                        "raw bundle archived"
+                    ),
+                    Err(error) if self.config.archive_fail_closed => {
+                        return Err(Error::Archive(error));
+                    }
+                    Err(error) => tracing::warn!(
+                        tick = verified.tick.tick,
+                        %error,
+                        "raw archive failed; continuing with indexed rows"
+                    ),
+                }
+            }
             let batch = self.build_batch(&verified).await?;
             for event in &verified.logs {
                 match event.custom_op_code() {
@@ -658,11 +685,40 @@ pub fn verify_bundle(mut bundle: TickBundle, verify_signatures: bool) -> Result<
         tick_data,
         votes: bundle.votes,
         transactions: bundle.transactions,
+        computors: bundle.computors,
         log_ranges: bundle.log_ranges,
         logs: bundle.logs,
         verification,
         warnings,
     })
+}
+
+async fn archive_tick(
+    verified: &VerifiedTick,
+    archive: &dyn archive::RawArchive,
+) -> archive::Result<()> {
+    let mut bundle = RawBundle::new(verified.tick.epoch, verified.tick.tick);
+    bundle.set_section(Section::TickHeader, verified.tick.encode().to_vec());
+    bundle.set_section(Section::TickData, verified.tick_data.encode());
+    let mut votes = Vec::with_capacity(verified.votes.len() * 352);
+    for vote in &verified.votes {
+        votes.extend_from_slice(&vote.encode());
+    }
+    bundle.set_section(Section::Votes, votes);
+    let mut transactions = Vec::new();
+    for transaction in &verified.transactions {
+        transactions.extend_from_slice(&transaction.encode());
+    }
+    bundle.set_section(Section::Transactions, transactions);
+    bundle.set_section(Section::LogRanges, verified.log_ranges.encode());
+    let mut logs = Vec::new();
+    for event in &verified.logs {
+        logs.extend_from_slice(&event.encode());
+    }
+    bundle.set_section(Section::Logs, logs);
+    bundle.set_section(Section::Computors, verified.computors.encode());
+    archive::put_bundle(archive, &bundle).await?;
+    Ok(())
 }
 
 fn required_quorum(digest: &[u8; 32]) -> usize {

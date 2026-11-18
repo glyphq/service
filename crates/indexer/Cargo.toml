@@ -9,6 +9,7 @@ license.workspace = true
 node = { path = "../node" }
 qubic = { path = "../qubic" }
 store = { path = "../store" }
+archive = { path = "../archive" }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true

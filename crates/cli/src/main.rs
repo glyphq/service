@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
+use archive::{FileArchive, S3Archive, SharedArchive};
 use clap::{Parser, Subcommand};
 use indexer::IndexerConfig;
 use node::{NodePool, PeerConfig};
@@ -145,6 +146,9 @@ async fn main() -> anyhow::Result<()> {
                 poll_interval: std::time::Duration::from_millis(poll_ms),
                 verify_signatures: !no_verify_signatures,
                 progress_every: progress_every.max(1),
+                archive: archive_from_env()?,
+                archive_fail_closed: std::env::var("ARCHIVE_FAIL_CLOSED")
+                    .is_ok_and(|value| value == "true"),
             };
             let url =
                 std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
@@ -192,6 +196,18 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn archive_from_env() -> anyhow::Result<Option<SharedArchive>> {
+    if let Some(s3) = S3Archive::from_env().context("configure S3 raw archive")? {
+        return Ok(Some(Arc::new(s3)));
+    }
+    if let Ok(dir) = std::env::var("ARCHIVE_DIR") {
+        if !dir.trim().is_empty() {
+            return Ok(Some(Arc::new(FileArchive::new(dir))));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
