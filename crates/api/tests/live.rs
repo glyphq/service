@@ -120,7 +120,7 @@ async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
 #[tokio::test]
 async fn live_clickhouse_serves_every_collection() {
     let database = unique_database();
-    let store = ClickHouseStore::new(&clickhouse_url(), &database).expect("store config");
+    let store = Arc::new(ClickHouseStore::new(&clickhouse_url(), &database).expect("store config"));
     if let Err(error) = store.init().await {
         eprintln!(
             "skipping API ClickHouse smoke test at {}: {error}",
@@ -132,7 +132,7 @@ async fn live_clickhouse_serves_every_collection() {
     store.write_tick(&batch(101)).await.expect("write 101");
 
     let app = router(AppState {
-        store: Arc::new(store),
+        store: store.clone(),
     });
 
     let (status, body) = get(&app, "/v1/status").await;
@@ -208,4 +208,6 @@ async fn live_clickhouse_serves_every_collection() {
     let (status, body) = get(&app, "/openapi.json").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["openapi"], "3.1.0");
+
+    store.drop_database().await.expect("drop test database");
 }
