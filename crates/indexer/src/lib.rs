@@ -215,11 +215,13 @@ fn dispatch_upper_bound(next_write: u32, head_tick: u32, window: usize) -> Optio
 fn should_flush(
     buffered: usize,
     write_batch: usize,
-    idle: bool,
     elapsed: Duration,
     write_flush: Duration,
 ) -> bool {
-    buffered >= write_batch || (idle && elapsed >= write_flush)
+    // The timer must not be starved by a steady result stream. Otherwise a
+    // backfill would expose the head only every `write_batch` ticks, which
+    // looks like long stalls between bursts even though fetching is steady.
+    buffered >= write_batch || (buffered > 0 && elapsed >= write_flush)
 }
 
 fn next_after_flush(current: u32, persisted: Option<u32>) -> u32 {
@@ -597,7 +599,6 @@ impl<S: Store + 'static> Indexer<S> {
                     let flush_due = should_flush(
                         write_batches.len(),
                         tuning.write_batch,
-                        false,
                         last_flush.elapsed(),
                         tuning.write_flush,
                     );
@@ -655,7 +656,6 @@ impl<S: Store + 'static> Indexer<S> {
                 && should_flush(
                     write_batches.len(),
                     tuning.write_batch,
-                    true,
                     last_flush.elapsed(),
                     tuning.write_flush,
                 )
@@ -2096,30 +2096,13 @@ mod tests {
     }
 
     #[test]
-    fn flush_policy_fills_batches_while_busy_and_times_out_when_idle() {
+    fn flush_policy_fills_batches_and_honors_the_time_bound() {
         let flush = Duration::from_millis(250);
-        assert!(!should_flush(
-            127,
-            128,
-            false,
-            Duration::from_secs(10),
-            flush
-        ));
-        assert!(should_flush(128, 128, false, Duration::ZERO, flush));
-        assert!(!should_flush(
-            1,
-            128,
-            true,
-            Duration::from_millis(100),
-            flush
-        ));
-        assert!(should_flush(
-            1,
-            128,
-            true,
-            Duration::from_millis(250),
-            flush
-        ));
+        assert!(should_flush(127, 128, Duration::from_secs(10), flush));
+        assert!(should_flush(128, 128, Duration::ZERO, flush));
+        assert!(!should_flush(1, 128, Duration::from_millis(100), flush));
+        assert!(should_flush(1, 128, Duration::from_millis(250), flush));
+        assert!(!should_flush(0, 128, Duration::from_secs(10), flush));
     }
 
     #[test]
