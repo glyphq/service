@@ -888,10 +888,11 @@ per request. Set `MARKET_ENABLED=false` to disable the poller.
 | `GET /v1/market/qubic` | Alias for `/v1/market`. |
 | `GET /v1/prices/market` | Alias for `/v1/market`. |
 
-These are reference values, not on-chain oracle points. `/v1/prices` remains the
-verified on-chain series. A cold process returns `503 unavailable` until the
-first poll succeeds; a failed refresh keeps the previous snapshot and reports
-`stale` from its age.
+These are reference values, not on-chain oracle points. `/v1/prices` uses
+verified on-chain points when they exist and marks external fallback rows with
+`onchain: false`. A cold process returns `503 unavailable` until the first poll
+succeeds; a failed refresh keeps the previous snapshot and reports `stale` from
+its age.
 
 ### Wallets and snapshots
 
