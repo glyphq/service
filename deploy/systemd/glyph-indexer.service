@@ -1,0 +1,25 @@
+[Unit]
+Description=Glyph indexer
+Documentation=https://github.com/glyphq/api
+After=network-online.target clickhouse-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=glyph
+Group=glyph
+WorkingDirectory=/opt/glyph
+EnvironmentFile=/etc/glyph/indexer.env
+ExecStart=/opt/glyph/glyph sync
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/glyph
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

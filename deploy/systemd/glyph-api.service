@@ -1,0 +1,25 @@
+[Unit]
+Description=Glyph API
+Documentation=https://github.com/glyphq/api
+After=network-online.target clickhouse-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=glyph
+Group=glyph
+WorkingDirectory=/opt/glyph
+EnvironmentFile=/etc/glyph/api.env
+ExecStart=/opt/glyph/glyph-api
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/glyph
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
