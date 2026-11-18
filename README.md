@@ -5,24 +5,8 @@ directly to Qubic peers over TCP, verifies ticks and votes, stores normalized hi
 ClickHouse, and serves a resource-oriented HTTP API.
 
 The index starts at the epoch that is current on first run and moves forward. There is no
-backfill before that epoch and no compatibility layer for core-bob or the official RPC.
-
-## The no-hosted-RPC promise
-
-**Glyph API never calls a hosted RPC at runtime.** This is a design constraint, not a
-configuration default.
-
-- Ingest connects only to configured seed peers and addresses learned through
-  `ExchangePublicPeers`. Qubic core peers use TCP `21841`, Bob peers use `21842`.
-- Verification uses the computor keys and signatures carried by the protocol. There is no
-  "trusted upstream" mode.
-- The API reads only the local ClickHouse database. A missing resource is a `404` problem
-  document, never a proxy request.
-- Falling back to a hosted API is not a supported recovery path. If every peer is down,
-  the indexer stops advancing the head and the API keeps serving the indexed history.
-
-This keeps the trust boundary at the set of peers and the computor quorum, which is the
-same boundary a Qubic node already has.
+backfill before that epoch and no compatibility layer for core-bob or other Qubic API
+services.
 
 ## Status
 
