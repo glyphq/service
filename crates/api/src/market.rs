@@ -109,6 +109,7 @@ impl MarketCache {
     /// Replaces the cached snapshot directly. Used by one-shot flows and
     /// tests; the poller uses [`MarketCache::record_quote`] so the per-provider
     /// quote set stays current.
+    #[cfg(test)]
     pub(crate) fn store(&self, snapshot: MarketSnapshot) -> Option<MarketSnapshot> {
         if let Ok(mut state) = self.inner.write() {
             state.last_error = None;
@@ -494,7 +495,7 @@ fn price_e8(price_usd: f64) -> Option<i64> {
 }
 
 #[derive(Debug, Clone, Default)]
-struct CoinGeckoMeta {
+pub(crate) struct CoinGeckoMeta {
     market_cap_usd: Option<f64>,
     volume_24h_usd: Option<f64>,
     change_24h_percent: Option<f64>,
