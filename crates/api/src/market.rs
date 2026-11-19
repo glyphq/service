@@ -34,10 +34,7 @@ const DEFAULT_GATE_ENDPOINT: &str = "https://api.gateio.ws/api/v4/spot/tickers";
 const PRICE_SCALE: f64 = 100_000_000.0;
 
 pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/v1/market", get(market))
-        .route("/v1/market/qubic", get(market))
-        .route("/v1/prices/market", get(market))
+    Router::new().route("/v1/market", get(market))
 }
 
 /// One externally sourced QUBIC market snapshot.

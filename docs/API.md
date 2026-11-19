@@ -1,14 +1,15 @@
 # API
 
 Glyph API exposes an HTTP API over the local ClickHouse index. Read routes never
-call a hosted RPC. A small set of optional network routes connect directly to a
-configured Qubic peer, and transaction broadcast is disabled unless
-`ALLOW_BROADCAST=true`. If a resource is not indexed, the API returns a problem
-document instead of proxying upstream.
+call a hosted RPC. Peer-backed operations live under `/v1/live` and connect
+directly to a configured Qubic peer per request. Transaction broadcast is
+disabled unless `ALLOW_BROADCAST=true`. If a resource is not indexed, the API
+returns a problem document instead of proxying upstream.
 
 - Base URL in development: `http://127.0.0.1:8080`
-- Data routes are under `/v1`. `/healthz`, `/openapi.json`, and `/docs` are
-  unversioned.
+- Indexed data routes are under `/v1`. Peer-backed routes are under `/v1/live`.
+  `/healthz`, `/openapi.json`, and `/docs` are unversioned.
+- The canonical market route is `/v1/market`. Aliases are not published.
 - Requests and responses are UTF-8 JSON. Errors use `application/problem+json`.
 - The server is axum with gzip and zstd response compression, CORS (permissive
   by default or restricted with `CORS_ALLOWED_ORIGINS`), an `x-request-id`
@@ -17,8 +18,36 @@ document instead of proxying upstream.
   reference with grouped sections and generated request snippets is at
   `GET /docs`.
 
+Route families:
+
+| Prefix | Reads from | Cacheable |
+| --- | --- | --- |
+| `/v1/status`, `/v1/network` | Index and sampled peer state | No |
+| `/v1/epochs`, `/v1/ticks`, `/v1/transactions`, `/v1/events` | ClickHouse index | Point reads yes, lists briefly |
+| `/v1/identities`, `/v1/wallets`, `/v1/assets` | ClickHouse index plus peer joins | Briefly |
+| `/v1/prices`, `/v1/market`, `/v1/analytics` | Stored prices and aggregates | Briefly |
+| `/v1/stream`, `/v1/ws` | Local index head | No |
+| `/v1/live` | Direct peer call | At most 2 s, some no-store |
+
 This page documents the implemented surface. Planned endpoints and tiers are in
 [ROADMAP.md](./ROADMAP.md) and are not part of the current contract.
+
+### Migration from 0.1
+
+The 0.2 spec moves direct-peer reads under `/v1/live`, removes duplicate market
+aliases, and standardizes operation IDs. Regenerate generated clients.
+
+| Old path | New path |
+| --- | --- |
+| `/v1/network/stats` | `/v1/network` |
+| `/v1/identities/{identity}/entity` | `/v1/live/identities/{identity}` |
+| `/v1/transactions/{hash}/network` | `/v1/live/transactions/{hash}` |
+| `/v1/transactions/{hash}/network/status` | `/v1/live/transactions/{hash}/status` |
+| `/v1/ticks/{tick}/tx-status` | `/v1/live/ticks/{tick}/transactions` |
+| `/v1/contracts/{contract_index}/query` | `/v1/live/contracts/{contract_index}/query` |
+| `/v1/wallets/{identity}/snapshot` | `/v1/live/wallets/{identity}` |
+| `/v1/market/qubic` | `/v1/market` |
+| `/v1/prices/market` | `/v1/market` |
 
 ## Response envelope
 
@@ -213,7 +242,7 @@ inside the current epoch (bounded by the peer head), `epoch_ticks` counts ticks
 elapsed so far, and `coverage` is their ratio. When the peer is unavailable,
 `available` is `false` and a `reason` field is included.
 
-### `GET /v1/network/stats`
+### `GET /v1/network`
 
 Typed index-wide counts and progress. This is the stable shape for dashboards
 and does not require parsing the free-form `stats` object in `/v1/status`.
@@ -789,6 +818,8 @@ verified and persisted.
 | `GET /v1/stream/ticks` | Tick events only. |
 | `GET /v1/stream/transactions` | Transaction events only. |
 | `GET /v1/stream/events` | Log events only. |
+| `GET /v1/stream/prices` | Price-point updates only. |
+| `GET /v1/stream/market` | Market-snapshot updates only. |
 | `GET /v1/ws` | WebSocket carrying the same JSON events. |
 
 `GET /v1/stream` accepts `?types=tick,event` to select a subset. Event names are
@@ -811,23 +842,24 @@ being skipped.
 The polling cadence is controlled by `STREAM_POLL_MS`. A hub that is not running
 returns `503 unavailable`.
 
-### Peer-backed routes
+### Live routes (`/v1/live`)
 
 These routes connect directly to a configured peer for each request and are
-separate from the indexed read path. Configure peers with `QUBIC_PEERS`
-(comma-separated `host:port`) or `QUBIC_PEER`.
+separate from the indexed read path. They may carry a short two-second cache.
+Configure peers with `QUBIC_PEERS` (comma-separated `host:port`) or
+`QUBIC_PEER`.
 
 | Route | Meaning |
 | --- | --- |
-| `GET /v1/identities/{identity}/entity` | Entity record (balance, incoming/outgoing amount, number of transfers) as reported by a peer. |
-| `GET /v1/transactions/{hash}/network` | Peer view of a transaction, including whether the peer knows it. |
-| `GET /v1/transactions/{hash}/network/status` | Peer confirmation state for one transaction, including the money-flew flag when the peer runs the tx-status add-on. |
+| `GET /v1/live/identities/{identity}` | Entity record (balance, incoming/outgoing amount, number of transfers) as reported by a peer. |
+| `GET /v1/live/transactions/{hash}` | Peer view of a transaction, including whether the peer knows it. |
+| `GET /v1/live/transactions/{hash}/status` | Peer confirmation state for one transaction, including the money-flew flag when the peer runs the tx-status add-on. |
 | `GET /v1/wallets/{identity}` | Indexed identity and recent transactions joined with the peer spectrum entity and asset lists. |
 | `GET /v1/wallets/{identity}/assets?kind=` | Issued, owned, and possessed assets for a wallet from the peer asset tree. |
-| `GET /v1/wallets/{identity}/snapshot` | Point-in-time peer entity, assets, counts, and head for a wallet. |
+| `GET /v1/live/wallets/{identity}` | Point-in-time peer entity, assets, counts, and head for a wallet. |
 | `GET /v1/assets/{issuer}/{name}/holders?limit=` | Ownership holders for an asset, ranked by shares. |
-| `GET /v1/ticks/{tick}/tx-status` | Peer transaction confirmation status with money-flew flags. |
-| `POST /v1/contracts/{contract_index}/query` | Read-only contract function call. Body is `{"input_type": 0, "input": "hex"}`. Output is hex. |
+| `GET /v1/live/ticks/{tick}/transactions` | Peer transaction confirmation status with money-flew flags. |
+| `POST /v1/live/contracts/{contract_index}/query` | Read-only contract function call. Body is `{"input_type": 0, "input": "hex"}`. Output is hex. |
 
 An unavailable peer returns `503 unavailable`. Invalid input returns
 `400 bad_request`. Peer responses are not persisted or merged into the index.
@@ -885,8 +917,6 @@ per request. Set `MARKET_ENABLED=false` to disable the poller.
 | Route | Meaning |
 | --- | --- |
 | `GET /v1/market` | Current market snapshot with per-exchange quotes. |
-| `GET /v1/market/qubic` | Alias for `/v1/market`. |
-| `GET /v1/prices/market` | Alias for `/v1/market`. |
 
 These are reference values, not on-chain oracle points. `/v1/prices` uses
 verified on-chain points when they exist and marks external fallback rows with
@@ -903,7 +933,7 @@ read-only and never sign or submit anything.
 | --- | --- |
 | `GET /v1/wallets/{identity}` | Peer spectrum entity plus issued, owned, and possessed assets, plus the last 10 indexed transactions. |
 | `GET /v1/wallets/{identity}/assets?kind=issued\|owned\|possessed` | Typed asset lists from one peer snapshot. |
-| `GET /v1/wallets/{identity}/snapshot` | Point-in-time entity and asset snapshot with peer tick and epoch. |
+| `GET /v1/live/wallets/{identity}` | Point-in-time entity and asset snapshot with peer tick and epoch. |
 | `GET /v1/assets/{issuer}/{name}/holders?limit=100` | Ownership snapshot for one asset, ranked by shares and deduplicated by identity. |
 
 The wallet overview returns `404` only when the identity is absent from both the
@@ -913,7 +943,7 @@ returns the indexed view with a warning. Snapshot and holder responses use
 
 ### Contract queries
 
-`POST /v1/contracts/{contract_index}/query` is deliberately generic:
+`POST /v1/live/contracts/{contract_index}/query` is deliberately generic:
 
 ```json
 { "input_type": 2, "input": "0x..." }
@@ -925,7 +955,7 @@ not hardcode a contract ABI or contract list, because deployed contracts and
 function tables change over time. Use the contract's own published interface to
 build `input_type` and `input`.
 
-### `GET /v1/transactions/{hash}/network/status`
+### `GET /v1/live/transactions/{hash}/status`
 
 Confirms one transaction through a direct peer and reports whether it moved
 value or assets.
@@ -1020,7 +1050,7 @@ skipped rather than failing the request.
 
 A malformed identity or unknown `kind` returns `400`. No peer returns `503`.
 
-### `GET /v1/wallets/{identity}/snapshot`
+### `GET /v1/live/wallets/{identity}`
 
 A point-in-time peer snapshot for one wallet: identity, public key, peer tick,
 epoch when the peer head is available, entity, all three asset lists, and
@@ -1147,9 +1177,9 @@ before asking the user to sign.
       "total_bytes": 144
     },
     "peers": [
-      { "peer": "157.180.10.49:21841", "sent": true, "latency_ms": 84, "error": null },
-      { "peer": "198.27.75.81:21841", "sent": true, "latency_ms": 121, "error": null },
-      { "peer": "87.219.84.68:21841", "sent": false, "latency_ms": 2000, "error": "connection timed out" }
+      { "peer": "peer-a.example:21841", "sent": true, "latency_ms": 84, "error": null },
+      { "peer": "peer-b.example:21841", "sent": true, "latency_ms": 121, "error": null },
+      { "peer": "peer-c.example:21841", "sent": false, "latency_ms": 2000, "error": "connection timed out" }
     ],
     "warnings": [
       "transaction reached 2 of 3 peers; propagation may be slower"
@@ -1293,7 +1323,7 @@ current surface.
 | `CLICKHOUSE_DB` | `glyph` | Database name. |
 | `CORS_ALLOWED_ORIGINS` | unset (permissive) | Comma-separated browser origins. |
 | `RATE_LIMIT_PER_MINUTE` | unset (disabled) | Per-client-IP request budget. |
-| `QUBIC_PEERS` | unset | Comma-separated `host:port` peers for network routes and broadcast. |
+| `QUBIC_PEERS` | unset | Comma-separated `host:port` peers for live routes and broadcast. |
 | `QUBIC_PEER` | unset | Single fallback peer when `QUBIC_PEERS` is unset. |
 | `ALLOW_BROADCAST` | `false` | Enable `POST /v1/transactions`. |
 | `STREAM_POLL_MS` | `1000` | Index-head poll interval for the stream hub. |
@@ -1309,7 +1339,7 @@ run as multiple replicas against the same database.
 ```bash
 curl -sS localhost:8080/healthz
 curl -sS localhost:8080/v1/status | jq .data.head
-curl -sS localhost:8080/v1/network/stats | jq .data
+curl -sS localhost:8080/v1/network | jq .data
 curl -sS 'localhost:8080/v1/epochs?limit=10' | jq .data
 curl -sS 'localhost:8080/v1/ticks?epoch=240&limit=10' | jq .data
 curl -sS localhost:8080/v1/ticks/91916480 | jq .data
@@ -1329,9 +1359,9 @@ curl -sS -X POST localhost:8080/v1/transactions/batch \
 curl -sS 'localhost:8080/v1/analytics/activity?interval=60&limit=10' | jq .
 curl -sS 'localhost:8080/v1/analytics/top-identities?limit=10' | jq .
 curl -sS -N 'localhost:8080/v1/stream?types=tick,event'
-curl -sS 'localhost:8080/v1/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK/entity' | jq .
-curl -sS 'localhost:8080/v1/ticks/91916480/tx-status' | jq .
-curl -sS 'localhost:8080/v1/transactions/<hash>/network/status' | jq .
+curl -sS 'localhost:8080/v1/live/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK' | jq .
+curl -sS 'localhost:8080/v1/live/ticks/91916480/transactions' | jq .
+curl -sS 'localhost:8080/v1/live/transactions/<hash>/status' | jq .
 curl -sS -X POST localhost:8080/v1/transactions/validate \
   -H 'content-type: application/json' \
   -d '{"raw":"0x..."}' | jq .

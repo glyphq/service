@@ -27,16 +27,19 @@ const TX_STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/v1/identities/{identity}/entity", get(entity))
-        .route("/v1/transactions/{hash}/network", get(network_transaction))
+        .route("/v1/live/identities/{identity}", get(entity))
+        .route("/v1/live/transactions/{hash}", get(network_transaction))
         .route(
-            "/v1/transactions/{hash}/network/status",
+            "/v1/live/transactions/{hash}/status",
             get(network_transaction_status),
         )
         .route("/v1/transactions/validate", post(validate))
-        .route("/v1/ticks/{tick}/tx-status", get(tx_status))
+        .route("/v1/live/ticks/{tick}/transactions", get(tx_status))
         .route("/v1/ticks/{tick}/raw", get(raw_bundle))
-        .route("/v1/contracts/{contract_index}/query", post(contract_query))
+        .route(
+            "/v1/live/contracts/{contract_index}/query",
+            post(contract_query),
+        )
 }
 
 #[derive(Debug, Deserialize)]

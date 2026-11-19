@@ -69,7 +69,7 @@ Useful variants:
 
 ```bash
 scripts/dev-up.sh --no-indexer
-scripts/dev-up.sh --peer 157.180.10.49:21841 --bind 127.0.0.1:8080
+scripts/dev-up.sh --peer peer.example:21841 --bind 127.0.0.1:8080
 scripts/dev-down.sh --wipe
 ```
 
@@ -93,7 +93,7 @@ cargo run -p cli --bin glyph -- db-init
 cargo run -p api --bin glyph-api
 
 # In another shell:
-cargo run -p cli --bin glyph -- sync --peer 157.180.10.49:21841
+cargo run -p cli --bin glyph -- sync --peer peer.example:21841
 ```
 
 The API listens on `127.0.0.1:8080` by default.
@@ -160,7 +160,7 @@ The most common variables are below. The full list is in
 | `BIND` | `127.0.0.1:8080` | API listen address |
 | `CLICKHOUSE_URL` | `http://127.0.0.1:8123` | API, CLI, store |
 | `CLICKHOUSE_DB` | `glyph` | API, CLI, store |
-| `QUBIC_PEERS` | unset | Indexer peers, peer-backed API routes, and broadcast |
+| `QUBIC_PEERS` | unset | Indexer peers, live API routes, and broadcast |
 | `ALLOW_BROADCAST` | `false` | Enables `POST /v1/transactions` |
 | `BROADCAST_PEERS` | `3` | Peers per broadcast fan-out, capped at `8` |
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval |
@@ -186,7 +186,7 @@ The v1 contract is in [docs/API.md](docs/API.md). A short tour:
 # Service and index state
 curl -sS localhost:8080/healthz
 curl -sS localhost:8080/v1/status
-curl -sS localhost:8080/v1/network/stats
+curl -sS localhost:8080/v1/network
 
 # Ticks and transactions
 curl -sS 'localhost:8080/v1/ticks?epoch=240&limit=25'
@@ -264,22 +264,22 @@ on `qubic`. `qubic` has no I/O.
 
 ```bash
 # Current head from a peer
-cargo run -p cli --bin glyph -- head --peer 157.180.10.49:21841
+cargo run -p cli --bin glyph -- head --peer peer.example:21841
 
 # Peers advertised through ExchangePublicPeers
-cargo run -p cli --bin glyph -- peers --peer 157.180.10.49:21841
+cargo run -p cli --bin glyph -- peers --peer peer.example:21841
 
 # Fetch and summarize one tick bundle
-cargo run -p cli --bin glyph -- tick 91915000 --peer 157.180.10.49:21841
+cargo run -p cli --bin glyph -- tick 91915000 --peer peer.example:21841
 
 # Read the on-chain QUBIC/USDT price, or report why it is unavailable
-cargo run -p cli --bin glyph -- price --peer 157.180.10.49:21841
+cargo run -p cli --bin glyph -- price --peer peer.example:21841
 
 # Index from the current epoch initial tick
-cargo run -p cli --bin glyph -- sync --peer 157.180.10.49:21841
+cargo run -p cli --bin glyph -- sync --peer peer.example:21841
 
 # Backfill without signature checks, then restart with verification on
-cargo run -p cli --bin glyph -- sync --peer 157.180.10.49:21841 --no-verify-signatures
+cargo run -p cli --bin glyph -- sync --peer peer.example:21841 --no-verify-signatures
 
 # Apply the ClickHouse schema
 cargo run -p cli --bin glyph -- db-init

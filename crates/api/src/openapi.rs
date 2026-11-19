@@ -5,6 +5,7 @@ fn limit_param() -> Value {
         "name": "limit",
         "in": "query",
         "required": false,
+        "description": "Maximum rows to return. Values above the route maximum are clamped.",
         "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
     })
 }
@@ -30,59 +31,149 @@ fn offset_param() -> Value {
     })
 }
 
-fn path_param(name: &str, description: &str) -> Value {
+fn tick_param() -> Value {
     json!({
-        "name": name,
+        "name": "tick",
         "in": "path",
         "required": true,
-        "description": description,
+        "description": "Global tick number.",
+        "schema": { "type": "integer", "minimum": 0 }
+    })
+}
+
+fn epoch_param() -> Value {
+    json!({
+        "name": "epoch",
+        "in": "path",
+        "required": true,
+        "description": "Epoch number.",
+        "schema": { "type": "integer", "minimum": 0 }
+    })
+}
+
+fn identity_param() -> Value {
+    json!({
+        "name": "identity",
+        "in": "path",
+        "required": true,
+        "description": "Canonical uppercase base-26 identity, 60 characters.",
         "schema": { "type": "string" }
     })
+}
+
+fn transaction_hash_param() -> Value {
+    json!({
+        "name": "hash",
+        "in": "path",
+        "required": true,
+        "description": "Lowercase base-26 transaction hash, 60 characters.",
+        "schema": { "type": "string" }
+    })
+}
+
+fn issuer_param() -> Value {
+    json!({
+        "name": "issuer",
+        "in": "path",
+        "required": true,
+        "description": "Issuer identity in canonical uppercase base-26 form.",
+        "schema": { "type": "string" }
+    })
+}
+
+fn asset_name_param() -> Value {
+    json!({
+        "name": "name",
+        "in": "path",
+        "required": true,
+        "description": "Asset name, 1 to 7 uppercase ASCII letters or digits.",
+        "schema": { "type": "string", "minLength": 1, "maxLength": 7, "pattern": "^[A-Z0-9]+$" }
+    })
+}
+
+fn contract_index_param() -> Value {
+    json!({
+        "name": "contract_index",
+        "in": "path",
+        "required": true,
+        "description": "Contract index.",
+        "schema": { "type": "integer", "minimum": 0 }
+    })
+}
+
+fn data_envelope(schema: &str) -> Value {
+    json!({
+        "type": "object",
+        "required": ["data"],
+        "properties": {
+            "data": { "$ref": format!("#/components/schemas/{schema}") },
+            "meta": { "type": "object" }
+        }
+    })
+}
+
+fn info() -> Value {
+    json!({
+        "title": "Glyph API",
+        "version": "0.2.0",
+        "summary": "A direct-peer read API for the Qubic network.",
+        "x-logo": { "url": "/logo.png", "altText": "Glyph" },
+        "description": "# Glyph API\n\nGlyph indexes Qubic by connecting straight to peers and verifying quorum evidence. There is no hosted RPC in the path: every tick, transaction, and event served here came from peer messages that Glyph fetched, aligned, and persisted itself.\n\n## Response shape\n\nEvery JSON response wraps its payload in `data`. Collections also return `meta` with pagination fields. Errors use RFC 9457 problem documents and a stable `code`.\n\n## Two read paths\n\n- Indexed routes under `/v1` read ClickHouse and return only quorum-verified, persisted history.\n- Live routes under `/v1/live` make a direct peer call per request. They may use a short 2-second cache and return `503 unavailable` when no peer answers.\n\n## Conventions\n\n- Amounts are integer QU in the network's base unit. 1 QU is 1 base unit and is never rescaled.\n- Identities are uppercase base-26. Transaction hashes are lowercase base-26. Tick and epoch numbers are JSON integers.\n- Newest-first collections accept `limit` and an opaque `cursor` from `meta.next_cursor`.\n- `/v1/status` reports ingest and network progress. `/status` renders the same state as HTML."
+    })
+}
+
+fn tags() -> Value {
+    json!([
+        { "name": "Status", "description": "Liveness, indexer progress, and the HTML operations dashboard." },
+        { "name": "Epochs", "description": "Epoch summaries and elected computor sets." },
+        { "name": "Ticks", "description": "Tick headers and their verified transaction and event contents." },
+        { "name": "Transactions", "description": "Transactions by hash, source, destination, input type, and tick." },
+        { "name": "Events", "description": "Contract event logs decoded into typed bodies and participants." },
+        { "name": "Identities", "description": "Identity history, balances, transfers, and contract interactions." },
+        { "name": "Wallets", "description": "Wallet-centric balances and issued or held assets." },
+        { "name": "Assets", "description": "Asset issuances, metadata, and holder sets." },
+        { "name": "Prices", "description": "Oracle price samples and hourly QUBIC/USDT history." },
+        { "name": "Market", "description": "External exchange consensus and market reference data." },
+        { "name": "Analytics", "description": "Aggregated activity, volume, and network-level counts." },
+        { "name": "Network", "description": "Index-wide counts, ingest progress, and peer-observed network state." },
+        { "name": "Stream", "description": "Server-sent and WebSocket event streams." },
+        { "name": "Live", "description": "Direct peer calls that are not part of the immutable index. Short-lived cache or no-store, may be unavailable." },
+        { "name": "Archive", "description": "Raw verified tick bundles retained for audit and replay." },
+        { "name": "Search", "description": "Resolve hashes, ticks, epochs, assets, and identities in one request." }
+    ])
+}
+
+fn tag_groups() -> Value {
+    json!([
+        { "name": "Operations", "tags": ["Status", "Network"] },
+        { "name": "Chain Data", "tags": ["Epochs", "Ticks", "Transactions", "Events", "Archive"] },
+        { "name": "Accounts & Assets", "tags": ["Identities", "Wallets", "Assets"] },
+        { "name": "Markets & Analytics", "tags": ["Prices", "Market", "Analytics"] },
+        { "name": "Live & Lookup", "tags": ["Live", "Stream", "Search"] }
+    ])
 }
 
 pub fn spec() -> Value {
     json!({
         "openapi": "3.1.0",
-        "info": {
-            "title": "Glyph API",
-            "version": "0.1.0",
-            "summary": "A direct-peer read API for the Qubic network.",
-            "x-logo": { "url": "/logo.png", "altText": "Glyph" },
-            "description": "# Glyph API\n\nGlyph indexes Qubic by connecting straight to peers and verifying quorum evidence. There is no hosted RPC in the path: every tick, transaction, and event served here came from peer messages that Glyph fetched, aligned, and persisted itself.\n\n## Reading the API\n\n- Every response wraps its payload in `data` and, where relevant, `meta`.\n- Newest-first collections accept `limit` and an opaque `cursor` from `meta.next_cursor`.\n- Tick, epoch, transaction, event, identity, wallet, asset, and price routes are read-only.\n- `/v1/status` reports live ingest and network progress; `/status` renders the same state as HTML.\n\n## Freshness\n\nNewest-first responses are cached briefly. `/v1/status` is never cached and includes the latest indexed tick, the current network head sampled from peers, indexer throughput, and current-epoch backfill coverage."
-        },
+        "info": info(),
         "servers": [{ "url": "/" }],
-        "tags": [
-            { "name": "Status", "description": "Liveness, indexer progress, and the HTML operations dashboard." },
-            { "name": "Epochs", "description": "Epoch summaries and elected computor sets." },
-            { "name": "Ticks", "description": "Tick headers and their verified transaction and event contents." },
-            { "name": "Transactions", "description": "Transactions by hash, source, destination, input type, and tick." },
-            { "name": "Events", "description": "Contract event logs decoded into typed bodies and participants." },
-            { "name": "Identities", "description": "Identity history, balances, transfers, and contract interactions." },
-            { "name": "Wallets", "description": "Wallet-centric balances and issued or held assets." },
-            { "name": "Assets", "description": "Asset issuances, metadata, and holder sets." },
-            { "name": "Prices", "description": "Oracle price samples and hourly QUBIC/USDT history." },
-            { "name": "Market", "description": "External exchange consensus and market reference data." },
-            { "name": "Analytics", "description": "Aggregated activity, volume, and network-level counts." },
-            { "name": "Stream", "description": "Server-sent event streams for new ticks and transactions." },
-            { "name": "Network", "description": "Peer-observed network state and index coverage." },
-            { "name": "Contracts", "description": "Contract call history and per-contract activity." },
-            { "name": "Archive", "description": "Raw verified tick bundles retained for audit and replay." },
-            { "name": "Search", "description": "Resolve hashes, ticks, epochs, assets, and identities in one request." }
-        ],
-        "x-tagGroups": [
-            { "name": "Operations", "tags": ["Status", "Network"] },
-            { "name": "Chain Data", "tags": ["Epochs", "Ticks", "Transactions", "Events", "Contracts", "Archive"] },
-            { "name": "Accounts & Assets", "tags": ["Identities", "Wallets", "Assets"] },
-            { "name": "Markets & Analytics", "tags": ["Prices", "Market", "Analytics"] },
-            { "name": "Live & Lookup", "tags": ["Stream", "Search"] }
-        ],
-        "paths": {
-            "/healthz": {
+        "tags": tags(),
+        "x-tagGroups": tag_groups(),
+        "paths": paths(),
+        "components": { "schemas": schemas() }
+    })
+}
+
+fn paths() -> Value {
+    json!({
+        // Operations
+        "/healthz": {
                 "get": {
                     "operationId": "getHealth",
                     "tags": ["Status"],
-                    "summary": "Liveness probe",
-                    "description": "Returns 200 as soon as the process is accepting requests. It does not touch storage or peers, so it is safe for load balancers and container health checks.",
+                    "summary": "Check process health",
+                    "description": "Returns 200 as soon as the process is accepting requests. It does not touch storage or peers, so it is safe for load balancers and container health checks. For index and network state, use `/v1/status`.",
                     "responses": { "200": { "description": "Process is alive" } }
                 }
             },
@@ -90,8 +181,8 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "getStatus",
                     "tags": ["Status"],
-                    "summary": "Live indexer and network progress",
-                    "description": "Returns the persisted index head, ingest cursor, sampled peer head, indexer throughput, lag and ETA, and current-epoch backfill coverage. Throughput is measured between status requests at least one second apart, so the first request after startup may omit rates.",
+                    "summary": "Get live indexer and network progress",
+                    "description": "Returns the persisted index head, ingest cursor, sampled peer head, indexer throughput, lag and ETA, and current-epoch backfill coverage. Never cached. Throughput is measured between status requests at least one second apart, so the first request after startup may omit rates.",
                     "responses": {
                         "200": {
                             "description": "Current status",
@@ -110,50 +201,51 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "getStatusPage",
                     "tags": ["Status"],
-                    "summary": "Server-rendered operations dashboard",
+                    "summary": "Open the server-rendered operations dashboard",
                     "description": "Uptime, head, ingest cursor, counts, and runtime feature flags. Refreshes every 5 seconds and does not require JavaScript.",
                     "responses": { "200": { "description": "HTML dashboard", "content": { "text/html": { "schema": { "type": "string" } } } } }
                 }
             },
-            "/v1/network/stats": {
+            "/v1/network": {
                 "get": {
-                    "operationId": "getNetworkStats",
+                    "operationId": "getNetwork",
                     "tags": ["Network"],
-                    "summary": "Index-wide counts and coverage",
-                    "description": "Entity counts and the indexed tick range. Use /v1/status for live peer throughput and backfill progress.",
+                    "summary": "Get index-wide counts and coverage",
+                    "description": "Entity counts and the indexed tick range. Local-only and stable for dashboards. Use `/v1/status` for live peer throughput and backfill progress.",
                     "responses": {
                         "200": { "description": "Network stats", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/NetworkStats" } } } } } },
                         "500": { "description": "Storage failure" }
                     }
                 }
             },
+            // Chain data
             "/v1/epochs": {
                 "get": {
                     "operationId": "listEpochs",
                     "tags": ["Epochs"],
-                    "summary": "Epoch summaries, newest first",
+                    "summary": "List epoch summaries, newest first",
                     "description": "One row per indexed epoch with its tick range, transaction and event counts, and observed timestamps. Walk backwards through history with cursor pagination.",
                     "parameters": [limit_param(), cursor_param(), offset_param()],
-                    "responses": { "200": { "description": "Paginated epochs" } }
+                    "responses": { "200": { "description": "Paginated epochs, newest first", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EpochPage" } } } } }
                 }
             },
             "/v1/epochs/{epoch}": {
                 "get": {
                     "operationId": "getEpoch",
                     "tags": ["Epochs"],
-                    "summary": "One epoch summary",
-                    "description": "Returns the same summary row as the collection for a single epoch.",
-                    "parameters": [path_param("epoch", "Epoch number")],
-                    "responses": { "200": { "description": "Epoch" }, "404": { "description": "Epoch not indexed" } }
+                    "summary": "Get one epoch summary",
+                    "description": "Returns the summary row for one indexed epoch. Returns 404 when the epoch has no indexed ticks.",
+                    "parameters": [epoch_param()],
+                    "responses": { "200": { "description": "Epoch summary", "content": { "application/json": { "schema": data_envelope("Epoch") } } }, "404": { "description": "Epoch not indexed" } }
                 }
             },
             "/v1/epochs/{epoch}/computors": {
                 "get": {
                     "operationId": "listEpochComputors",
                     "tags": ["Epochs"],
-                    "summary": "Elected computor set for an epoch",
+                    "summary": "List the elected computor set for an epoch",
                     "description": "Ordered by computor_index. public_key is 0x-prefixed hex and identity is the canonical uppercase base-26 form.",
-                    "parameters": [path_param("epoch", "Epoch number")],
+                    "parameters": [epoch_param()],
                     "responses": {
                         "200": {
                             "description": "Computor list",
@@ -173,35 +265,35 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "listTicks",
                     "tags": ["Ticks"],
-                    "summary": "Ticks, newest first",
+                    "summary": "List ticks, newest first",
                     "description": "Tick headers with timestamp, computor index, transaction and event counts, and verification tier. Filter by epoch and page with cursors.",
                     "parameters": [
                         { "name": "epoch", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
                         limit_param(), cursor_param(), offset_param()
                     ],
-                    "responses": { "200": { "description": "Paginated ticks" } }
+                    "responses": { "200": { "description": "Paginated ticks, newest first", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TickPage" } } } } }
                 }
             },
             "/v1/ticks/{tick}": {
                 "get": {
                     "operationId": "getTick",
                     "tags": ["Ticks"],
-                    "summary": "Tick by number",
-                    "description": "A single tick header. Tick numbers are global across epochs and increase monotonically.",
-                    "parameters": [path_param("tick", "Global tick number")],
+                    "summary": "Get a tick by number",
+                    "description": "A single tick header. Tick numbers are global across epochs and increase monotonically. Returns 404 when the tick is not indexed.",
+                    "parameters": [tick_param()],
                     "responses": {
-                        "200": { "description": "Tick" },
+                        "200": { "description": "Tick header", "content": { "application/json": { "schema": data_envelope("Tick") } } },
                         "404": { "description": "Tick not indexed" }
                     }
                 }
             },
             "/v1/ticks/{tick}/evidence": {
                 "get": {
-                    "operationId": "getTickEvidence",
+                    "operationId": "getTickQuorumEvidence",
                     "tags": ["Ticks"],
-                    "summary": "Quorum evidence behind a stored tick",
+                    "summary": "Get the quorum evidence behind a stored tick",
                     "description": "Digests are lowercase hex. Vote counts describe how the winning quorum was assembled.",
-                    "parameters": [path_param("tick", "Global tick number")],
+                    "parameters": [tick_param()],
                     "responses": {
                         "200": {
                             "description": "Quorum evidence",
@@ -217,12 +309,12 @@ pub fn spec() -> Value {
             "/v1/ticks/{tick}/transactions": {
                 "get": {
                     "operationId": "listTickTransactions",
-                    "tags": ["Ticks", "Transactions"],
-                    "summary": "Transactions in a tick, slot order",
+                    "tags": ["Ticks"],
+                    "summary": "List transactions in a tick, in slot order",
                     "description": "Transactions in execution-slot order with hash, source, destination, amount, input type, input data, and status.",
-                    "parameters": [path_param("tick", "Global tick number"), limit_param(), cursor_param(), offset_param()],
+                    "parameters": [tick_param(), limit_param(), cursor_param(), offset_param()],
                     "responses": {
-                        "200": { "description": "Paginated transactions" },
+                        "200": { "description": "Paginated transactions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransactionPage" } } } },
                         "404": { "description": "Tick not indexed" }
                     }
                 }
@@ -230,12 +322,12 @@ pub fn spec() -> Value {
             "/v1/ticks/{tick}/events": {
                 "get": {
                     "operationId": "listTickEvents",
-                    "tags": ["Ticks", "Events"],
-                    "summary": "Events in a tick, log id order",
+                    "tags": ["Ticks"],
+                    "summary": "List events in a tick, in log-id order",
                     "description": "Decoded contract events in log-id order with type name, typed body, participant identities, and the transaction that produced them.",
-                    "parameters": [path_param("tick", "Global tick number"), limit_param(), cursor_param(), offset_param()],
+                    "parameters": [tick_param(), limit_param(), cursor_param(), offset_param()],
                     "responses": {
-                        "200": { "description": "Paginated events" },
+                        "200": { "description": "Paginated events", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EventPage" } } } },
                         "404": { "description": "Tick not indexed" }
                     }
                 }
@@ -244,7 +336,7 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "listTransactions",
                     "tags": ["Transactions"],
-                    "summary": "Transactions, newest tick first",
+                    "summary": "List transactions, newest tick first",
                     "description": "Transactions filtered by epoch, tick, or identity. Newest tick and slot first. Use the dedicated identity or tick routes for larger histories.",
                     "parameters": [
                         { "name": "epoch", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
@@ -252,7 +344,7 @@ pub fn spec() -> Value {
                         { "name": "identity", "in": "query", "schema": { "type": "string" } },
                         limit_param(), cursor_param(), offset_param()
                     ],
-                    "responses": { "200": { "description": "Paginated transactions" }, "400": { "description": "Invalid identity or cursor" } }
+                    "responses": { "200": { "description": "Paginated transactions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransactionPage" } } } }, "400": { "description": "Invalid identity or cursor" } }
                 },
                 "post": {
                     "operationId": "broadcastTransaction",
@@ -276,11 +368,11 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "getTransaction",
                     "tags": ["Transactions"],
-                    "summary": "Transaction by lowercase base-26 hash",
+                    "summary": "Get a transaction by hash",
                     "description": "Look up one transaction by its 60-character lowercase base-26 hash.",
-                    "parameters": [path_param("hash", "60-character transaction hash")],
+                    "parameters": [transaction_hash_param()],
                     "responses": {
-                        "200": { "description": "Transaction" },
+                        "200": { "description": "Transaction", "content": { "application/json": { "schema": data_envelope("Transaction") } } },
                         "400": { "description": "Invalid hash" },
                         "404": { "description": "Transaction not indexed" }
                     }
@@ -289,10 +381,10 @@ pub fn spec() -> Value {
             "/v1/transactions/{hash}/effects": {
                 "get": {
                     "operationId": "getTransactionEffects",
-                    "tags": ["Transactions", "Events"],
-                    "summary": "Transaction, tick header, events, and normalized effects",
+                    "tags": ["Transactions"],
+                    "summary": "Get the full explorer view for a transaction",
                     "description": "One request for an explorer transaction page. Returns the indexed transaction, its tick header, every decoded event, a typed effect list for transfers, asset movements, burns, contract messages, and custom messages, plus an aggregate summary. This route is local-only and never opens a peer connection.",
-                    "parameters": [path_param("hash", "60-character transaction hash")],
+                    "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Transaction effects", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/TransactionEffects" } } } } } },
                         "400": { "description": "Invalid transaction hash" },
@@ -304,7 +396,7 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "listEvents",
                     "tags": ["Events"],
-                    "summary": "Typed events, newest tick first",
+                    "summary": "List typed events, newest tick first",
                     "description": "Decoded logs with type name, body, participants, and transaction linkage. Filter by epoch, tick, or event type.",
                     "parameters": [
                         { "name": "epoch", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
@@ -312,28 +404,29 @@ pub fn spec() -> Value {
                         { "name": "type", "in": "query", "schema": { "type": "string" } },
                         limit_param(), cursor_param(), offset_param()
                     ],
-                    "responses": { "200": { "description": "Paginated events" }, "400": { "description": "Invalid cursor" } }
+                    "responses": { "200": { "description": "Paginated events", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EventPage" } } } }, "400": { "description": "Invalid cursor" } }
                 }
             },
+            // Accounts and assets
             "/v1/identities": {
                 "get": {
                     "operationId": "listIdentities",
                     "tags": ["Identities"],
-                    "summary": "Identities by most recent activity",
+                    "summary": "List identities by most recent activity",
                     "description": "Ranked by latest activity. Each row carries observed QU balance, incoming and outgoing totals, transfer count, and first and last seen ticks.",
                     "parameters": [limit_param(), cursor_param(), offset_param()],
-                    "responses": { "200": { "description": "Paginated identities" } }
+                    "responses": { "200": { "description": "Paginated identities, most recently active first", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IdentityPage" } } } } }
                 }
             },
             "/v1/identities/{identity}": {
                 "get": {
                     "operationId": "getIdentity",
                     "tags": ["Identities"],
-                    "summary": "Identity summary and observed QU flow",
+                    "summary": "Get an identity summary and observed QU flow",
                     "description": "Indexed QU flow, transfer count, and first and last activity for one identity. This is observed history, not a live spectrum lookup.",
-                    "parameters": [path_param("identity", "Uppercase base-26 identity")],
+                    "parameters": [identity_param()],
                     "responses": {
-                        "200": { "description": "Identity" },
+                        "200": { "description": "Identity summary", "content": { "application/json": { "schema": data_envelope("Identity") } } },
                         "400": { "description": "Invalid identity" },
                         "404": { "description": "Identity not indexed" }
                     }
@@ -342,12 +435,12 @@ pub fn spec() -> Value {
             "/v1/identities/{identity}/transactions": {
                 "get": {
                     "operationId": "listIdentityTransactions",
-                    "tags": ["Identities", "Transactions"],
-                    "summary": "Transactions sent or received by an identity",
+                    "tags": ["Identities"],
+                    "summary": "List transactions sent or received by an identity",
                     "description": "Both outgoing transactions and transfers where the identity is the destination, newest first.",
-                    "parameters": [path_param("identity", "Uppercase base-26 identity"), limit_param(), cursor_param(), offset_param()],
+                    "parameters": [identity_param(), limit_param(), cursor_param(), offset_param()],
                     "responses": {
-                        "200": { "description": "Paginated transactions" },
+                        "200": { "description": "Paginated transactions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransactionPage" } } } },
                         "400": { "description": "Invalid identity or cursor" }
                     }
                 }
@@ -355,12 +448,12 @@ pub fn spec() -> Value {
             "/v1/identities/{identity}/activity": {
                 "get": {
                     "operationId": "getIdentityActivity",
-                    "tags": ["Identities", "Transactions", "Events"],
-                    "summary": "Linear transaction and contract-effect history",
+                    "tags": ["Identities"],
+                    "summary": "Get the linear activity timeline for an identity",
                     "description": "Merges direct transactions with decoded events where the identity participates, including contract payouts and asset movements.",
-                    "parameters": [path_param("identity", "Uppercase base-26 identity"), limit_param(), cursor_param(), offset_param()],
+                    "parameters": [identity_param(), limit_param(), cursor_param(), offset_param()],
                     "responses": {
-                        "200": { "description": "Paginated activity rows with kind transaction or event" },
+                        "200": { "description": "Paginated activity rows with kind transaction or event", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IdentityActivityPage" } } } },
                         "400": { "description": "Invalid identity or cursor" }
                     }
                 }
@@ -368,11 +461,11 @@ pub fn spec() -> Value {
             "/v1/identities/{identity}/counterparties": {
                 "get": {
                     "operationId": "listIdentityCounterparties",
-                    "tags": ["Identities", "Analytics"],
-                    "summary": "Top counterparties by transfer volume",
+                    "tags": ["Identities"],
+                    "summary": "List top counterparties by transfer volume",
                     "description": "Aggregates indexed transfers where the identity is the source or destination. Each row reports incoming and outgoing amounts, net flow, transaction count, and first and last tick. Self-transfers are excluded. This route is local-only.",
                     "parameters": [
-                        path_param("identity", "Uppercase base-26 identity"),
+                        identity_param(),
                         { "name": "direction", "in": "query", "schema": { "type": "string", "enum": ["all", "incoming", "outgoing"], "default": "all" } },
                         { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } }
                     ],
@@ -385,11 +478,11 @@ pub fn spec() -> Value {
             "/v1/identities/{identity}/flow": {
                 "get": {
                     "operationId": "getIdentityFlow",
-                    "tags": ["Identities", "Analytics"],
-                    "summary": "Bucketed incoming and outgoing QU flow",
+                    "tags": ["Identities"],
+                    "summary": "Get bucketed incoming and outgoing QU flow",
                     "description": "Returns a fixed window of buckets ending at the indexed head. Empty buckets are zero-filled so charts do not need to resample. Amounts are in the network's base unit and are not rescaled.",
                     "parameters": [
-                        path_param("identity", "Uppercase base-26 identity"),
+                        identity_param(),
                         { "name": "interval", "in": "query", "schema": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 3600 }, "description": "Bucket width in seconds" },
                         { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 168 }, "description": "Number of buckets, newest first" }
                     ],
@@ -403,12 +496,12 @@ pub fn spec() -> Value {
             "/v1/identities/{identity}/events": {
                 "get": {
                     "operationId": "listIdentityEvents",
-                    "tags": ["Identities", "Events"],
-                    "summary": "Events where the identity participates",
+                    "tags": ["Identities"],
+                    "summary": "List events where the identity participates",
                     "description": "Contract events where the identity appears as a sender, receiver, or other participant, newest first.",
-                    "parameters": [path_param("identity", "Uppercase base-26 identity"), limit_param(), cursor_param(), offset_param()],
+                    "parameters": [identity_param(), limit_param(), cursor_param(), offset_param()],
                     "responses": {
-                        "200": { "description": "Paginated event rows" },
+                        "200": { "description": "Paginated event rows", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EventPage" } } } },
                         "400": { "description": "Invalid identity or cursor" }
                     }
                 }
@@ -417,24 +510,24 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "listAssets",
                     "tags": ["Assets"],
-                    "summary": "Assets derived from issuance events, by issuer and name",
-                    "description": "Assets discovered from issuance events. Filter by issuer or owner and page newest first.",
+                    "summary": "List assets derived from issuance events",
+                    "description": "Assets discovered from issuance events in the indexed range. Filter by issuer and page newest first. Returns an empty page when the indexed epochs contain no issuance events.",
                     "parameters": [
                         { "name": "issuer", "in": "query", "schema": { "type": "string" } },
                         limit_param(), cursor_param(), offset_param()
                     ],
-                    "responses": { "200": { "description": "Paginated assets" }, "400": { "description": "Invalid issuer or cursor" } }
+                    "responses": { "200": { "description": "Paginated assets", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AssetPage" } } } }, "400": { "description": "Invalid issuer or cursor" } }
                 }
             },
             "/v1/assets/{issuer}/{name}": {
                 "get": {
                     "operationId": "getAsset",
                     "tags": ["Assets"],
-                    "summary": "One asset by issuer and name",
+                    "summary": "Get one asset by issuer and name",
                     "description": "Asset metadata and issuance details for one issuer and asset name.",
-                    "parameters": [path_param("issuer", "Issuer identity"), path_param("name", "Asset name")],
+                    "parameters": [issuer_param(), asset_name_param()],
                     "responses": {
-                        "200": { "description": "Asset" },
+                        "200": { "description": "Asset metadata", "content": { "application/json": { "schema": data_envelope("Asset") } } },
                         "400": { "description": "Invalid issuer" },
                         "404": { "description": "Asset not indexed" }
                     }
@@ -443,17 +536,17 @@ pub fn spec() -> Value {
             "/v1/assets/{issuer}/{name}/transfers": {
                 "get": {
                     "operationId": "listAssetTransfers",
-                    "tags": ["Assets", "Events"],
-                    "summary": "Ownership and possession transfers for one asset",
+                    "tags": ["Assets"],
+                    "summary": "List ownership and possession transfers for one asset",
                     "description": "Local indexed history of decoded asset_ownership_change and asset_possession_change events, newest first. Works without a peer and does not rebuild the holder set.",
                     "parameters": [
-                        path_param("issuer", "Issuer identity"),
-                        path_param("name", "Asset name, 1-7 ASCII letters or digits"),
+                        issuer_param(),
+                        asset_name_param(),
                         { "name": "kind", "in": "query", "schema": { "type": "string", "enum": ["all", "ownership", "possession"], "default": "all" } },
                         limit_param(), cursor_param(), offset_param()
                     ],
                     "responses": {
-                        "200": { "description": "Paginated transfer events", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "type": "array", "items": { "$ref": "#/components/schemas/AssetTransfer" } } } } } } },
+                        "200": { "description": "Paginated transfer events", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AssetTransferPage" } } } },
                         "400": { "description": "Invalid issuer, asset name, kind, or cursor" }
                     }
                 }
@@ -461,10 +554,10 @@ pub fn spec() -> Value {
             "/v1/wallets/{identity}": {
                 "get": {
                     "operationId": "getWallet",
-                    "tags": ["Wallets", "Identities", "Network"],
-                    "summary": "Wallet overview from the index and a direct peer",
+                    "tags": ["Wallets"],
+                    "summary": "Get the wallet overview from index plus peer",
                     "description": "Combines the indexed identity and its ten newest transactions with the peer spectrum entity and the issued, owned, and possessed asset lists. One peer connection serves the request.",
-                    "parameters": [path_param("identity", "60-character identity")],
+                    "parameters": [identity_param()],
                     "responses": {
                         "200": { "description": "Wallet overview", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/WalletOverview" }, "meta": { "type": "object" } } } } } },
                         "400": { "description": "Invalid identity" },
@@ -475,12 +568,12 @@ pub fn spec() -> Value {
             },
             "/v1/wallets/{identity}/assets": {
                 "get": {
-                    "operationId": "getWalletAssets",
-                    "tags": ["Wallets", "Assets", "Network"],
-                    "summary": "Issued, owned, and possessed assets for a wallet",
+                    "operationId": "listWalletAssets",
+                    "tags": ["Wallets"],
+                    "summary": "List issued, owned, and possessed assets for a wallet",
                     "description": "Asset lists from one peer connection, filtered by kind. Use kind=all for a single round trip.",
                     "parameters": [
-                        path_param("identity", "60-character identity"),
+                        identity_param(),
                         { "name": "kind", "in": "query", "required": false, "schema": { "type": "string", "enum": ["issued", "owned", "possessed", "all"], "default": "all" } }
                     ],
                     "responses": {
@@ -490,13 +583,13 @@ pub fn spec() -> Value {
                     }
                 }
             },
-            "/v1/wallets/{identity}/snapshot": {
+            "/v1/live/wallets/{identity}": {
                 "get": {
-                    "operationId": "getWalletSnapshot",
-                    "tags": ["Wallets", "Network"],
-                    "summary": "Point-in-time peer snapshot for a wallet",
+                    "operationId": "getLiveWallet",
+                    "tags": ["Live"],
+                    "summary": "Get a point-in-time peer snapshot for a wallet",
                     "description": "Entity, asset lists, counts, and peer head from a single peer connection. Never cached.",
-                    "parameters": [path_param("identity", "60-character identity")],
+                    "parameters": [identity_param()],
                     "responses": {
                         "200": { "description": "Wallet snapshot", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/WalletSnapshot" }, "meta": { "type": "object" } } } } } },
                         "400": { "description": "Invalid identity" },
@@ -507,12 +600,12 @@ pub fn spec() -> Value {
             "/v1/assets/{issuer}/{name}/holders": {
                 "get": {
                     "operationId": "listAssetHolders",
-                    "tags": ["Assets", "Network"],
-                    "summary": "Ownership holders for an asset",
+                    "tags": ["Assets"],
+                    "summary": "List ownership holders for an asset",
                     "description": "Queries the peer asset tree for ownership records of one issuer and asset name. Holders are deduplicated by identity, sorted by shares descending then identity, and truncated to limit.",
                     "parameters": [
-                        path_param("issuer", "Issuer identity"),
-                        path_param("name", "Asset name, 1-7 uppercase ASCII letters or digits"),
+                        issuer_param(),
+                        asset_name_param(),
                         { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 100 } }
                     ],
                     "responses": {
@@ -522,14 +615,15 @@ pub fn spec() -> Value {
                     }
                 }
             },
+            // Lookup and analytics
             "/v1/search": {
                 "get": {
                     "operationId": "search",
                     "tags": ["Search"],
-                    "summary": "Resolve a tick, transaction hash, or identity",
+                    "summary": "Search ticks, transactions, identities, and assets",
                     "description": "One query parameter, typed results. Ticks resolve as integers, transaction hashes by base-26 digest, and identities in either canonical or hex form.",
                     "parameters": [{ "name": "q", "in": "query", "required": true, "schema": { "type": "string" } }],
-                    "responses": { "200": { "description": "Typed matches" }, "400": { "description": "Missing query" } }
+                    "responses": { "200": { "description": "Typed matches", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SearchResults" } } } }, "400": { "description": "Missing query" } }
                 }
             },
             "/v1/transactions/batch": {
@@ -550,42 +644,43 @@ pub fn spec() -> Value {
             },
             "/v1/analytics/activity": {
                 "get": {
-                    "operationId": "getActivityAnalytics",
+                    "operationId": "getActivity",
                     "tags": ["Analytics"],
-                    "summary": "Transaction and event counts per time bucket",
+                    "summary": "Get transaction and event counts per time bucket",
                     "description": "Bucketed activity with deduplicated counts across replayed ticks and summed QU volume. Choose the interval and window with query parameters.",
                     "parameters": [
                         { "name": "interval", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 86400, "default": 3600 }, "description": "Bucket width in seconds" },
                         { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 24 } }
                     ],
-                    "responses": { "200": { "description": "Activity buckets, newest first" } }
+                    "responses": { "200": { "description": "Activity buckets, newest first", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ActivityBucketPage" } } } } }
                 }
             },
             "/v1/analytics/top-identities": {
                 "get": {
                     "operationId": "listTopIdentities",
                     "tags": ["Analytics"],
-                    "summary": "Identities with the most observed activity",
+                    "summary": "List identities with the most observed activity",
                     "description": "Ranked by transfer count, with balance and first and last seen ticks for each identity.",
                     "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 25 } }],
-                    "responses": { "200": { "description": "Ranked identities" } }
+                    "responses": { "200": { "description": "Ranked identities", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IdentityPage" } } } } }
                 }
             },
             "/v1/analytics/event-types": {
                 "get": {
-                    "operationId": "getEventTypeAnalytics",
+                    "operationId": "listEventTypes",
                     "tags": ["Analytics"],
-                    "summary": "Event counts grouped by decoded type",
+                    "summary": "Get event counts grouped by decoded type",
                     "description": "Total occurrences for each decoded event type, highest first.",
                     "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } }],
-                    "responses": { "200": { "description": "Event type counts" } }
+                    "responses": { "200": { "description": "Event type counts, highest first", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EventTypePage" } } } } }
                 }
             },
+            // Streaming
             "/v1/stream": {
                 "get": {
                     "operationId": "streamAll",
                     "tags": ["Stream"],
-                    "summary": "Server-sent events for ticks, transactions, and events",
+                    "summary": "Subscribe to ticks, transactions, events, prices, and market",
                     "description": "Polls the local index head only; never opens a peer connection. Sends keep-alive comments every 15 seconds and lag events when a subscriber falls behind.",
                     "parameters": [
                         { "name": "types", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated subset of tick,transaction,event,price,market. The poll interval is set on the server with STREAM_POLL_MS." },
@@ -602,7 +697,7 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "streamTicks",
                     "tags": ["Stream"],
-                    "summary": "Tick events only",
+                    "summary": "Subscribe to tick headers only",
                     "description": "Server-sent tick headers as new ticks are indexed.",
                     "responses": { "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "503": { "description": "Streaming is not enabled" } }
                 }
@@ -611,7 +706,7 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "streamTransactions",
                     "tags": ["Stream"],
-                    "summary": "Transaction events only",
+                    "summary": "Subscribe to transaction rows only",
                     "description": "Server-sent transaction rows as new ticks are indexed.",
                     "responses": { "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "503": { "description": "Streaming is not enabled" } }
                 }
@@ -620,59 +715,78 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "streamEvents",
                     "tags": ["Stream"],
-                    "summary": "Log event events only",
+                    "summary": "Subscribe to decoded contract events only",
                     "description": "Server-sent decoded contract events as new ticks are indexed.",
                     "responses": { "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "503": { "description": "Streaming is not enabled" } }
                 }
             },
+            "/v1/stream/prices": {
+                "get": {
+                    "operationId": "streamPrices",
+                    "tags": ["Stream"],
+                    "summary": "Subscribe to price-point updates only",
+                    "description": "Server-sent price points as new hours are stored. Same payload as GET /v1/prices, pushed when the stored hour changes.",
+                    "responses": { "200": { "description": "text/event-stream" }, "503": { "description": "Streaming is not enabled" } }
+                }
+            },
+            "/v1/stream/market": {
+                "get": {
+                    "operationId": "streamMarket",
+                    "tags": ["Stream"],
+                    "summary": "Subscribe to market-snapshot updates only",
+                    "description": "Server-sent market snapshots as the external reference refreshes. Same payload as GET /v1/market.",
+                    "responses": { "200": { "description": "text/event-stream" }, "503": { "description": "Streaming is not enabled" } }
+                }
+            },
             "/v1/ws": {
                 "get": {
-                    "operationId": "websocketStream",
+                    "operationId": "streamWebSocket",
                     "tags": ["Stream"],
-                    "summary": "WebSocket feed with the same event stream",
+                    "summary": "Subscribe over WebSocket with the same event stream",
                     "description": "Upgrade to a WebSocket and receive the same JSON events as the SSE stream on one connection.",
                     "responses": { "200": { "description": "WebSocket upgrade" }, "503": { "description": "Streaming is not enabled" } }
                 }
             },
-            "/v1/identities/{identity}/entity": {
+            // Live peer routes
+            "/v1/live/identities/{identity}": {
                 "get": {
-                    "operationId": "getIdentityEntity",
-                    "tags": ["Identities", "Network"],
-                    "summary": "Entity record from a direct peer",
-                    "description": "Reads the peer spectrum entity for an identity. This is live peer state and is never cached.",
-                    "parameters": [path_param("identity", "Uppercase base-26 identity")],
+                    "operationId": "getLiveIdentity",
+                    "tags": ["Live"],
+                    "summary": "Get the live identity record from a direct peer",
+                    "description": "Reads the peer spectrum entity for an identity. This is live peer state with a two-second cache.",
+                    "parameters": [identity_param()],
                     "responses": {
-                        "200": { "description": "Entity record from the peer" },
+                        "200": { "description": "Live identity record from the peer", "content": { "application/json": { "schema": data_envelope("LiveIdentity") } } },
                         "400": { "description": "Invalid identity" },
                         "404": { "description": "Peer has no entity record" },
                         "503": { "description": "No peer available" }
                     }
                 }
             },
-            "/v1/transactions/{hash}/network": {
+            "/v1/live/transactions/{hash}": {
                 "get": {
-                    "operationId": "getNetworkTransaction",
-                    "tags": ["Transactions", "Network"],
-                    "summary": "Transaction as reported by a direct peer",
+                    "operationId": "getLiveTransaction",
+                    "tags": ["Live"],
+                    "summary": "Get a transaction as reported by a direct peer",
                     "description": "Reads a transaction from a peer by hash. Useful for transactions newer than the local index.",
-                    "parameters": [path_param("hash", "60-character transaction hash")],
+                    "parameters": [transaction_hash_param()],
                     "responses": {
-                        "200": { "description": "Peer transaction record" },
+                        "200": { "description": "Transaction as reported by the peer", "content": { "application/json": { "schema": data_envelope("Transaction") } } },
                         "400": { "description": "Invalid hash" },
                         "404": { "description": "Peer has no transaction" },
                         "503": { "description": "No peer available" }
                     }
                 }
             },
-            "/v1/transactions/{hash}/network/status": {
+            "/v1/live/transactions/{hash}/status": {
                 "get": {
-                    "operationId": "getNetworkTransactionStatus",
-                    "tags": ["Transactions", "Network"],
-                    "summary": "Peer confirmation and money-flow status for a transaction",
+                    "operationId": "getLiveTransactionStatus",
+                    "tags": ["Live"],
+                    "summary": "Get peer confirmation and money-flow for a transaction",
                     "description": "Looks up the confirmed transaction by hash, then asks the same peer for the tick tx-status add-on. When the peer does not run the add-on, the response is still 200 with money_flew null and meta.status_source unavailable.",
-                    "parameters": [path_param("hash", "60-character transaction hash")],
+                    "parameters": [transaction_hash_param()],
                     "responses": {
-                        "200": { "description": "Peer transaction status", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/TransactionNetworkStatus" } } } } } },
+                        "200": { "description": "Peer transaction status", "content": { "application/json": { "schema": data_envelope("TransactionNetworkStatus") } } },
                         "400": { "description": "Invalid hash" },
                         "404": { "description": "Peer has no confirmed transaction" },
                         "503": { "description": "No peer available or transaction lookup failed" }
@@ -683,7 +797,7 @@ pub fn spec() -> Value {
                 "post": {
                     "operationId": "validateTransaction",
                     "tags": ["Transactions"],
-                    "summary": "Validate a signed transaction locally without broadcasting",
+                    "summary": "Validate a signed transaction without broadcasting",
                     "description": "Decodes the signed transaction and reports amount-range, input-size, and SchnorrQ signature checks. No peer connection is opened and ALLOW_BROADCAST is not required.",
                     "requestBody": {
                         "required": true,
@@ -698,10 +812,10 @@ pub fn spec() -> Value {
             "/v1/transactions/{hash}/status": {
                 "get": {
                     "operationId": "getTransactionStatus",
-                    "tags": ["Transactions", "Network"],
-                    "summary": "Combined indexed and peer transaction status",
+                    "tags": ["Transactions"],
+                    "summary": "Get indexed plus live confirmation for a transaction",
                     "description": "Returns the indexed row when present and best-effort peer confirmation data. An indexed transaction still returns 200 when peers are unavailable; meta.peer_error explains the degradation.",
-                    "parameters": [path_param("hash", "60-character transaction hash")],
+                    "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Indexed and/or peer transaction status" },
                         "400": { "description": "Invalid hash" },
@@ -710,27 +824,27 @@ pub fn spec() -> Value {
                     }
                 }
             },
-            "/v1/ticks/{tick}/tx-status": {
+            "/v1/live/ticks/{tick}/transactions": {
                 "get": {
-                    "operationId": "getTickTransactionStatus",
-                    "tags": ["Ticks", "Network"],
-                    "summary": "Transaction confirmation status from a direct peer",
+                    "operationId": "listLiveTickTransactions",
+                    "tags": ["Live"],
+                    "summary": "Get live confirmation status for every transaction in a tick",
                     "description": "Peer-side status for every transaction in a tick, including whether money moved for each hash.",
-                    "parameters": [path_param("tick", "Global tick number")],
+                    "parameters": [tick_param()],
                     "responses": {
-                        "200": { "description": "Peer transaction status" },
+                        "200": { "description": "Peer transaction status", "content": { "application/json": { "schema": data_envelope("TickTransactionStatus") } } },
                         "503": { "description": "No peer available" }
                     }
                 }
             },
             "/v1/ticks/{tick}/raw": {
                 "get": {
-                    "operationId": "getRawTickBundle",
-                    "tags": ["Ticks", "Archive"],
-                    "summary": "Archived raw QBB1 tick bundle or one section",
+                    "operationId": "downloadTickBundle",
+                    "tags": ["Archive"],
+                    "summary": "Download the archived raw QBB1 tick bundle",
                     "description": "Requires S3_BUCKET or ARCHIVE_DIR to be configured for the API. Without section, returns the zstd-compressed QBB1 container.",
                     "parameters": [
-                        path_param("tick", "Global tick number"),
+                        tick_param(),
                         { "name": "section", "in": "query", "schema": { "type": "string", "enum": ["tick", "tick_data", "votes", "transactions", "log_ranges", "logs", "computors"] } }
                     ],
                     "responses": {
@@ -741,36 +855,37 @@ pub fn spec() -> Value {
                     }
                 }
             },
-            "/v1/contracts/{contract_index}/query": {
+            "/v1/live/contracts/{contract_index}/query": {
                 "post": {
                     "operationId": "queryContract",
-                    "tags": ["Contracts", "Network"],
+                    "tags": ["Live"],
                     "summary": "Call a read-only contract function on a direct peer",
-                    "description": "Queries a contract index with a raw input type and hex payload against a direct peer. No ABI or contract name is assumed; the caller supplies the encoded input and receives raw output bytes.",
-                    "parameters": [path_param("contract_index", "Contract index")],
+                    "description": "Queries a contract index with a raw input type and hex payload against a direct peer. No ABI or contract name is assumed; the caller supplies encoded input and receives raw output bytes. Cached for up to two seconds. Returns 503 when no peer answers.",
+                    "parameters": [contract_index_param()],
                     "requestBody": {
                         "required": false,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ContractQueryRequest" } } }
                     },
                     "responses": {
-                        "200": { "description": "Hex-encoded contract output" },
+                        "200": { "description": "Hex-encoded contract output", "content": { "application/json": { "schema": data_envelope("ContractQueryResult") } } },
                         "400": { "description": "Invalid hex or input exceeds MAX_INPUT_SIZE" },
                         "503": { "description": "No peer available or contract call failed" }
                     }
                 }
             },
+            // Prices and market
             "/v1/prices": {
                 "get": {
                     "operationId": "listPrices",
                     "tags": ["Prices"],
-                    "summary": "Hourly QUBIC/USDT points, ascending",
-                    "description": "Points recorded from the latest verified QUBIC/USDT Price oracle reply or the QPayhub GetQuUsdPrice fallback. When neither on-chain source exists, rows come from the external exchange consensus and omit on-chain-only fields such as epoch, ticks and series_digest.",
+                    "summary": "List hourly QUBIC/USDT points, ascending",
+                    "description": "Points recorded from the latest verified QUBIC/USDT Price oracle reply or the QPayhub GetQuUsdPrice fallback. When neither on-chain source exists, rows come from the external exchange consensus and set `onchain: false` while omitting on-chain-only fields.",
                     "parameters": [
                         { "name": "from_hour", "in": "query", "schema": { "type": "integer", "minimum": 0 }, "description": "First core price hour, inclusive" },
                         { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 168 } }
                     ],
                     "responses": {
-                        "200": { "description": "Price points", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "type": "array", "items": { "$ref": "#/components/schemas/PricePoint" } }, "meta": { "type": "object" } } } } } },
+                        "200": { "description": "Price points, ascending", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PricePointPage" } } } },
                         "500": { "description": "Storage failure" }
                     }
                 }
@@ -779,18 +894,18 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "getPriceHistory",
                     "tags": ["Prices"],
-                    "summary": "Trailing QUBIC/USDT price window",
+                    "summary": "Get the trailing QUBIC/USDT price window",
                     "description": "The most recent stored points for a requested number of hours, ascending. Missing hours are omitted rather than zero-filled.",
                     "parameters": [{ "name": "hours", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 24 } }],
-                    "responses": { "200": { "description": "Ascending price window" } }
+                    "responses": { "200": { "description": "Ascending price window", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PricePointPage" } } } } }
                 }
             },
             "/v1/prices/latest": {
                 "get": {
                     "operationId": "getLatestPrice",
                     "tags": ["Prices"],
-                    "summary": "Latest stored QUBIC/USDT price point",
-                    "description": "The newest stored oracle sample. The response is null before the first successful poll.",
+                    "summary": "Get the latest stored QUBIC/USDT price point",
+                    "description": "The newest stored point. Returns 404 before the first successful poll. Check `onchain` before treating a point as an oracle sample.",
                     "responses": {
                         "200": { "description": "Latest price", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/PricePoint" } } } } } },
                         "404": { "description": "No price data yet" }
@@ -801,7 +916,7 @@ pub fn spec() -> Value {
                 "get": {
                     "operationId": "getPriceSnapshot",
                     "tags": ["Prices"],
-                    "summary": "QUBIC/USDT price metadata and latest point",
+                    "summary": "Get QUBIC/USDT price metadata and latest point",
                     "description": "Source, staleness, series digest, and the latest point in one response. Use this to render a price header without a second request.",
                     "responses": {
                         "200": { "description": "Price snapshot; data is null before the first poll", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "oneOf": [{ "$ref": "#/components/schemas/PriceSnapshot" }, { "type": "null" }] }, "meta": { "type": "object" } } } } } },
@@ -812,43 +927,22 @@ pub fn spec() -> Value {
             "/v1/market": {
                 "get": {
                     "operationId": "getMarket",
-                    "tags": ["Market", "Prices"],
-                    "summary": "Current QUBIC/USDT market snapshot",
+                    "tags": ["Market"],
+                    "summary": "Get the current QUBIC/USDT market snapshot",
                     "description": "Cached external exchange consensus plus CoinGecko reference data. MEXC and Gate.io spot tickers provide the price; CoinGecko supplies market cap, 24-hour volume, and 24-hour change. The endpoint never fans out to an exchange per request.",
                     "responses": {
-                        "200": { "description": "Market snapshot" },
-                        "503": { "description": "No market snapshot has been fetched yet" }
-                    }
-                }
-            },
-            "/v1/market/qubic": {
-                "get": {
-                    "operationId": "getMarketQubic",
-                    "tags": ["Market"],
-                    "summary": "QUBIC market alias",
-                    "description": "Alias for /v1/market. Returns the same cached QUBIC/USDT market snapshot.",
-                    "responses": {
-                        "200": { "description": "Market snapshot" },
-                        "503": { "description": "No market snapshot has been fetched yet" }
-                    }
-                }
-            },
-            "/v1/prices/market": {
-                "get": {
-                    "operationId": "getPriceMarket",
-                    "tags": ["Market", "Prices"],
-                    "summary": "Market price alias",
-                    "description": "Alias for /v1/market. Returns the external QUBIC/USDT price and market reference, not an on-chain price series point.",
-                    "responses": {
-                        "200": { "description": "Market snapshot" },
+                        "200": { "description": "Market snapshot", "content": { "application/json": { "schema": data_envelope("MarketSnapshot") } } },
                         "503": { "description": "No market snapshot has been fetched yet" }
                     }
                 }
             }
-        },
-        "components": {
-            "schemas": {
-                "Problem": {
+    })
+}
+
+fn schemas() -> Value {
+    json!({
+        // Errors and request bodies
+        "Problem": {
                     "type": "object",
                     "required": ["type", "title", "status", "code", "detail"],
                     "properties": {
@@ -986,7 +1080,8 @@ pub fn spec() -> Value {
                         "input": { "type": "string", "description": "Hex-encoded input, at most MAX_INPUT_SIZE bytes" }
                     }
                 },
-                "PageMeta": {
+        // Pagination and list envelopes
+        "PageMeta": {
                     "type": "object",
                     "properties": {
                         "limit": { "type": "integer" },
@@ -995,6 +1090,140 @@ pub fn spec() -> Value {
                         "next_offset": { "type": ["integer", "null"] },
                         "next_cursor": { "type": ["string", "null"] },
                         "has_more": { "type": "boolean" }
+                    }
+                },
+                "TickPage": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/Tick" } },
+                        "meta": { "$ref": "#/components/schemas/PageMeta" }
+                    }
+                },
+                "EpochPage": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/Epoch" } },
+                        "meta": { "$ref": "#/components/schemas/PageMeta" }
+                    }
+                },
+                "TransactionPage": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/Transaction" } },
+                        "meta": { "$ref": "#/components/schemas/PageMeta" }
+                    }
+                },
+                "EventPage": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/Event" } },
+                        "meta": { "$ref": "#/components/schemas/PageMeta" }
+                    }
+                },
+                "IdentityPage": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/Identity" } },
+                        "meta": { "$ref": "#/components/schemas/PageMeta" }
+                    }
+                },
+                "IdentityActivityItem": {
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["transaction", "event"] },
+                        "tick": { "type": "integer" },
+                        "timestamp": { "type": "string", "format": "date-time" },
+                        "transaction": { "$ref": "#/components/schemas/Transaction" },
+                        "event": { "$ref": "#/components/schemas/Event" }
+                    }
+                },
+                "IdentityActivityPage": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/IdentityActivityItem" } },
+                        "meta": { "$ref": "#/components/schemas/PageMeta" }
+                    }
+                },
+                "ActivityBucket": {
+                    "type": "object",
+                    "required": ["bucket", "transactions", "events", "ticks"],
+                    "properties": {
+                        "bucket": { "type": "string", "format": "date-time" },
+                        "transactions": { "type": "integer" },
+                        "events": { "type": "integer" },
+                        "ticks": { "type": "integer" },
+                        "volume": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "ActivityBucketPage": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/ActivityBucket" } },
+                        "meta": { "type": "object" }
+                    }
+                },
+                "EventTypeCount": {
+                    "type": "object",
+                    "required": ["type", "count"],
+                    "properties": {
+                        "type": { "type": "string" },
+                        "count": { "type": "integer", "format": "int64" }
+                    }
+                },
+                "EventTypePage": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/EventTypeCount" } },
+                        "meta": { "type": "object" }
+                    }
+                },
+                "AssetPage": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/Asset" } },
+                        "meta": { "$ref": "#/components/schemas/PageMeta" }
+                    }
+                },
+                "AssetTransferPage": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/AssetTransfer" } },
+                        "meta": { "$ref": "#/components/schemas/PageMeta" }
+                    }
+                },
+                "PricePointPage": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/PricePoint" } },
+                        "meta": { "type": "object" }
+                    }
+                },
+                "SearchResult": {
+                    "type": "object",
+                    "required": ["type", "value"],
+                    "properties": {
+                        "type": { "type": "string", "enum": ["tick", "epoch", "transaction", "identity", "asset"] },
+                        "value": { "type": "object" }
+                    }
+                },
+                "SearchResults": {
+                    "type": "object",
+                    "required": ["data", "meta"],
+                    "properties": {
+                        "data": { "type": "array", "items": { "$ref": "#/components/schemas/SearchResult" } },
+                        "meta": { "type": "object" }
                     }
                 },
                 "Tick": {
@@ -1031,7 +1260,8 @@ pub fn spec() -> Value {
                         "timestamp": { "type": "string", "format": "date-time" }
                     }
                 },
-                "Counterparty": {
+        // Analytics resources
+        "Counterparty": {
                     "type": "object",
                     "required": ["identity", "incoming_amount", "outgoing_amount", "net_amount", "transaction_count"],
                     "properties": {
@@ -1119,7 +1349,8 @@ pub fn spec() -> Value {
                         }
                     }
                 },
-                "MarketSnapshot": {
+        // Markets and prices
+        "MarketSnapshot": {
                     "type": "object",
                     "required": ["source", "coin_id", "price_usd", "price_e8", "fetched_at"],
                     "properties": {
@@ -1211,6 +1442,52 @@ pub fn spec() -> Value {
                         "outgoing_transfers": { "type": "integer" },
                         "latest_incoming_tick": { "type": "integer" },
                         "latest_outgoing_tick": { "type": "integer" }
+                    }
+                },
+                "LiveIdentity": {
+                    "type": "object",
+                    "required": ["identity", "public_key", "spectrum_index", "tick"],
+                    "properties": {
+                        "identity": { "type": "string" },
+                        "public_key": { "type": "string" },
+                        "spectrum_index": { "type": "integer" },
+                        "tick": { "type": "integer" },
+                        "balance": { "type": "integer", "format": "int64" },
+                        "incoming_amount": { "type": "integer", "format": "int64" },
+                        "outgoing_amount": { "type": "integer", "format": "int64" },
+                        "incoming_transfers": { "type": "integer" },
+                        "outgoing_transfers": { "type": "integer" },
+                        "latest_incoming_tick": { "type": "integer" },
+                        "latest_outgoing_tick": { "type": "integer" }
+                    }
+                },
+                "TickTransactionStatus": {
+                    "type": "object",
+                    "required": ["tick", "current_tick", "transactions"],
+                    "properties": {
+                        "tick": { "type": "integer" },
+                        "current_tick": { "type": "integer" },
+                        "transactions": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["hash", "money_flew"],
+                                "properties": {
+                                    "hash": { "type": "string" },
+                                    "money_flew": { "type": "boolean" }
+                                }
+                            }
+                        }
+                    }
+                },
+                "ContractQueryResult": {
+                    "type": "object",
+                    "required": ["contract_index", "input_type", "output", "bytes"],
+                    "properties": {
+                        "contract_index": { "type": "integer" },
+                        "input_type": { "type": "integer" },
+                        "output": { "type": "string", "description": "Hex-encoded output bytes" },
+                        "bytes": { "type": "integer" }
                     }
                 },
                 "IssuedAsset": {
@@ -1347,7 +1624,8 @@ pub fn spec() -> Value {
                         "observed_at": { "type": "string", "format": "date-time" }
                     }
                 },
-                "NetworkStats": {
+        // Status and network
+        "NetworkStats": {
                     "type": "object",
                     "properties": {
                         "head": { "oneOf": [{ "$ref": "#/components/schemas/Tick" }, { "type": "null" }] },
@@ -1366,7 +1644,7 @@ pub fn spec() -> Value {
                         "ingest_status": { "$ref": "#/components/schemas/IngestStatus" },
                         "network": { "$ref": "#/components/schemas/NetworkStatus" },
                         "backfill": { "$ref": "#/components/schemas/BackfillStatus" },
-                        "stats": { "type": "object", "description": "Counts and ingest cursor returned by /v1/network/stats." }
+                        "stats": { "type": "object", "description": "Counts and ingest cursor returned by /v1/network." }
                     }
                 },
                 "IngestStatus": {
@@ -1410,25 +1688,26 @@ pub fn spec() -> Value {
                         "coverage_percent": { "type": ["number", "null"] }
                     }
                 }
-            }
-        }
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     #[test]
     fn spec_is_openapi_31_and_covers_routes() {
         let spec = spec();
         assert_eq!(spec["openapi"], "3.1.0");
+        assert_eq!(spec["info"]["version"], "0.2.0");
         let paths = spec["paths"].as_object().expect("paths object");
         for path in [
             "/healthz",
             "/v1/status",
             "/status",
-            "/v1/network/stats",
+            "/v1/network",
             "/v1/epochs",
             "/v1/epochs/{epoch}",
             "/v1/epochs/{epoch}/computors",
@@ -1454,7 +1733,7 @@ mod tests {
             "/v1/assets/{issuer}/{name}/holders",
             "/v1/wallets/{identity}",
             "/v1/wallets/{identity}/assets",
-            "/v1/wallets/{identity}/snapshot",
+            "/v1/live/wallets/{identity}",
             "/v1/transactions/batch",
             "/v1/analytics/activity",
             "/v1/analytics/top-identities",
@@ -1463,44 +1742,137 @@ mod tests {
             "/v1/stream/ticks",
             "/v1/stream/transactions",
             "/v1/stream/events",
+            "/v1/stream/prices",
+            "/v1/stream/market",
             "/v1/ws",
-            "/v1/identities/{identity}/entity",
-            "/v1/transactions/{hash}/network",
-            "/v1/transactions/{hash}/network/status",
+            "/v1/live/identities/{identity}",
+            "/v1/live/transactions/{hash}",
+            "/v1/live/transactions/{hash}/status",
             "/v1/transactions/{hash}/status",
             "/v1/transactions/validate",
-            "/v1/ticks/{tick}/tx-status",
+            "/v1/live/ticks/{tick}/transactions",
             "/v1/ticks/{tick}/raw",
-            "/v1/contracts/{contract_index}/query",
+            "/v1/live/contracts/{contract_index}/query",
             "/v1/prices",
             "/v1/prices/history",
             "/v1/prices/latest",
             "/v1/prices/snapshot",
             "/v1/market",
-            "/v1/market/qubic",
-            "/v1/prices/market",
-            "/v1/wallets/{identity}",
-            "/v1/wallets/{identity}/assets",
-            "/v1/wallets/{identity}/snapshot",
-            "/v1/assets/{issuer}/{name}/holders",
             "/v1/search",
         ] {
             assert!(paths.contains_key(path), "missing {path}");
         }
-        for tag in spec["tags"].as_array().expect("tags array") {
-            let name = tag["name"].as_str().expect("tag name");
+
+        for path in [
+            "/v1/network/stats",
+            "/v1/market/qubic",
+            "/v1/prices/market",
+            "/v1/identities/{identity}/entity",
+            "/v1/transactions/{hash}/network",
+            "/v1/transactions/{hash}/network/status",
+            "/v1/ticks/{tick}/tx-status",
+            "/v1/contracts/{contract_index}/query",
+            "/v1/wallets/{identity}/snapshot",
+        ] {
             assert!(
-                name.chars().next().is_some_and(char::is_uppercase),
-                "tag names are displayed in docs and should be title case: {name}"
+                !paths.contains_key(path),
+                "retired route still documented: {path}"
             );
         }
+
+        let declared_tags: HashSet<&str> = spec["tags"]
+            .as_array()
+            .expect("tags array")
+            .iter()
+            .map(|tag| tag["name"].as_str().expect("tag name"))
+            .collect();
+        for tag in &declared_tags {
+            assert!(
+                tag.chars().next().is_some_and(char::is_uppercase),
+                "tag names are displayed in docs and should be title case: {tag}"
+            );
+        }
+
+        let mut operation_ids = HashSet::new();
+        let mut used_tags = HashSet::new();
         for (path, item) in paths {
             for (method, operation) in item.as_object().expect("path item") {
+                let operation_id = operation["operationId"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{method} {path} needs an operationId"));
                 assert!(
-                    operation.get("operationId").is_some(),
-                    "{method} {path} needs an operationId"
+                    operation_ids.insert(operation_id),
+                    "duplicate operationId {operation_id} at {method} {path}"
+                );
+                assert!(
+                    operation_id
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_lowercase())
+                        && operation_id.chars().all(|c| c.is_ascii_alphanumeric()),
+                    "{method} {path} has a non-camelCase operationId: {operation_id}"
+                );
+                let tags = operation["tags"].as_array().expect("operation tags");
+                assert_eq!(tags.len(), 1, "{method} {path} should have one primary tag");
+                let tag = tags[0].as_str().expect("tag name");
+                assert!(
+                    declared_tags.contains(tag),
+                    "undeclared tag {tag} at {path}"
+                );
+                used_tags.insert(tag);
+                assert!(
+                    operation["summary"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty()),
+                    "{method} {path} needs a summary"
+                );
+                assert!(
+                    operation["description"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty()),
+                    "{method} {path} needs a description"
+                );
+                assert!(
+                    operation["responses"].get("200").is_some(),
+                    "{method} {path} needs a 200 response"
                 );
             }
+        }
+        assert_eq!(
+            used_tags, declared_tags,
+            "every declared tag should be used"
+        );
+
+        let schemas = spec["components"]["schemas"]
+            .as_object()
+            .expect("component schemas");
+        let mut refs = Vec::new();
+        collect_refs(&spec, &mut refs);
+        for reference in refs {
+            if let Some(name) = reference.strip_prefix("#/components/schemas/") {
+                assert!(schemas.contains_key(name), "missing schema {name}");
+            } else {
+                panic!("unexpected external reference {reference}");
+            }
+        }
+    }
+
+    fn collect_refs(value: &Value, refs: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                if let Some(reference) = map.get("$ref").and_then(Value::as_str) {
+                    refs.push(reference.to_string());
+                }
+                for child in map.values() {
+                    collect_refs(child, refs);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_refs(item, refs);
+                }
+            }
+            _ => {}
         }
     }
 }

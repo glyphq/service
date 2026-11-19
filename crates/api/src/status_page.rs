@@ -383,7 +383,7 @@ fn render(view: &StatusView) -> String {
     html.push_str("</div><nav aria-label=\"Related endpoints\">");
     html.push_str("<a href=\"/healthz\">GET /healthz</a>");
     html.push_str("<a href=\"/v1/status\">GET /v1/status</a>");
-    html.push_str("<a href=\"/v1/network/stats\">GET /v1/network/stats</a>");
+    html.push_str("<a href=\"/v1/network\">GET /v1/network</a>");
     html.push_str("<a href=\"/openapi.json\">GET /openapi.json</a>");
     html.push_str("<a href=\"/docs\">GET /docs</a>");
     html.push_str(
@@ -439,7 +439,7 @@ mod tests {
         assert!(html.contains("not reported"));
         assert!(html.contains(env!("CARGO_PKG_VERSION")));
         assert!(html.contains("<meta http-equiv=\"refresh\" content=\"5\">"));
-        assert!(html.contains("href=\"/v1/network/stats\""));
+        assert!(html.contains("href=\"/v1/network\""));
         assert!(html.contains("href=\"/healthz\""));
         assert!(html.contains("href=\"/docs\""));
         assert!(html.contains("remain machine-readable"));

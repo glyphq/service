@@ -213,11 +213,11 @@ async fn wallet_assets_rejects_invalid_identity_and_kind() {
 
 #[tokio::test]
 async fn wallet_snapshot_rejects_invalid_identity() {
-    let (status, body) = get("/v1/wallets/nope/snapshot").await;
+    let (status, body) = get("/v1/live/wallets/nope").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "invalid_identity");
 
-    let (status, body) = get(&format!("/v1/wallets/{IDENTITY}/snapshot")).await;
+    let (status, body) = get(&format!("/v1/live/wallets/{IDENTITY}")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["code"], "unavailable");
 }
@@ -246,7 +246,7 @@ async fn openapi_lists_wallet_surface() {
     for path in [
         "/v1/wallets/{identity}",
         "/v1/wallets/{identity}/assets",
-        "/v1/wallets/{identity}/snapshot",
+        "/v1/live/wallets/{identity}",
         "/v1/assets/{issuer}/{name}/holders",
     ] {
         assert!(paths.contains_key(path), "missing {path}");

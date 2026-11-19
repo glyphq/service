@@ -768,7 +768,7 @@ async fn collection_resources_are_typed_and_enveloped() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["issuer"], IDENTITY);
 
-    let (status, body) = get("/v1/network/stats").await;
+    let (status, body) = get("/v1/network").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["ticks"], 3);
     assert_eq!(body["data"]["head"]["tick"], 7);
@@ -1046,12 +1046,12 @@ async fn optional_network_features_report_unavailable_or_forbidden() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"], "forbidden");
 
-    let (status, body) = get("/v1/identities/NOT-AN-IDENTITY/entity").await;
+    let (status, body) = get("/v1/live/identities/NOT-AN-IDENTITY").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "invalid_identity");
 
     let (status, body) = post(
-        "/v1/contracts/1/query",
+        "/v1/live/contracts/1/query",
         serde_json::json!({ "input": "not hex" }),
     )
     .await;
@@ -1192,16 +1192,16 @@ async fn transaction_validation_rejects_malformed_bytes() {
 
 #[tokio::test]
 async fn transaction_network_status_reports_errors() {
-    let (status, body) = get("/v1/transactions/not-a-hash/network/status").await;
+    let (status, body) = get("/v1/live/transactions/not-a-hash/status").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "invalid_transaction_hash");
 
     let hash = hash_for(7, 0);
-    let (status, body) = get(&format!("/v1/transactions/{hash}/network/status")).await;
+    let (status, body) = get(&format!("/v1/live/transactions/{hash}/status")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["code"], "unavailable");
 
-    let (status, body) = get(&format!("/v1/transactions/{hash}/network")).await;
+    let (status, body) = get(&format!("/v1/live/transactions/{hash}")).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["code"], "unavailable");
 }

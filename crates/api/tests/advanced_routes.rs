@@ -747,7 +747,7 @@ async fn wallet_snapshot_reports_peer_head_and_counts() {
     let state = state_with_peer(Arc::new(MockStore::new()), peer);
     let (status, body, headers) = get(
         state,
-        &format!("/v1/wallets/{}/snapshot", identity(&WALLET_KEY)),
+        &format!("/v1/live/wallets/{}", identity(&WALLET_KEY)),
     )
     .await;
 
@@ -788,7 +788,7 @@ async fn contract_query_forwards_input_and_returns_hex() {
     let state = state_with_peer(Arc::new(MockStore::new()), peer);
     let (status, body, _) = post(
         state,
-        "/v1/contracts/1/query",
+        "/v1/live/contracts/1/query",
         json!({ "input_type": 1, "input": "0Xdeadbeef" }),
     )
     .await;
@@ -807,7 +807,7 @@ async fn contract_query_defaults_and_rejects_oversized_input() {
     let state = state_with_peer(Arc::new(MockStore::new()), peer);
     let (status, body, _) = post(
         state,
-        "/v1/contracts/1/query",
+        "/v1/live/contracts/1/query",
         json!({ "input": " 0x0102 " }),
     )
     .await;
@@ -821,7 +821,7 @@ async fn contract_query_defaults_and_rejects_oversized_input() {
     let state = state_with_peer(Arc::new(MockStore::new()), peer);
     let (status, body, _) = post(
         state,
-        "/v1/contracts/1/query",
+        "/v1/live/contracts/1/query",
         json!({ "input": oversized }),
     )
     .await;
@@ -835,7 +835,7 @@ async fn contract_query_rejects_malformed_hex() {
     let state = state_with_peer(Arc::new(MockStore::new()), peer);
     let (status, body, _) = post(
         state,
-        "/v1/contracts/1/query",
+        "/v1/live/contracts/1/query",
         json!({ "input": "not hex" }),
     )
     .await;
@@ -852,7 +852,7 @@ async fn network_transaction_reads_peer_and_sets_cache_policy() {
     let state = state_with_peer(Arc::new(MockStore::new()), peer);
     let transaction = fixture_transaction();
     let hash = qubic::encode_tx_hash(&transaction.hash());
-    let (status, body, headers) = get(state, &format!("/v1/transactions/{hash}/network")).await;
+    let (status, body, headers) = get(state, &format!("/v1/live/transactions/{hash}")).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
@@ -874,7 +874,7 @@ async fn network_transaction_reports_unknown_hash() {
     let peer = spawn_mock_peer().await;
     let state = state_with_peer(Arc::new(MockStore::new()), peer);
     let hash = qubic::encode_tx_hash(&[0x12; 32]);
-    let (status, body, _) = get(state, &format!("/v1/transactions/{hash}/network")).await;
+    let (status, body, _) = get(state, &format!("/v1/live/transactions/{hash}")).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["code"], "not_found");
@@ -886,8 +886,7 @@ async fn network_transaction_status_reports_money_flew() {
     let state = state_with_peer(Arc::new(MockStore::new()), peer);
     let transaction = fixture_transaction();
     let hash = qubic::encode_tx_hash(&transaction.hash());
-    let (status, body, headers) =
-        get(state, &format!("/v1/transactions/{hash}/network/status")).await;
+    let (status, body, headers) = get(state, &format!("/v1/live/transactions/{hash}/status")).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
@@ -906,7 +905,7 @@ async fn network_transaction_status_reports_money_flew() {
 async fn tick_transaction_status_lists_every_entry() {
     let peer = spawn_mock_peer().await;
     let state = state_with_peer(Arc::new(MockStore::new()), peer);
-    let (status, body, _) = get(state, &format!("/v1/ticks/{TICK}/tx-status")).await;
+    let (status, body, _) = get(state, &format!("/v1/live/ticks/{TICK}/transactions")).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["data"]["current_tick"], fixture_transaction().tick + 5);

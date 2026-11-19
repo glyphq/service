@@ -13,7 +13,7 @@ the original phase boundaries:
   ClickHouse persistence and checkpointing, the v1 resource API, typed events, cursor
   pagination, asset and epoch reads derived from indexed rows, search, OpenAPI, batch
   transaction lookup, analytics, SSE and WebSocket streaming, local transaction
-  validation, peer-backed entity, transaction, network status, and contract routes,
+  validation, live identity, transaction, confirmation, and contract routes,
   opt-in broadcast, the raw bundle archive, the Docker Compose stack, a bounded
   multi-peer fetch pipeline with batched ClickHouse writes, the normalized event
   participant index and identity activity feed, wallet and asset-holder reads, a status

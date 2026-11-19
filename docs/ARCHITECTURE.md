@@ -82,8 +82,9 @@ The system is two long-running processes plus ClickHouse:
   pool and the write path. It fetches tick bundles, verifies them, writes canonical rows,
   and records the checkpoint.
 - **api** (`glyph-api` in `crates/api`) owns the read path. Indexed reads use only
-  ClickHouse. A small set of opt-in network routes connect directly to peers and never
-  write to the index. The API can be scaled horizontally behind a load balancer.
+  ClickHouse. A small set of opt-in live routes under `/v1/live` connect directly to
+  peers and never write to the index. The API can be scaled horizontally behind a load
+  balancer.
 - **ClickHouse** is the shared analytical store. It is not exposed to the public internet.
 - **raw archive** is an optional local filesystem or S3/MinIO bucket. The indexer writes
   one compressed bundle per verified tick before persisting it. It is not on the indexed

@@ -115,7 +115,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/status", get(status))
-        .route("/v1/network/stats", get(network_stats))
+        .route("/v1/network", get(network_stats))
         .route("/v1/epochs", get(epochs))
         .route("/v1/epochs/{epoch}", get(epoch))
         .route("/v1/epochs/{epoch}/computors", get(epoch_computors))
@@ -1164,7 +1164,7 @@ pub async fn docs() -> Html<&'static str> {
 <p>Read the Qubic chain directly from peers. The OpenAPI 3.1 document is at <a href="/openapi.json"><code>/openapi.json</code></a> and the interactive reference is at <a href="/docs"><code>/docs</code></a>.</p>
 <ul>
 <li><code>GET /v1/status</code></li>
-<li><code>GET /v1/network/stats</code></li>
+<li><code>GET /v1/network</code></li>
 <li><code>GET /v1/epochs?limit=&amp;cursor=</code></li>
 <li><code>GET /v1/epochs/{epoch}</code></li>
 <li><code>GET /v1/epochs/{epoch}/computors</code></li>
@@ -1184,7 +1184,7 @@ pub async fn docs() -> Html<&'static str> {
 <li><code>GET /v1/assets/{issuer}/{name}/holders?limit=</code></li>
 <li><code>GET /v1/wallets/{identity}</code></li>
 <li><code>GET /v1/wallets/{identity}/assets?kind=</code></li>
-<li><code>GET /v1/wallets/{identity}/snapshot</code></li>
+<li><code>GET /v1/live/wallets/{identity}</code></li>
 <li><code>GET /v1/prices?from_hour=&amp;limit=</code></li>
 <li><code>GET /v1/prices/history?hours=</code></li>
 <li><code>GET /v1/prices/latest</code></li>
@@ -1195,15 +1195,15 @@ pub async fn docs() -> Html<&'static str> {
 <li><code>GET /v1/analytics/top-identities?limit=</code></li>
 <li><code>GET /v1/analytics/event-types?limit=</code></li>
 <li><code>GET /v1/stream?types=</code></li>
-<li><code>GET /v1/stream/{ticks|transactions|events}</code></li>
+<li><code>GET /v1/stream/{ticks|transactions|events|prices|market}</code></li>
 <li><code>GET /v1/ws</code></li>
-<li><code>GET /v1/identities/{identity}/entity</code></li>
-<li><code>GET /v1/transactions/{hash}/network</code></li>
-<li><code>GET /v1/transactions/{hash}/network/status</code></li>
+<li><code>GET /v1/live/identities/{identity}</code></li>
+<li><code>GET /v1/live/transactions/{hash}</code></li>
+<li><code>GET /v1/live/transactions/{hash}/status</code></li>
 <li><code>POST /v1/transactions/validate</code></li>
-<li><code>GET /v1/ticks/{tick}/tx-status</code></li>
+<li><code>GET /v1/live/ticks/{tick}/transactions</code></li>
 <li><code>GET /v1/ticks/{tick}/raw?section=</code></li>
-<li><code>POST /v1/contracts/{contract_index}/query</code></li>
+<li><code>POST /v1/live/contracts/{contract_index}/query</code></li>
 <li><code>GET /v1/search?q=</code></li>
 </ul>
 </body></html>"#,

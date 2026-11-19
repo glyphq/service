@@ -8,7 +8,7 @@
 //! Routes:
 //! - `GET /v1/wallets/{identity}` wallet entity, assets, and indexed transactions
 //! - `GET /v1/wallets/{identity}/assets?kind=issued|owned|possessed`
-//! - `GET /v1/wallets/{identity}/snapshot` point-in-time peer snapshot
+//! - `GET /v1/live/wallets/{identity}` point-in-time peer snapshot
 //! - `GET /v1/assets/{issuer}/{name}/holders?limit=` ownership holders
 
 use std::collections::HashMap;
@@ -35,7 +35,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/wallets/{identity}", get(wallet))
         .route("/v1/wallets/{identity}/assets", get(wallet_assets))
-        .route("/v1/wallets/{identity}/snapshot", get(wallet_snapshot))
+        .route("/v1/live/wallets/{identity}", get(wallet_snapshot))
         .route("/v1/assets/{issuer}/{name}/holders", get(asset_holders))
         .route("/v1/assets/{issuer}/{name}/transfers", get(asset_transfers))
 }

@@ -6,7 +6,7 @@ SeaweedFS S3 as dependencies:
 
 | Process | Binary | Role |
 | --- | --- | --- |
-| API | `glyph-api` | HTTP API. Reads ClickHouse; optional peer-backed routes and broadcast connect directly to Qubic peers. |
+| API | `glyph-api` | HTTP API. Reads ClickHouse; optional live routes and broadcast connect directly to Qubic peers. |
 | Indexer | `glyph sync` | Fetches and verifies peer ticks, writes ClickHouse. |
 | ClickHouse | `clickhouse-server` | Shared analytical store and ingest checkpoint. |
 | SeaweedFS | `seaweedfs` | S3-compatible storage, provisioned for the raw archive. |
@@ -99,7 +99,7 @@ and the stack is reachable only from the same machine.
 | `BIND` | `0.0.0.0:8080` | Listen address for `glyph-api` inside the container. Keep the port at `8080` unless you also change the `api` port mapping. |
 | `API_HOST` | `127.0.0.1` | Host interface for the published API port. Set `0.0.0.0` to expose it. |
 | `API_PORT` | `8080` | Host port for the API. |
-| `QUBIC_PEERS` | `157.180.10.49:21841` | Comma-separated peer addresses used by the indexer and by peer-backed API routes. |
+| `QUBIC_PEERS` | `peer.example:21841` | Comma-separated peer addresses used by the indexer and by live API routes. |
 | `ALLOW_BROADCAST` | `false` | Set `true` to enable `POST /v1/transactions`. Keep disabled unless the API is trusted. |
 | `BROADCAST_PEERS` | `3` | Peers contacted concurrently per broadcast. Capped at `8`; each connection is a direct peer socket. |
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval. |
@@ -388,7 +388,7 @@ This Compose file is a single-host deployment, not a hardened multi-tenant
 platform.
 
 - The API is read-only by default. `POST /v1/transactions` is disabled unless
-  `ALLOW_BROADCAST=true`; peer-backed routes only read peer state. It has
+  `ALLOW_BROADCAST=true`; live routes only read peer state. It has
   permissive CORS, no API keys, and no rate limit by default. Put it behind an
   authenticating reverse proxy if it is not on a trusted network.
 - ClickHouse is published only on `127.0.0.1` and uses the credentials embedded
@@ -499,7 +499,7 @@ The workflow needs these repository secrets:
 
 | Secret | Example | Meaning |
 | --- | --- | --- |
-| `DEPLOY_HOST` | `34.107.41.199` | Server address |
+| `DEPLOY_HOST` | `deploy.example.com` | Server address |
 | `DEPLOY_USER` | `alexgeminilabs` | SSH user in the `docker` group |
 | `DEPLOY_PATH` | `/home/alexgeminilabs/glyph` | Writable deployment directory |
 | `DEPLOY_SSH_KEY` | private key text | Key authorized for `DEPLOY_USER` |
