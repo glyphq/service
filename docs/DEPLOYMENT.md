@@ -543,7 +543,11 @@ ClickHouse database. To upgrade, replace the binaries and restart in order:
 2. Smoke-test the image with `glyph --version`.
 3. `docker save | gzip` the image and copy it to the server over SSH.
 4. Load the image and run `bash deploy/docker/run-stack.sh up`.
+   The API container now has a Docker healthcheck against `/healthz`.
 5. Poll `https://api.glyphq.org/healthz` until it returns `200`.
+6. If any step fails, retag the image that was live before the deploy and
+   rerun `run-stack.sh up`. This restores the previous API and indexer
+   without a manual build.
 
 The workflow needs these repository secrets:
 

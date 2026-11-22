@@ -63,12 +63,29 @@ jobs:
             glyph-image.tar.gz \
             "$DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH/glyph-image.tar.gz"
 
+      - name: Capture live image for rollback
+        id: live
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          image="$(ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            "docker inspect glyph-api --format '{{.Image}}' 2>/dev/null || true")"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          if [[ -n "$image" ]]; then
+            echo "rollback image: $image"
+          else
+            echo "no live API image; rollback will be skipped"
+          fi
+
       - name: Load image and restart services
+        id: deploy
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
         run: |
+          echo "started=true" >> "$GITHUB_OUTPUT"
           ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
             "set -e
              cd '$DEPLOY_PATH'
@@ -92,3 +109,17 @@ jobs:
           done
           echo "health check failed: $HEALTHCHECK_URL" >&2
           exit 1
+
+      - name: Roll back on failure
+        if: failure() && steps.deploy.outputs.started == 'true' && steps.live.outputs.image != ''
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          ROLLBACK_IMAGE: ${{ steps.live.outputs.image }}
+        run: |
+          ssh -i ~/.ssh/deploy_key "$DEPLOY_USER@$DEPLOY_HOST" \
+            "set -e
+             cd '$DEPLOY_PATH'
+             docker tag '$ROLLBACK_IMAGE' glyph:rollback
+             GLYPH_IMAGE=glyph:rollback bash deploy/docker/run-stack.sh up"

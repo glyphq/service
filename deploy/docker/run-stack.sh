@@ -54,8 +54,19 @@ app_env=(
   -e "S3_SECRET_KEY=$s3_password"
   -e "S3_REGION=${S3_REGION:-us-east-1}"
   -e "ARCHIVE_FAIL_CLOSED=${ARCHIVE_FAIL_CLOSED:-false}"
+  -e "ARCHIVE_VOTES=${ARCHIVE_VOTES:-false}"
+  -e "PRUNE_KEEP_EPOCHS=${PRUNE_KEEP_EPOCHS:-}"
   -e "ALLOW_BROADCAST=${ALLOW_BROADCAST:-false}"
   -e "BROADCAST_PEERS=${BROADCAST_PEERS:-3}"
+  -e "MEMPOOL_ENABLED=${MEMPOOL_ENABLED:-true}"
+  -e "MEMPOOL_POLL_MS=${MEMPOOL_POLL_MS:-1000}"
+  -e "MEMPOOL_RETRY_MS=${MEMPOOL_RETRY_MS:-5000}"
+  -e "MEMPOOL_MAX_ATTEMPTS=${MEMPOOL_MAX_ATTEMPTS:-5}"
+  -e "MEMPOOL_EXPIRY_TICKS=${MEMPOOL_EXPIRY_TICKS:-10}"
+  -e "MEMPOOL_MAX_ENTRIES=${MEMPOOL_MAX_ENTRIES:-10000}"
+  -e "WEBHOOK_TIMEOUT_MS=${WEBHOOK_TIMEOUT_MS:-5000}"
+  -e "WEBHOOK_MAX_ATTEMPTS=${WEBHOOK_MAX_ATTEMPTS:-6}"
+  -e "WEBHOOK_ALLOW_PRIVATE=${WEBHOOK_ALLOW_PRIVATE:-false}"
   -e "STREAM_POLL_MS=${STREAM_POLL_MS:-1000}"
   -e "PRICE_POLL_MS=${PRICE_POLL_MS:-60000}"
   -e "MARKET_ENABLED=${MARKET_ENABLED:-true}"
@@ -200,6 +211,11 @@ EOF
   docker run -d --name glyph-api --network "$network" \
     --restart unless-stopped "${log_opts[@]}" \
     --stop-timeout 30 \
+    --health-cmd "curl -fsS --max-time 3 http://127.0.0.1:8080/healthz || exit 1" \
+    --health-interval 10s \
+    --health-timeout 5s \
+    --health-retries 6 \
+    --health-start-period 10s \
     "${app_env[@]}" \
     -e "BIND=0.0.0.0:8080" \
     -e "RUST_LOG=${GLYPH_API_LOG:-info,tower_http=info}" \
