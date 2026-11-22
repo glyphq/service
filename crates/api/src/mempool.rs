@@ -35,6 +35,7 @@ pub struct MempoolConfig {
     pub max_attempts: u8,
     pub expiry_ticks: u32,
     pub max_entries: usize,
+    pub max_per_source: usize,
 }
 
 impl MempoolConfig {
@@ -48,6 +49,7 @@ impl MempoolConfig {
             max_attempts: env_u64("MEMPOOL_MAX_ATTEMPTS", 10).clamp(1, 255) as u8,
             expiry_ticks: env_u64("MEMPOOL_EXPIRY_TICKS", 10).min(1_000_000) as u32,
             max_entries: env_u64("MEMPOOL_MAX_ENTRIES", 10_000).max(1) as usize,
+            max_per_source: env_u64("MEMPOOL_MAX_PER_SOURCE", 100).max(1) as usize,
         }
     }
 }
@@ -119,22 +121,32 @@ impl Mempool {
             )));
         }
         let hash = decoded.hash.clone();
+        let source = qubic::PublicKey(decoded.transaction.source).to_identity();
 
         if let Some(existing) = self.gateway.mempool_entry(&hash).await? {
             return Ok(existing);
         }
-        if self
+        let (source_open, total_open) = self
             .gateway
-            .open_mempool_count(self.config.max_attempts)
-            .await?
-            >= self.config.max_entries as u64
-        {
+            .open_mempool_counts(&source, self.config.max_attempts)
+            .await?;
+        if total_open >= self.config.max_entries as u64 {
             return Err(ApiError {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 code: "tracking_full",
                 detail: format!(
                     "transaction tracking is full ({} open entries)",
                     self.config.max_entries
+                ),
+            });
+        }
+        if source_open >= self.config.max_per_source as u64 {
+            return Err(ApiError {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                code: "source_tracking_full",
+                detail: format!(
+                    "source {source} already has {} open transactions; limit is {}",
+                    source_open, self.config.max_per_source
                 ),
             });
         }
@@ -149,7 +161,7 @@ impl Mempool {
         let mut entry = MempoolEntry {
             hash,
             raw: hex::encode(&decoded.bytes),
-            source: qubic::PublicKey(decoded.transaction.source).to_identity(),
+            source,
             destination: qubic::PublicKey(decoded.transaction.destination).to_identity(),
             amount: decoded.transaction.amount,
             tick: decoded.transaction.tick,
@@ -417,6 +429,7 @@ mod tests {
         let config = MempoolConfig::from_env();
         assert!(config.max_attempts >= 1);
         assert!(config.max_entries >= 1);
+        assert!(config.max_per_source >= 1);
         assert!(config.poll >= Duration::from_millis(1));
         assert!(config.retry >= Duration::from_millis(1));
     }

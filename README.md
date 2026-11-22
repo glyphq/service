@@ -184,6 +184,7 @@ The most common variables are below. The full list is in
 | `MEMPOOL_MAX_ATTEMPTS` | `10` | Maximum broadcast attempts per entry |
 | `MEMPOOL_EXPIRY_TICKS` | `10` | Expiry window after the target tick |
 | `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open tracked transactions |
+| `MEMPOOL_MAX_PER_SOURCE` | `100` | Maximum open tracked transactions per source |
 | `WEBHOOK_TIMEOUT_MS`, `WEBHOOK_MAX_ATTEMPTS` | `5000`, `6` | Webhook delivery timeout and attempt cap |
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private webhook targets |
 | `PRUNE_KEEP_EPOCHS` | unset | Drop partitions older than the newest N epochs |

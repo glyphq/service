@@ -1508,7 +1508,9 @@ be included. Use `meta.links.transaction`,
 - `400 bad_request` for malformed hex, a transaction that fails local checks,
   or a `webhook_url` without a matching `webhook_secret`.
 - `429 tracking_full` when `MEMPOOL_MAX_ENTRIES` is reached and the tracked path
-  is used. A duplicate hash returns the existing entry with `202` instead.
+  is used. `429 source_tracking_full` when that source reaches
+  `MEMPOOL_MAX_PER_SOURCE`. A duplicate hash returns the existing entry with
+  `202` instead.
 - `503 unavailable` when no configured peer accepts a direct packet, or when
   internal tracking is disabled and the direct path is unavailable.
 
@@ -1541,6 +1543,21 @@ reconciled.
 
 Every entry retains `raw`, the signed transaction hex, so a retry does not need
 the client to resubmit. `error` carries the last broadcast error when set.
+
+`MEMPOOL_MAX_ENTRIES` bounds **open** entries only: `queued`, `broadcast`, and
+`failed` entries that still have retry attempts left. A confirmed, expired, or
+exhausted failed entry stops counting against the cap immediately. The tracker
+expires an unindexed target once the head passes `tick + MEMPOOL_EXPIRY_TICKS`,
+and exhausted failed entries are retried no further. At the cap, new
+submissions return `429 tracking_full` before any peer socket is opened.
+
+`MEMPOOL_MAX_PER_SOURCE` additionally caps open entries for one source identity.
+It prevents a single wallet or script from consuming the whole pool and returns
+`429 source_tracking_full`.
+
+Terminal rows remain queryable through the lifecycle route for one day, then
+ClickHouse TTL removes them. Physical deletion is eventual because ClickHouse
+applies TTL during merges, but it never holds a capacity slot.
 
 ### Webhooks
 
@@ -1772,6 +1789,7 @@ Errors are problem documents with exactly these fields:
 | `not_found` | 404 | The resource is valid but absent from the index. |
 | `conflict` | 409 | A generic state conflict. |
 | `tracking_full` | 429 | `MEMPOOL_MAX_ENTRIES` is reached. |
+| `source_tracking_full` | 429 | `MEMPOOL_MAX_PER_SOURCE` is reached for that source identity. |
 | `rate_limited` | 429 | `RATE_LIMIT_PER_MINUTE` was exceeded. Includes `Retry-After`. |
 | `forbidden` | 403 | The operation is disabled, for example broadcast without `ALLOW_BROADCAST=true`. |
 | `unavailable` | 503 | A peer, the stream hub, or the raw archive is not available. |
@@ -1836,6 +1854,7 @@ current surface.
 | `MEMPOOL_MAX_ATTEMPTS` | `10` | Maximum broadcast attempts per entry. |
 | `MEMPOOL_EXPIRY_TICKS` | `10` | Expiry window after the target tick. |
 | `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open tracked transactions. |
+| `MEMPOOL_MAX_PER_SOURCE` | `100` | Maximum open tracked transactions per source identity. |
 | `WEBHOOK_TIMEOUT_MS` | `5000` | Webhook delivery timeout. |
 | `WEBHOOK_MAX_ATTEMPTS` | `6` | Delivery attempts before dead-lettering. |
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private webhook targets. |

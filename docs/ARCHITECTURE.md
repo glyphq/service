@@ -365,7 +365,8 @@ history.
 | Epoch rollover during fetch | `CurrentTickInfo.epoch` changes | Move `next` forward to the new `initialTick` and refresh computors | No cross-epoch write |
 | Epoch boundary unknown for a tick | No persisted boundary covers the tick | Skip the tick with a warning instead of guessing | No misassigned row |
 | Mempool entry never indexed | Indexed head is greater than `tick + MEMPOOL_EXPIRY_TICKS` | Mark `expired`, stop rebroadcasting, deliver the event | No chain write |
-| Mempool full | `MEMPOOL_MAX_ENTRIES` reached | Reject new submissions with `429 mempool_full` | Existing entries keep tracking |
+| Tracking full | `MEMPOOL_MAX_ENTRIES` reached | Reject new submissions with `429 tracking_full` | Existing entries keep tracking |
+| Source tracking full | `MEMPOOL_MAX_PER_SOURCE` reached | Reject that source with `429 source_tracking_full` | Other sources keep tracking |
 | Webhook receiver slow or down | Timeout, connection error, or non-2xx | Retry with backoff, persist each attempt, then dead-letter | Registration stays active unless deleted |
 | ClickHouse unavailable | Insert or query error | The indexer exits with an error. The API returns `internal_error` for reads that fail | Head stops advancing. No retry queue |
 | API process down | Load balancer health check | Restart, no ingest impact | None |

@@ -312,6 +312,12 @@ struct CountRow {
     n: u64,
 }
 
+#[derive(Debug, Row, Deserialize)]
+struct MempoolCountsRow {
+    source_count: u64,
+    total: u64,
+}
+
 fn millis(value: Option<DateTime<Utc>>) -> u64 {
     value
         .and_then(|value| u64::try_from(value.timestamp_millis()).ok())
@@ -481,21 +487,23 @@ impl GatewayStore {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
-    /// Number of open entries, used to enforce `MEMPOOL_MAX_ENTRIES`.
-    pub async fn open_mempool_count(&self, max_attempts: u8) -> Result<u64> {
+    /// Open entries overall and for one source, used to enforce both capacity
+    /// caps in a single scan.
+    pub async fn open_mempool_counts(&self, source: &str, max_attempts: u8) -> Result<(u64, u64)> {
         let row = self
             .client
             .query(
-                "SELECT count() AS n FROM (\
-                     SELECT status, attempts FROM mempool \
+                "SELECT countIf(source = ?) AS source_count, count() AS total FROM (\
+                     SELECT source, status, attempts FROM mempool \
                      ORDER BY version DESC LIMIT 1 BY hash\
                  ) WHERE (status IN ('queued', 'broadcast') \
                      OR (status = 'failed' AND attempts < ?))",
             )
+            .bind(source)
             .bind(max_attempts)
-            .fetch_one::<CountRow>()
+            .fetch_one::<MempoolCountsRow>()
             .await?;
-        Ok(row.n)
+        Ok((row.source_count, row.total))
     }
 
     pub async fn insert_webhook(&self, webhook: &Webhook) -> Result<()> {

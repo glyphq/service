@@ -132,6 +132,7 @@ and the stack is reachable only from the same machine.
 | `MEMPOOL_MAX_ATTEMPTS` | `10` | Maximum broadcast attempts before an entry is marked `failed`. |
 | `MEMPOOL_EXPIRY_TICKS` | `10` | Ticks after the target tick before an unindexed transaction expires. |
 | `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open tracked transactions. New submissions are rejected when full. |
+| `MEMPOOL_MAX_PER_SOURCE` | `100` | Maximum open tracked transactions per source identity. |
 | `WEBHOOK_TIMEOUT_MS` | `5000` | Webhook delivery timeout. |
 | `WEBHOOK_MAX_ATTEMPTS` | `6` | Delivery attempts before an attempt is dead-lettered. |
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private-range webhook targets. Keep `false` unless the receiver is internal and trusted. |

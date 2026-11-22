@@ -538,7 +538,7 @@ fn paths() -> Value {
                         } } } },
                         "400": { "description": "Transaction failed local validation" },
                         "403": { "description": "Broadcast disabled" },
-                        "429": { "description": "Tracking capacity is full; code tracking_full" },
+                        "429": { "description": "Tracking capacity or the per-source cap is full; code tracking_full or source_tracking_full" },
                         "503": { "description": "Tracking is disabled, or no peer accepted a direct broadcast" }
                     }
                 }
@@ -1221,7 +1221,7 @@ fn schemas() -> Value {
                         "type": { "type": "string", "default": "about:blank" },
                         "title": { "type": "string" },
                         "status": { "type": "integer" },
-                        "code": { "type": "string", "enum": ["bad_request", "invalid_identity", "invalid_transaction_hash", "invalid_cursor", "not_found", "conflict", "tracking_full", "forbidden", "unavailable", "internal_error", "rate_limited"] },
+                        "code": { "type": "string", "enum": ["bad_request", "invalid_identity", "invalid_transaction_hash", "invalid_cursor", "not_found", "conflict", "tracking_full", "source_tracking_full", "forbidden", "unavailable", "internal_error", "rate_limited"] },
                         "detail": { "type": "string" }
                     }
                 },
