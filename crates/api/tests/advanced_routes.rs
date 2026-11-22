@@ -143,8 +143,21 @@ impl Store for MockStore {
     async fn head(&self) -> StoreResult<Option<TickRow>> {
         Ok(None)
     }
-    async fn tick(&self, _tick: u32) -> StoreResult<Option<TickRow>> {
-        Ok(None)
+    async fn tick(&self, tick: u32) -> StoreResult<Option<TickRow>> {
+        if tick != 900 {
+            return Ok(None);
+        }
+        Ok(Some(TickRow {
+            epoch: 240,
+            tick,
+            timestamp: chrono::DateTime::parse_from_rfc3339("2026-11-22T12:34:56.789Z")
+                .expect("valid timestamp")
+                .with_timezone(&chrono::Utc),
+            computor_index: 0,
+            transaction_count: 0,
+            event_count: 0,
+            verification: "quorum".into(),
+        }))
     }
     async fn transactions_for_tick(
         &self,

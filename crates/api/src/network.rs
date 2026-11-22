@@ -103,6 +103,10 @@ async fn overview(State(state): State<AppState>) -> Result<impl IntoResponse, Ap
         Ok(system) => (Some(system), None),
         Err(error) => (None, Some(error.detail)),
     };
+    let started_at = match system.as_ref() {
+        Some(info) => epoch_started_at(&state, info).await,
+        None => None,
+    };
     let health = state.pool.health();
     let healthy = health
         .iter()
@@ -118,7 +122,9 @@ async fn overview(State(state): State<AppState>) -> Result<impl IntoResponse, Ap
         .map(|(system, head)| system.tick.saturating_sub(head.tick));
     let data = json!({
         "indexed": indexed_json(&indexed),
-        "system": system.as_ref().map(|info| system_json(info, head.as_ref())),
+        "system": system
+            .as_ref()
+            .map(|info| system_json(info, head.as_ref(), started_at)),
         "peers": {
             "configured": state.peers.len(),
             "healthy": healthy,
@@ -177,7 +183,8 @@ async fn system(State(state): State<AppState>) -> Result<impl IntoResponse, ApiE
     }
     let head = state.store.head().await?;
     let info = peer::request("peer system info", PEER_TIMEOUT, state.pool.system_info()).await?;
-    let value = system_json(&info, head.as_ref());
+    let started_at = epoch_started_at(&state, &info).await;
+    let value = system_json(&info, head.as_ref(), started_at);
     state.live_cache.put(key, value.clone());
     Ok((
         [(header::CACHE_CONTROL, RECENT)],
@@ -198,8 +205,11 @@ fn cached_response(value: Value) -> ([(axum::http::HeaderName, &'static str); 1]
     )
 }
 
-fn system_json(info: &SystemInfo, indexed_head: Option<&store::TickRow>) -> Value {
-    let started_at = system_timestamp(info);
+fn system_json(
+    info: &SystemInfo,
+    indexed_head: Option<&store::TickRow>,
+    started_at: Option<String>,
+) -> Value {
     json!({
         "version": info.version,
         "epoch": info.epoch,
@@ -227,23 +237,12 @@ fn system_json(info: &SystemInfo, indexed_head: Option<&store::TickRow>) -> Valu
     })
 }
 
-fn system_timestamp(info: &SystemInfo) -> Option<String> {
-    if info.initial_year == 0 || info.initial_month == 0 || info.initial_day == 0 {
-        return None;
-    }
-    let year = i32::from(info.initial_year) + 2000;
-    let timestamp = Utc
-        .with_ymd_and_hms(
-            year,
-            u32::from(info.initial_month),
-            u32::from(info.initial_day),
-            u32::from(info.initial_hour),
-            u32::from(info.initial_minute),
-            u32::from(info.initial_second),
-        )
-        .single()?
-        .with_nanosecond(u32::from(info.initial_millisecond) * 1_000_000)?;
-    Some(timestamp.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+async fn epoch_started_at(state: &AppState, info: &SystemInfo) -> Option<String> {
+    let row = state.store.tick(info.initial_tick).await.ok().flatten()?;
+    Some(
+        row.timestamp
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    )
 }
 
 async fn peers(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {

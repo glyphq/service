@@ -311,8 +311,10 @@ and does not require parsing the free-form `stats` object in `/v1/status`.
 
 ### `GET /v1/network/system`
 
-Live `RespondSystemInfo` from the best peer, normalized to snake_case. `started_at`
-is the peer's epoch start time. `indexed` is the local head and lag when one
+Live `RespondSystemInfo` from the best peer, normalized to snake_case.
+`started_at` is the indexed timestamp of the epoch's first tick, or `null` when
+that tick is outside retention. The peer's own date fields are not used because
+nodes can report stale values. `indexed` is the local head and lag when one
 exists. Cached for one second.
 
 ### `GET /v1/network/peers`
