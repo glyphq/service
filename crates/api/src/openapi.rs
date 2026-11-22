@@ -265,10 +265,10 @@ fn paths() -> Value {
                     "parameters": [
                         { "name": "limit", "in": "query", "required": false, "description": "Rows to return.", "schema": { "type": "integer", "minimum": 1, "maximum": 676, "default": 676 } },
                         { "name": "offset", "in": "query", "required": false, "description": "Rows to skip.", "schema": { "type": "integer", "minimum": 0, "default": 0 } },
-                        { "name": "sort", "in": "query", "required": false, "description": "reward, tx_score, oracle_score, doge_score, or index.", "schema": { "type": "string" } },
+                        { "name": "sort", "in": "query", "required": false, "description": "reward, tx_score, oracle_score, doge_score, or index.", "schema": { "type": "string", "enum": ["reward", "tx_score", "oracle_score", "doge_score", "index"] } },
                         { "name": "identity", "in": "query", "required": false, "description": "Filter to one computor identity.", "schema": { "type": "string" } }
                     ],
-                    "responses": { "200": { "description": "Revenue rows", "content": { "application/json": { "schema": { "type": "object" } } } }, "503": { "description": "No peer answered" } }
+                    "responses": { "200": { "description": "Revenue rows", "content": { "application/json": { "schema": { "type": "object" } } } }, "400": { "description": "Invalid identity or sort" }, "503": { "description": "No peer answered" } }
                 }
             },
             "/v1/network/revenue/{identity}": {

@@ -286,8 +286,28 @@ async fn peers(State(state): State<AppState>) -> Result<impl IntoResponse, ApiEr
 
 async fn revenue(
     State(state): State<AppState>,
-    Query(params): Query<RevenueQuery>,
+    Query(mut params): Query<RevenueQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if let Some(identity) = params.identity.as_mut() {
+        *identity = identity.trim().to_ascii_uppercase();
+        qubic::PublicKey::from_identity(identity)
+            .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
+    }
+    let sort = params.sort.clone().unwrap_or_else(|| "reward".to_owned());
+    params.sort = Some(
+        match sort.as_str() {
+            "reward" | "tx_score" | "oracle_score" | "doge_score" | "index" => sort.as_str(),
+            "tx" => "tx_score",
+            "oracle" => "oracle_score",
+            "doge" => "doge_score",
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "unknown revenue sort {other:?}; use reward, tx_score, oracle_score, doge_score, or index"
+                )));
+            }
+        }
+        .to_owned(),
+    );
     let key = format!(
         "network:revenue:{:?}:{:?}:{:?}:{:?}",
         params.limit, params.offset, params.sort, params.identity
@@ -620,6 +640,7 @@ async fn oracle_queries(
     let mut rows = Vec::new();
     let started = std::time::Instant::now();
     let mut truncated = false;
+    let tick_meta = (req_type != ORACLE_REQUEST_PENDING_QUERY_IDS).then_some(tick);
     for id in page {
         let remaining = ORACLE_LIST_BUDGET.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -646,7 +667,7 @@ async fn oracle_queries(
             "data": rows,
             "meta": {
                 "source": "peer",
-                "tick": tick,
+                "tick": tick_meta,
                 "limit": limit,
                 "offset": offset,
                 "count": rows.len(),

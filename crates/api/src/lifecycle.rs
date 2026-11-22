@@ -20,8 +20,8 @@ use serde_json::{Value, json};
 use crate::transactions_ext::{effect_json, effect_summary};
 use crate::{ApiError, AppState, peer};
 
-const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const RECENT: &str = "public, max-age=2, stale-while-revalidate=5";
+const AGGREGATE: &str = "public, max-age=30, stale-while-revalidate=60";
 const PEER_TIMEOUT: Duration = Duration::from_secs(2);
 /// A transaction lives in the node's pending pool for about ten minutes. At a
 /// one-second tick, a target further away than this is likely to be dropped.
@@ -709,7 +709,7 @@ async fn tick_capacity(
 
     let fill = f64::from(row.transaction_count) / TX_PER_TICK as f64;
     Ok((
-        [(header::CACHE_CONTROL, IMMUTABLE)],
+        [(header::CACHE_CONTROL, AGGREGATE)],
         Json(json!({
             "data": {
                 "tick": tick,

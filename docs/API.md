@@ -923,7 +923,9 @@ consensus guarantee.
 
 Tick fill for one indexed tick: transaction count, remaining slots, fill ratio,
 volume, transfer and contract-call counts, top senders, and optional money-flow
-counts from a peer tx-status add-on. The tick row itself is immutable.
+counts from a peer tx-status add-on. The tick row itself is immutable, but
+money-flow counts depend on peer availability, so the response is cached for
+30 seconds rather than marked immutable.
 
 ### `GET /v1/identities/{identity}`
 

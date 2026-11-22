@@ -1250,6 +1250,10 @@ async fn network_system_revenue_and_peers_are_typed() {
     assert!(body["data"]["totals"]["estimated_reward"].as_u64().unwrap() > 0);
     assert_eq!(body["meta"]["approximate"], true);
 
+    let (status, body, _) = get(state.clone(), "/v1/network/revenue?sort=nope").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "bad_request");
+
     let (status, body, _) = get(state, "/v1/network/peers").await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["meta"]["configured"], 1);
@@ -1277,6 +1281,7 @@ async fn oracle_routes_expose_queries_subscriptions_and_revenue() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["meta"]["tick"].is_null());
     let rows = body["data"].as_array().unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0]["query_id"], 1001);
