@@ -35,6 +35,8 @@ const ORACLE_TTL: Duration = Duration::from_secs(5);
 const PEER_TIMEOUT: Duration = Duration::from_secs(4);
 /// Total time allowed to materialize a list of oracle queries or subscriptions.
 const ORACLE_LIST_BUDGET: Duration = Duration::from_secs(8);
+/// Some epochs begin with ticks carrying the genesis date, so probe a few rows.
+const EPOCH_START_PROBE_TICKS: u32 = 32;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -238,11 +240,31 @@ fn system_json(
 }
 
 async fn epoch_started_at(state: &AppState, info: &SystemInfo) -> Option<String> {
+    let rows = state
+        .store
+        .ticks_after(info.initial_tick.saturating_sub(1), EPOCH_START_PROBE_TICKS)
+        .await
+        .unwrap_or_default();
+    if let Some(started) = epoch_start_from_rows(&rows) {
+        return Some(started);
+    }
     let row = state.store.tick(info.initial_tick).await.ok().flatten()?;
     Some(
         row.timestamp
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
     )
+}
+
+fn epoch_start_from_rows(rows: &[store::TickRow]) -> Option<String> {
+    let latest = rows.iter().map(|row| row.timestamp).max()?;
+    let cutoff = latest - chrono::TimeDelta::hours(1);
+    rows.iter()
+        .filter(|row| row.timestamp >= cutoff)
+        .min_by_key(|row| row.tick)
+        .map(|row| {
+            row.timestamp
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+        })
 }
 
 async fn peers(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
@@ -1018,6 +1040,35 @@ mod tests {
         assert_eq!(revenue_factor(0, 10), 0);
         assert_eq!(revenue_factor(10, 10), 1024);
         assert_eq!(revenue_factor(5, 10), 512);
+    }
+
+    #[test]
+    fn epoch_start_skips_genesis_dated_ticks() {
+        let row = |tick, timestamp| store::TickRow {
+            epoch: 240,
+            tick,
+            timestamp,
+            computor_index: 0,
+            transaction_count: 0,
+            event_count: 0,
+            verification: "data".into(),
+        };
+        let parse = |value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .expect("valid timestamp")
+                .with_timezone(&Utc)
+        };
+        let rows = vec![
+            row(100, parse("2022-04-13T12:00:00Z")),
+            row(101, parse("2022-04-13T12:00:01Z")),
+            row(110, parse("2026-11-18T12:11:18Z")),
+            row(111, parse("2026-11-18T12:11:19Z")),
+        ];
+        assert_eq!(
+            epoch_start_from_rows(&rows).as_deref(),
+            Some("2026-11-18T12:11:18.000Z")
+        );
+        assert_eq!(epoch_start_from_rows(&[]), None);
     }
 
     #[test]

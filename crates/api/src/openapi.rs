@@ -2060,7 +2060,7 @@ fn schemas() -> Value {
                         "initial_tick": { "type": "integer" },
                         "latest_created_tick": { "type": "integer" },
                         "epoch_age_ticks": { "type": "integer" },
-                        "started_at": { "type": ["string", "null"], "format": "date-time", "description": "Indexed timestamp of the epoch's first tick, or null when it is outside retention." },
+                        "started_at": { "type": ["string", "null"], "format": "date-time", "description": "Earliest trustworthy indexed epoch timestamp, or null when no epoch tick is retained." },
                         "entity_count": { "type": "integer" },
                         "transaction_count": { "type": "integer" },
                         "total_spectrum_amount": { "type": "integer" },
