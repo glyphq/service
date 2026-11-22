@@ -82,7 +82,7 @@ async fn transaction_effects(
     ))
 }
 
-fn effect_json(event: &Value) -> Option<Value> {
+pub(crate) fn effect_json(event: &Value) -> Option<Value> {
     let body = event.get("body")?;
     let kind = event.get("type_name")?.as_str()?;
     let common = json!({
@@ -140,7 +140,7 @@ fn effect_json(event: &Value) -> Option<Value> {
     Some(effect)
 }
 
-fn effect_summary(events: &[Value]) -> Value {
+pub(crate) fn effect_summary(events: &[Value]) -> Value {
     let mut qu_transfer_count = 0u64;
     let mut qu_transfer_amount = 0i64;
     let mut asset_ownership_change_count = 0u64;

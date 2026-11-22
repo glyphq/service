@@ -482,25 +482,47 @@ peer. Hours before `from_hour` are never included.
 ### Oracle data (variable)
 
 `RequestOracleData` is a 16-byte request: `u32 req_type`, `u32 padding`, `i64 tick_or_id`.
-The client uses reqType 9 (active subscriptions, `tick_or_id` ignored), reqType 6
-(subscription info, `tick_or_id` is the subscription ID), and reqType 5 (query and
-response, `tick_or_id` is the query ID).
+ReqType selects what `tick_or_id` means:
+
+| reqType | Meaning |
+| --- | --- |
+| 0 | All query IDs of a tick |
+| 1 | User query IDs of a tick |
+| 2 | Direct contract query IDs of a tick |
+| 3 | Subscription query IDs of a tick |
+| 4 | Pending query IDs, `tick_or_id` ignored |
+| 5 | Query metadata, query data, and reply for one query ID |
+| 6 | Subscription info, initial query, and subscribers for one subscription ID |
+| 7 | Query statistics, `tick_or_id` ignored |
+| 8 | Oracle revenue points, `tick_or_id` ignored |
+| 9 | Active subscription IDs, `tick_or_id` ignored |
+| 10 | Active subscription IDs of one contract index |
 
 Each `RespondOracleData` packet starts with `u32 res_type`:
 
 | resType | Meaning |
 | --- | --- |
+| 0 | Query IDs, an array of `i64` |
 | 1 | Query metadata, 72 bytes |
 | 2 | Query data, size defined by the oracle interface |
 | 3 | Reply data, size defined by the oracle interface |
 | 5 | Subscription info, 28 bytes of fields padded to 32 in the core |
 | 6 | Subscriber info, 16 bytes |
+| 7 | Query statistics, 20 `u64` counters |
+| 8 | Oracle revenue points, 676 `u64` values |
+| 9 | Valid tick range, `u32 first_tick`, `u32 current_tick` |
 | 10 | Active subscription IDs, an array of `i32` |
 
 Query metadata is `i64 query_id`, `u8 type`, `u8 status`, `u16 status_flags`,
 `u32 query_tick`, `[u8; 32] querying_entity`, `u64 timeout`, `u32 interface_index`,
 `i32 subscription_id`, `u32 reveal_tick`, `u16 total_commits`, `u16 agreeing_commits`.
 Status 3 means the reply was revealed successfully.
+
+Query statistics are 20 `u64` fields: pending counts (oracle machine, commit,
+reveal), successful and reveal transaction counts, unresolvable and timeout
+counts, timeout breakdowns, oracle-machine disagreement count, average
+oracle-machine/commit/success/timeout durations in thousandth ticks, wrong
+knowledge proof count, and user/contract/subscription query totals.
 
 Subscription info is `i32 subscription_id`, `u32 interface_index`,
 `i64 last_pending_query_id`, `i64 last_revealed_query_id`, `u32 generated_queries_count`.
@@ -514,6 +536,18 @@ by zero bytes and USDT is `USDT` followed by zero bytes.
 The `/v1/prices` routes read the QUBIC/USDT orientation from this oracle. When no active
 Price subscription with a revealed QUBIC/USDT reply is found, the poller falls back to the
 QPayhub `GetQuUsdPrice` contract read (contract 29, input type 4).
+
+### Revenue data (fixed)
+
+`RequestRevenueData` has no payload. `RespondRevenueData` is packed and 16,238 bytes:
+`u32 tick`, `u16 doge_k`, `i64 ipc`, then three arrays of 676 `u64` values:
+`txScore`, `oracleScore`, and `dogeScore`.
+
+Scores are the node's live in-memory state at `tick`. They are approximate mid-epoch
+and exact only at epoch end. The revenue formula normalizes each dimension against the
+451st-highest score, then multiplies the per-computor factors by `ipc`. Qubic currently
+disables the DOGE factor, so `/v1/network/revenue` exposes raw `doge_score` but leaves it
+out of the estimated reward.
 
 ## Request payloads
 

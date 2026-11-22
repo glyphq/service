@@ -1,16 +1,17 @@
 # API
 
 Glyph API exposes an HTTP API over the local ClickHouse index. Read routes never
-call a hosted RPC. Peer-backed operations live under `/v1/live` and connect
-directly to a configured Qubic peer per request. Transaction broadcast is
-disabled unless `ALLOW_BROADCAST=true`. Signed transactions are queued in the
-API mempool by default, or fanned out immediately with `direct: true`. If a
-resource is not indexed, the API returns a problem document instead of proxying
-upstream.
+call a hosted RPC. Live chain state lives under `/v1/network` and raw peer
+passthrough operations live under `/v1/live`; both connect directly to a
+configured Qubic peer per request. Transaction broadcast is disabled unless
+`ALLOW_BROADCAST=true`. Signed transactions are queued in the API mempool by
+default, or fanned out immediately with `direct: true`. If a resource is not
+indexed, the API returns a problem document instead of proxying upstream.
 
 - Base URL in development: `http://127.0.0.1:8080`
-- Indexed data routes are under `/v1`. Peer-backed routes are under `/v1/live`.
-  `/healthz`, `/openapi.json`, and `/docs` are unversioned.
+- Indexed data routes are under `/v1`. Live chain state is under `/v1/network`.
+  Raw peer passthrough is under `/v1/live`. `/healthz`, `/openapi.json`, and
+  `/docs` are unversioned.
 - The canonical market route is `/v1/market`. Aliases are not published.
 - Requests and responses are UTF-8 JSON. Errors use `application/problem+json`.
 - The server is axum with gzip and zstd response compression, CORS (permissive
@@ -24,26 +25,34 @@ Route families:
 
 | Prefix | Reads from | Cacheable |
 | --- | --- | --- |
-| `/v1/status`, `/v1/network` | Index and sampled peer state | No |
+| `/v1/status` | Index and sampled peer state | No |
+| `/v1/network` | Live system info, peer health, revenue, oracles | Briefly |
+| `/v1/network/index` | Index-wide counts | Briefly |
 | `/v1/epochs`, `/v1/ticks`, `/v1/transactions`, `/v1/events` | ClickHouse index | Point reads yes, lists briefly |
 | `/v1/identities`, `/v1/wallets`, `/v1/assets` | ClickHouse index plus peer joins | Briefly |
 | `/v1/prices`, `/v1/market`, `/v1/analytics` | Stored prices and aggregates | Briefly |
 | `/v1/stream`, `/v1/ws` | Local index head | No |
 | `/v1/mempool` | Local mempool state plus index status | No |
 | `/v1/webhooks` | Local webhook registrations and deliveries | No |
-| `/v1/live` | Direct peer call | At most 2 s, some no-store |
+| `/v1/live` | Direct raw peer call | At most 2 s, some no-store |
 
 This page documents the implemented surface. Planned endpoints and tiers are in
 [ROADMAP.md](./ROADMAP.md) and are not part of the current contract.
 
-### Migration from 0.1
+### Migration notes
 
-The 0.2 spec moves direct-peer reads under `/v1/live`, removes duplicate market
-aliases, and standardizes operation IDs. Regenerate generated clients.
+The 0.2 spec moved direct-peer reads under `/v1/live`, removed duplicate market
+aliases, and standardized operation IDs. The 0.3 spec turns `/v1/network` into
+a live overview and moves the old count shape to `/v1/network/index`. It also
+adds `/v1/network/system`, `/v1/network/peers`, `/v1/network/revenue`,
+`/v1/network/oracles`, `/v1/transactions/{hash}/lifecycle`,
+`/v1/transactions/inclusion-risk`, and `/v1/ticks/{tick}/capacity`. Regenerate
+generated clients.
 
 | Old path | New path |
 | --- | --- |
-| `/v1/network/stats` | `/v1/network` |
+| `/v1/network/stats` | `/v1/network/index` |
+| `/v1/network` (old counts shape) | `/v1/network/index` |
 | `/v1/identities/{identity}/entity` | `/v1/live/identities/{identity}` |
 | `/v1/transactions/{hash}/network` | `/v1/live/transactions/{hash}` |
 | `/v1/transactions/{hash}/network/status` | `/v1/live/transactions/{hash}/status` |
@@ -248,6 +257,39 @@ elapsed so far, and `coverage` is their ratio. When the peer is unavailable,
 
 ### `GET /v1/network`
 
+One dashboard call that combines the index, live peer system info, peer health,
+and sync lag. `system` is `null` when no peer answers; `meta.peer_error` says
+why. Use `/v1/network/index` when only the stable count shape is needed.
+
+```json
+{
+  "data": {
+    "indexed": {
+      "head": { "epoch": 240, "tick": 91916480, "verification": "data" },
+      "epochs": 1,
+      "ticks": 6481,
+      "transactions": 45120,
+      "events": 103696,
+      "identities": 3210,
+      "ingest": { "last_indexed_tick": 91916480, "epoch": 240 }
+    },
+    "system": {
+      "epoch": 240,
+      "tick": 91916500,
+      "initial_tick": 91880000,
+      "entity_count": 51234,
+      "transaction_count": 9123456,
+      "indexed": { "tick": 91916480, "lag_ticks": 20 }
+    },
+    "peers": { "configured": 5, "healthy": 4, "unknown": 1, "quarantined": 0 },
+    "sync": { "lag_ticks": 20, "indexed_tick": 91916480, "network_tick": 91916500 }
+  },
+  "meta": { "source": "index+peer", "peer_error": null }
+}
+```
+
+### `GET /v1/network/index`
+
 Typed index-wide counts and progress. This is the stable shape for dashboards
 and does not require parsing the free-form `stats` object in `/v1/status`.
 
@@ -263,9 +305,73 @@ and does not require parsing the free-form `stats` object in `/v1/status`.
     "latest_timestamp": "2026-11-18T15:10:00.000Z",
     "ingest": { "last_indexed_tick": 91916480, "epoch": 240 }
   },
-  "meta": { "source": "direct-qubic-peers" }
+  "meta": { "source": "index" }
 }
 ```
+
+### `GET /v1/network/system`
+
+Live `RespondSystemInfo` from the best peer, normalized to snake_case. `started_at`
+is the peer's epoch start time. `indexed` is the local head and lag when one
+exists. Cached for one second.
+
+### `GET /v1/network/peers`
+
+Operator view of every configured peer: score, successes, failures, last latency,
+and quarantine remaining. `status` is `healthy`, `unknown`, or `quarantined`.
+
+### `GET /v1/network/revenue`
+
+Live `RespondRevenueData` scores for all 676 computors. Each row includes
+`tx_score`, `oracle_score`, `doge_score`, the normalized factors, an estimated
+`reward`, and `share` of the current epoch estimate. `sort` accepts `reward`,
+`tx_score`, `oracle_score`, `doge_score`, or `index`. `identity` filters to one
+computor.
+
+Scores are the node's live in-memory state. They are approximate mid-epoch and
+exact only after the epoch ends. Qubic currently disables the DOGE factor, so
+`doge_included` is `false` and raw `doge_score` is still returned.
+
+### `GET /v1/network/revenue/{identity}`
+
+One computor row from the live revenue response. Returns `404` when the identity
+is not a computor in the current epoch.
+
+### `GET /v1/network/oracles`
+
+Oracle overview: query statistics, pending query count, active subscription
+count, and total queries.
+
+### `GET /v1/network/oracles/stats`
+
+Full `RespondOracleDataQueryStatistics`: pending and successful counts, timeout
+breakdowns, disagreement counts, wrong knowledge proofs, per-type query counts,
+and average durations in thousandth ticks.
+
+### `GET /v1/network/oracles/queries`
+
+`status=pending` (default) returns pending query IDs. `status=all|user|contract|subscription`
+returns queries for `tick`, which defaults to the indexed head. `limit` bounds
+how many query details are materialized. Each row includes metadata, status and
+type names, decoded price query and reply when the interface is the price oracle,
+and raw query/reply hex.
+
+### `GET /v1/network/oracles/queries/{id}`
+
+One oracle query with metadata, timeout time, decoded price data, and raw hex.
+
+### `GET /v1/network/oracles/subscriptions`
+
+Active subscription IDs with details and contract subscribers. `contract` filters
+to one contract index. `limit` caps how many subscriptions are materialized.
+
+### `GET /v1/network/oracles/subscriptions/{id}`
+
+One subscription with its initial query and every subscriber.
+
+### `GET /v1/network/oracles/revenue`
+
+676 oracle revenue points for the current epoch, with computor identity joins.
 
 ### `GET /v1/epochs`
 
@@ -753,6 +859,69 @@ The effect list covers `qu_transfer`, `asset_ownership_change`,
 `asset_possession_change`, `burning`, contract message types, and
 `custom_message`. The summary counts each kind and sums QU transfer amounts.
 The response is immutable and cached for one year.
+
+### `GET /v1/transactions/{hash}/lifecycle`
+
+The explorer view of one transaction: where it was seen, whether it landed,
+whether it moved money, and what it produced.
+
+```json
+{
+  "data": {
+    "hash": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
+    "state": "confirmed",
+    "target_tick": 91916480,
+    "included_tick": 91916480,
+    "current_tick": 91916540,
+    "confirmations": 60,
+    "money_flew": true,
+    "execution": { "status": "success", "error_count": 0, "event_count": 3 },
+    "transaction": { "source": "...", "destination": "...", "amount": 1000 },
+    "events": [],
+    "effects": [],
+    "summary": { "event_count": 3, "qu_transfer_count": 1 },
+    "errors": [],
+    "mempool": null,
+    "network": null,
+    "timeline": [
+      { "stage": "included", "tick": 91916480, "timestamp": "2026-11-18T15:10:00.000Z" },
+      { "stage": "confirmed", "tick": 91916540, "confirmations": 60 }
+    ]
+  },
+  "meta": {
+    "source": "index",
+    "pending_pool_public": false,
+    "note": "money_flew is null when no peer running the tx-status add-on answered."
+  }
+}
+```
+
+`state` is `queued`, `broadcast`, `confirmed`, `expired`, `failed`, `cancelled`,
+`pending`, or `missed`. The route checks the index, the Glyph mempool, and then
+the peer. `money_flew` is `true` or `false` only when a peer tx-status add-on
+answers; otherwise it is `null`, never a misleading `false`.
+
+### `GET /v1/transactions/inclusion-risk`
+
+Heuristic estimate for a transaction that has not been included yet.
+
+| Query | Meaning |
+| --- | --- |
+| `source` | Optional sender identity. Adds balance and recent activity. |
+| `target_tick` | Optional target tick. Defaults to current plus one. |
+| `amount` | Optional amount. A value above the live balance is an immediate high risk. |
+
+The response includes `score` (`0..1`), `level` (`low`, `medium`, `high`,
+`very_high`), `recommendation`, per-factor contributions, and recent capacity
+statistics. Qubic does not expose the computor pending pool, so this is an
+estimate from recent tick fill, target-tick distance, and balance. It is not a
+consensus guarantee.
+
+### `GET /v1/ticks/{tick}/capacity`
+
+Tick fill for one indexed tick: transaction count, remaining slots, fill ratio,
+volume, transfer and contract-call counts, top senders, and optional money-flow
+counts from a peer tx-status add-on. The tick row itself is immutable.
 
 ### `GET /v1/identities/{identity}`
 
@@ -1290,7 +1459,7 @@ preview before asking the user to sign.
 A direct send returns `202 Accepted`. Qubic does not acknowledge broadcasts, so
 `sent` means the packet reached the peer socket, not that the transaction will
 be included. Use `meta.links.transaction`, `GET /v1/mempool/{hash}`,
-`GET /v1/transactions/{hash}/status`, or the tick stream to observe inclusion.
+`GET /v1/transactions/{hash}/lifecycle`, or the tick stream to observe inclusion.
 
 - `403 forbidden` when `ALLOW_BROADCAST` is not `true`.
 - `400 bad_request` for malformed hex, a transaction that fails local checks,
@@ -1664,6 +1833,9 @@ API process variable.
 curl -sS localhost:8080/healthz
 curl -sS localhost:8080/v1/status | jq .data.head
 curl -sS localhost:8080/v1/network | jq .data
+curl -sS localhost:8080/v1/network/system | jq .data
+curl -sS 'localhost:8080/v1/network/revenue?limit=10&sort=reward' | jq .data
+curl -sS localhost:8080/v1/network/oracles | jq .data
 curl -sS 'localhost:8080/v1/epochs?limit=10' | jq .data
 curl -sS 'localhost:8080/v1/ticks?epoch=240&limit=10' | jq .data
 curl -sS localhost:8080/v1/ticks/91916480 | jq .data
@@ -1672,6 +1844,8 @@ curl -sS 'localhost:8080/v1/ticks/91916480/events?limit=10' | jq .
 curl -sS 'localhost:8080/v1/transactions?limit=10' | jq .
 curl -sS 'localhost:8080/v1/events?type=asset_issuance&limit=10' | jq .
 curl -sS localhost:8080/v1/transactions/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh
+curl -sS localhost:8080/v1/transactions/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh/lifecycle | jq .data
+curl -sS 'localhost:8080/v1/transactions/inclusion-risk?source=BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK&target_tick=91916480' | jq .data
 curl -sS 'localhost:8080/v1/identities?limit=10' | jq .
 curl -sS localhost:8080/v1/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK
 curl -sS 'localhost:8080/v1/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK/transactions?limit=10' | jq .

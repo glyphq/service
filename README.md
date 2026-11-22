@@ -204,14 +204,24 @@ The v1 contract is in [docs/API.md](docs/API.md). A short tour:
 curl -sS localhost:8080/healthz
 curl -sS localhost:8080/v1/status
 curl -sS localhost:8080/v1/network
+curl -sS localhost:8080/v1/network/index
+curl -sS localhost:8080/v1/network/system
+curl -sS localhost:8080/v1/network/peers
 
 # Ticks and transactions
 curl -sS 'localhost:8080/v1/ticks?epoch=240&limit=25'
 curl -sS localhost:8080/v1/ticks/91915000
+curl -sS localhost:8080/v1/ticks/91915000/capacity
 curl -sS 'localhost:8080/v1/ticks/91915000/events?limit=25'
 curl -sS localhost:8080/v1/transactions/<hash>
 curl -sS localhost:8080/v1/transactions/<hash>/effects
-curl -sS localhost:8080/v1/transactions/<hash>/status
+curl -sS localhost:8080/v1/transactions/<hash>/lifecycle
+curl -sS 'localhost:8080/v1/transactions/inclusion-risk?source=<identity>&target_tick=91915100'
+
+# Live computor revenue and oracle state
+curl -sS 'localhost:8080/v1/network/revenue?limit=25&sort=reward'
+curl -sS localhost:8080/v1/network/oracles
+curl -sS 'localhost:8080/v1/network/oracles/queries?status=pending&limit=10'
 
 # Identity history, including contract-originated effects
 curl -sS 'localhost:8080/v1/identities/<identity>/activity?limit=25'

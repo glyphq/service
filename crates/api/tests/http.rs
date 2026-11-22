@@ -770,10 +770,16 @@ async fn collection_resources_are_typed_and_enveloped() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["issuer"], IDENTITY);
 
-    let (status, body) = get("/v1/network").await;
+    let (status, body) = get("/v1/network/index").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["ticks"], 3);
     assert_eq!(body["data"]["head"]["tick"], 7);
+
+    let (status, body) = get("/v1/network").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["indexed"]["ticks"], 3);
+    assert_eq!(body["data"]["system"], Value::Null);
+    assert_eq!(body["data"]["peers"]["configured"], 0);
 }
 
 #[tokio::test]
@@ -947,6 +953,9 @@ async fn openapi_and_docs_are_served() {
     assert!(html.contains("Scalar.createApiReference"));
     assert!(html.contains("/scalar.js"));
     assert!(html.contains("/openapi.json"));
+    assert!(html.contains("Space Grotesk"));
+    assert!(html.contains("/fonts/space-grotesk.woff2"));
+    assert!(html.contains(r#"rel="preload""#));
 
     let app = router(AppState::new(Arc::new(MockStore::new())));
     let response = app
@@ -963,6 +972,46 @@ async fn openapi_and_docs_are_served() {
         response.headers().get(header::CONTENT_TYPE).unwrap(),
         "application/javascript"
     );
+
+    let app = router(AppState::new(Arc::new(MockStore::new())));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/fonts/space-grotesk.woff2")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "font/woff2"
+    );
+    assert_eq!(
+        response.headers().get(header::CACHE_CONTROL).unwrap(),
+        "public, max-age=31536000, immutable"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(bytes.starts_with(b"wOF2"));
+
+    let app = router(AppState::new(Arc::new(MockStore::new())));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/fonts/space-grotesk-ofl.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("SIL OPEN FONT LICENSE"));
 }
 
 #[tokio::test]
@@ -1059,6 +1108,17 @@ async fn optional_network_features_report_unavailable_or_forbidden() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "bad_request");
+
+    for uri in [
+        "/v1/network/system",
+        "/v1/network/revenue",
+        "/v1/network/oracles",
+        "/v1/network/oracles/stats",
+    ] {
+        let (status, body) = get(uri).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        assert_eq!(body["code"], "unavailable", "{uri}");
+    }
 }
 
 #[tokio::test]
@@ -1331,4 +1391,63 @@ async fn search_returns_every_matching_resource_type() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"][0]["type"], "asset");
     assert_eq!(body["data"][0]["value"]["name"], "QX");
+}
+
+#[tokio::test]
+async fn transaction_lifecycle_reports_inclusion_and_execution() {
+    let hash = hash_for(7, 0);
+    let (status, body) = get(&format!("/v1/transactions/{hash}/lifecycle")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["state"], "confirmed");
+    assert_eq!(body["data"]["target_tick"], 7);
+    assert_eq!(body["data"]["included_tick"], 7);
+    assert_eq!(body["data"]["transaction"]["hash"], hash);
+    assert_eq!(body["data"]["money_flew"], Value::Null);
+    assert_eq!(body["meta"]["pending_pool_public"], false);
+    assert_eq!(body["data"]["timeline"][0]["stage"], "included");
+    assert!(
+        body["data"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["type_name"] == "qu_transfer")
+    );
+
+    let (status, body) = get("/v1/transactions/unknown/lifecycle").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["code"], "invalid_transaction_hash");
+}
+
+#[tokio::test]
+async fn inclusion_risk_uses_recent_fill_and_target_distance() {
+    let (status, body) = get(&format!(
+        "/v1/transactions/inclusion-risk?source={IDENTITY}&target_tick=8"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["current_tick"], 7);
+    assert_eq!(body["data"]["target_tick"], 8);
+    assert_eq!(body["data"]["ticks_until_target"], 1);
+    assert!(body["data"]["score"].as_f64().unwrap() < 0.25);
+    assert_eq!(body["data"]["level"], "low");
+    assert_eq!(body["meta"]["model"], "heuristic");
+
+    let (status, body) = get("/v1/transactions/inclusion-risk?target_tick=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["level"], "very_high");
+    assert_eq!(
+        body["data"]["recommendation"],
+        "rebuild with a future target tick"
+    );
+}
+
+#[tokio::test]
+async fn tick_capacity_reports_fill_and_top_senders() {
+    let (status, body) = get("/v1/ticks/7/capacity").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["transaction_count"], 2);
+    assert_eq!(body["data"]["transaction_slots"], 4096);
+    assert_eq!(body["data"]["remaining_slots"], 4094);
+    assert_eq!(body["data"]["top_senders"].as_array().unwrap().len(), 2);
+    assert_eq!(body["data"]["money_flew"]["available"], false);
 }

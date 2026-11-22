@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -20,9 +20,12 @@ pub mod advanced;
 pub mod dto;
 pub mod error;
 pub mod identity;
+pub mod lifecycle;
 pub mod market;
 pub mod mempool;
+pub mod network;
 pub mod openapi;
+pub mod peer;
 pub mod prices;
 pub mod routes;
 pub mod status_page;
@@ -58,6 +61,8 @@ pub struct AppState {
     pub mempool: Option<Arc<mempool::Mempool>>,
     /// Signed webhook registration and delivery. `None` disables webhook routes.
     pub webhooks: Option<Arc<webhook::Webhooks>>,
+    /// Short-lived cache for peer-backed reads.
+    pub live_cache: Arc<peer::LiveCache>,
 }
 
 impl AppState {
@@ -77,6 +82,7 @@ impl AppState {
             gateway: None,
             mempool: None,
             webhooks: None,
+            live_cache: Arc::new(peer::LiveCache::default()),
         }
     }
 
@@ -152,6 +158,8 @@ pub fn router(state: AppState) -> Router {
         .merge(routes::router())
         .merge(identity::router())
         .merge(advanced::router())
+        .merge(network::router())
+        .merge(lifecycle::router())
         .merge(market::router())
         .merge(prices::router())
         .merge(stream::router())
@@ -169,6 +177,14 @@ pub fn router(state: AppState) -> Router {
         .route("/logo.png", axum::routing::get(routes::logo_dark))
         .route("/logo-light.png", axum::routing::get(routes::logo_light))
         .route("/favicon.png", axum::routing::get(routes::favicon))
+        .route(
+            "/fonts/space-grotesk.woff2",
+            axum::routing::get(routes::space_grotesk),
+        )
+        .route(
+            "/fonts/space-grotesk-ofl.txt",
+            axum::routing::get(routes::space_grotesk_license),
+        )
         .fallback(routes::not_found)
         .with_state(state);
     if let Some(limiter) = RateLimiter::from_env() {
@@ -406,6 +422,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         gateway,
         mempool,
         webhooks,
+        live_cache: Arc::new(peer::LiveCache::default()),
     });
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "glyph api listening");

@@ -17,9 +17,15 @@ use qubic::messages::{
     ASSET_REQUEST_ANY_OWNER, ASSET_REQUEST_ANY_OWNERSHIP_MANAGING_CONTRACT,
     ASSET_REQUEST_GET_SIBLINGS, ASSET_REQUEST_OWNERSHIP, ASSETS_DEPTH, AssetIssuanceRecord,
     AssetOwnershipRecord, AssetPossessionRecord, AssetRecord, AssetRecordKind, CurrentTickInfo,
-    EntityRecord, MAX_INPUT_SIZE, RequestAssets, RespondAssets, RespondAssetsWithSiblings,
+    EntityRecord, MAX_INPUT_SIZE, ORACLE_QUERY_STATUS_PENDING,
+    ORACLE_REQUEST_ACTIVE_CONTRACT_SUBSCRIPTIONS, ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS,
+    ORACLE_REQUEST_PENDING_QUERY_IDS, ORACLE_REQUEST_QUERY_AND_RESPONSE,
+    ORACLE_REQUEST_QUERY_STATISTICS, ORACLE_REQUEST_REVENUE_POINTS, ORACLE_REQUEST_SUBSCRIPTION,
+    OracleQueryMetadata, OracleQueryStatistics, OracleSubscriber, OracleSubscription,
+    PriceOracleQuery, RequestAssets, RequestOracleData, RespondAssets, RespondAssetsWithSiblings,
     RespondContractFunction, RespondEntity, RespondIssuedAssets, RespondOwnedAssets,
-    RespondPossessedAssets, RespondTxStatus, SPECTRUM_DEPTH, Transaction,
+    RespondPossessedAssets, RespondRevenueData, RespondTxStatus, SPECTRUM_DEPTH, SystemInfo,
+    Transaction,
 };
 use qubic::wire::{HEADER_SIZE, MessageType, Packet};
 use serde_json::{Value, json};
@@ -44,6 +50,12 @@ const ERROR_DIGEST: [u8; 32] = [0xEE; 32];
 
 fn identity(key: &[u8; 32]) -> String {
     qubic::PublicKey(*key).to_identity()
+}
+
+fn currency_id(name: &str) -> [u8; 32] {
+    let mut id = [0u8; 32];
+    id[..name.len()].copy_from_slice(name.as_bytes());
+    id
 }
 
 fn fixture_transaction() -> Transaction {
@@ -333,6 +345,12 @@ async fn send(stream: &mut TcpStream, kind: MessageType, dejavu: u32, payload: V
     stream.flush().await.expect("mock peer flush");
 }
 
+async fn send_oracle(stream: &mut TcpStream, dejavu: u32, res_type: u32, data: Vec<u8>) {
+    let mut payload = res_type.to_le_bytes().to_vec();
+    payload.extend_from_slice(&data);
+    send(stream, MessageType::RespondOracleData, dejavu, payload).await;
+}
+
 async fn serve(stream: TcpStream) {
     let mut stream = stream;
     send(
@@ -587,6 +605,220 @@ async fn serve(stream: TcpStream) {
                     status.encode(),
                 )
                 .await;
+            }
+            MessageType::RequestSystemInfo => {
+                let info = SystemInfo {
+                    version: 300,
+                    epoch: 240,
+                    tick: TICK,
+                    initial_tick: 900,
+                    latest_created_tick: TICK + 1,
+                    initial_millisecond: 789,
+                    initial_second: 56,
+                    initial_minute: 34,
+                    initial_hour: 12,
+                    initial_day: 22,
+                    initial_month: 11,
+                    initial_year: 26,
+                    number_of_entities: 1234,
+                    number_of_transactions: 5678,
+                    random_mining_seed: [7; 32],
+                    solution_threshold: 100,
+                    total_spectrum_amount: 1_000_000_000_000,
+                    current_entity_balance_dust_threshold: 100,
+                    target_tick_vote_signature: 451,
+                    computor_packet_signature: 9,
+                    solution_additional_threshold: 50,
+                    reserve2: 0,
+                    reserve3: 0,
+                    reserve4: 0,
+                };
+                send(
+                    &mut stream,
+                    MessageType::RespondSystemInfo,
+                    dejavu,
+                    info.encode().to_vec(),
+                )
+                .await;
+            }
+            MessageType::RequestRevenueData => {
+                let revenue = RespondRevenueData {
+                    tick: TICK,
+                    doge_k: 2,
+                    ipc: 1_479_289_940,
+                    tx_score: (0..676u64).collect(),
+                    oracle_score: (0..676u64).map(|value| value % 32).collect(),
+                    doge_score: vec![0; 676],
+                };
+                send(
+                    &mut stream,
+                    MessageType::RespondRevenueData,
+                    dejavu,
+                    revenue.encode(),
+                )
+                .await;
+            }
+            MessageType::RequestOracleData => {
+                let request = RequestOracleData::decode(&payload).expect("oracle request");
+                match request.req_type {
+                    ORACLE_REQUEST_QUERY_STATISTICS => {
+                        let stats = OracleQueryStatistics {
+                            pending_count: 2,
+                            successful_count: 10,
+                            timeout_count: 1,
+                            user_queries: 4,
+                            contract_queries: 5,
+                            subscription_queries: 6,
+                            ..OracleQueryStatistics::default()
+                        };
+                        send_oracle(
+                            &mut stream,
+                            dejavu,
+                            qubic::messages::ORACLE_RESPOND_QUERY_STATISTICS,
+                            stats.encode().to_vec(),
+                        )
+                        .await;
+                        send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                    }
+                    ORACLE_REQUEST_PENDING_QUERY_IDS => {
+                        for id in [1001i64, 1002] {
+                            send_oracle(
+                                &mut stream,
+                                dejavu,
+                                qubic::messages::ORACLE_RESPOND_QUERY_IDS,
+                                id.to_le_bytes().to_vec(),
+                            )
+                            .await;
+                        }
+                        send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                    }
+                    ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS => {
+                        send_oracle(
+                            &mut stream,
+                            dejavu,
+                            qubic::messages::ORACLE_RESPOND_SUBSCRIPTION_IDS,
+                            7i32.to_le_bytes().to_vec(),
+                        )
+                        .await;
+                        send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                    }
+                    ORACLE_REQUEST_QUERY_AND_RESPONSE => {
+                        let query_id = request.tick_or_id;
+                        let metadata = OracleQueryMetadata {
+                            query_id,
+                            query_type: 2,
+                            status: ORACLE_QUERY_STATUS_PENDING,
+                            status_flags: 0,
+                            query_tick: TICK,
+                            querying_entity: WALLET_KEY,
+                            timeout: (2026u64 << 46)
+                                | (11u64 << 42)
+                                | (22u64 << 37)
+                                | (12u64 << 32)
+                                | (34u64 << 26)
+                                | (56u64 << 20)
+                                | (789u64 << 10),
+                            interface_index: 0,
+                            subscription_id: -1,
+                            reveal_tick: 0,
+                            total_commits: 0,
+                            agreeing_commits: 0,
+                        };
+                        let query = PriceOracleQuery {
+                            oracle: [0; 32],
+                            timestamp: 1_700_000_000,
+                            currency1: currency_id("QUBIC"),
+                            currency2: currency_id("USDT"),
+                        };
+                        send_oracle(
+                            &mut stream,
+                            dejavu,
+                            qubic::messages::ORACLE_RESPOND_QUERY_METADATA,
+                            metadata.encode().to_vec(),
+                        )
+                        .await;
+                        send_oracle(
+                            &mut stream,
+                            dejavu,
+                            qubic::messages::ORACLE_RESPOND_QUERY_DATA,
+                            query.encode().to_vec(),
+                        )
+                        .await;
+                        send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                    }
+                    ORACLE_REQUEST_SUBSCRIPTION => {
+                        let subscription = OracleSubscription {
+                            subscription_id: 7,
+                            interface_index: 0,
+                            last_pending_query_id: 1001,
+                            last_revealed_query_id: 1000,
+                            generated_queries_count: 10,
+                        };
+                        let query = PriceOracleQuery {
+                            oracle: [0; 32],
+                            timestamp: 1_700_000_000,
+                            currency1: currency_id("QUBIC"),
+                            currency2: currency_id("USDT"),
+                        };
+                        let subscriber = OracleSubscriber {
+                            subscription_id: 7,
+                            contract_index: 13,
+                            notification_period_minutes: 60,
+                            next_query_timestamp: 0,
+                        };
+                        send_oracle(
+                            &mut stream,
+                            dejavu,
+                            qubic::messages::ORACLE_RESPOND_SUBSCRIPTION,
+                            subscription.encode(),
+                        )
+                        .await;
+                        send_oracle(
+                            &mut stream,
+                            dejavu,
+                            qubic::messages::ORACLE_RESPOND_QUERY_DATA,
+                            query.encode().to_vec(),
+                        )
+                        .await;
+                        send_oracle(
+                            &mut stream,
+                            dejavu,
+                            qubic::messages::ORACLE_RESPOND_SUBSCRIBER,
+                            subscriber.encode().to_vec(),
+                        )
+                        .await;
+                        send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                    }
+                    ORACLE_REQUEST_REVENUE_POINTS => {
+                        let mut data = Vec::with_capacity(676 * 8);
+                        for point in 1..=676u64 {
+                            data.extend_from_slice(&point.to_le_bytes());
+                        }
+                        send_oracle(
+                            &mut stream,
+                            dejavu,
+                            qubic::messages::ORACLE_RESPOND_REVENUE_POINTS,
+                            data,
+                        )
+                        .await;
+                        send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                    }
+                    ORACLE_REQUEST_ACTIVE_CONTRACT_SUBSCRIPTIONS => {
+                        for id in [7i32, 8] {
+                            send_oracle(
+                                &mut stream,
+                                dejavu,
+                                qubic::messages::ORACLE_RESPOND_SUBSCRIPTION_IDS,
+                                id.to_le_bytes().to_vec(),
+                            )
+                            .await;
+                        }
+                        send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                    }
+                    _ => {
+                        send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                    }
+                }
             }
             MessageType::BroadcastTransaction => {}
             _ => {}
@@ -978,4 +1210,94 @@ async fn batch_counts_unique_hashes_and_collapses_duplicates() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["code"], "bad_request");
+}
+
+#[tokio::test]
+async fn network_system_revenue_and_peers_are_typed() {
+    let state = state_with_peer(Arc::new(MockStore::new()), spawn_mock_peer().await);
+    let (status, body, headers) = get(state.clone(), "/v1/network/system").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        headers[header::CACHE_CONTROL],
+        "public, max-age=2, stale-while-revalidate=5"
+    );
+    assert_eq!(body["data"]["version"], 300);
+    assert_eq!(body["data"]["epoch"], 240);
+    assert_eq!(body["data"]["tick"], TICK);
+    assert_eq!(body["data"]["initial_tick"], 900);
+    assert_eq!(body["data"]["entity_count"], 1234);
+    assert_eq!(body["data"]["started_at"], "2026-11-22T12:34:56.789Z");
+    assert_eq!(body["meta"]["source"], "peer");
+
+    let (status, body, _) = get(state.clone(), "/v1/network/revenue?limit=3&sort=tx_score").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["epoch"], 240);
+    assert_eq!(body["data"]["computors"].as_array().unwrap().len(), 3);
+    assert_eq!(body["data"]["computors"][0]["tx_score"], 675);
+    assert!(body["data"]["totals"]["estimated_reward"].as_u64().unwrap() > 0);
+    assert_eq!(body["meta"]["approximate"], true);
+
+    let (status, body, _) = get(state, "/v1/network/peers").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["meta"]["configured"], 1);
+    assert_eq!(body["data"][0]["status"], "healthy");
+}
+
+#[tokio::test]
+async fn oracle_routes_expose_queries_subscriptions_and_revenue() {
+    let state = state_with_peer(Arc::new(MockStore::new()), spawn_mock_peer().await);
+
+    let (status, body, _) = get(state.clone(), "/v1/network/oracles").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["pending_queries"], 2);
+    assert_eq!(body["data"]["active_subscriptions"], 1);
+    assert_eq!(body["data"]["stats"]["pending_count"], 2);
+
+    let (status, body, _) = get(state.clone(), "/v1/network/oracles/stats").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["successful_count"], 10);
+    assert_eq!(body["data"]["user_queries"], 4);
+
+    let (status, body, _) = get(
+        state.clone(),
+        "/v1/network/oracles/queries?status=pending&limit=2",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["query_id"], 1001);
+    assert_eq!(rows[0]["status_name"], "pending");
+    assert_eq!(rows[0]["type_name"], "user_query");
+    assert_eq!(
+        rows[0]["price"]["currency1"],
+        identity(&currency_id("QUBIC"))
+    );
+    assert_eq!(
+        rows[0]["price"]["currency2"],
+        identity(&currency_id("USDT"))
+    );
+
+    let (status, body, _) = get(state.clone(), "/v1/network/oracles/queries/1001").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["query_id"], 1001);
+    assert_eq!(body["data"]["timeout_at"], "2026-11-22T12:34:56.789Z");
+    assert_eq!(body["data"]["interface_name"], "price");
+
+    let (status, body, _) = get(state.clone(), "/v1/network/oracles/subscriptions?limit=1").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let rows = body["data"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["subscription_id"], 7);
+    assert_eq!(rows[0]["subscribers"][0]["contract_index"], 13);
+
+    let (status, body, _) = get(state.clone(), "/v1/network/oracles/subscriptions/7").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["subscription_id"], 7);
+    assert_eq!(body["data"]["generated_queries_count"], 10);
+
+    let (status, body, _) = get(state, "/v1/network/oracles/revenue").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["total_points"], 228_826);
+    assert_eq!(body["data"]["computors"].as_array().unwrap().len(), 676);
 }

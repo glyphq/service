@@ -31,6 +31,9 @@ const TOP_IDENTITY_BUDGET: Duration = Duration::from_secs(4);
 const LOGO_DARK_PNG: &[u8] = include_bytes!("../assets/logo-dark.png");
 const LOGO_LIGHT_PNG: &[u8] = include_bytes!("../assets/logo-light.png");
 const FAVICON_PNG: &[u8] = include_bytes!("../assets/favicon.png");
+const SPACE_GROTESK_WOFF2: &[u8] = include_bytes!("../assets/space-grotesk-latin.woff2");
+const SPACE_GROTESK_LICENSE: &[u8] = include_bytes!("../assets/SPACE_GROTESK_OFL.txt");
+const FONT_PRELOAD: &str = r#"<link rel="preload" href="/fonts/space-grotesk.woff2" as="font" type="font/woff2" crossorigin>"#;
 
 /// [`axum::extract::Path`] with API error responses.
 ///
@@ -74,6 +77,9 @@ where
 }
 
 const DOCS_BRAND: &str = r#"<style>
+@font-face { font-family: "Space Grotesk"; font-style: normal; font-weight: 300 700; font-display: swap; src: url("/fonts/space-grotesk.woff2") format("woff2"); }
+:root, .light-mode, .dark-mode { --scalar-font: "Space Grotesk", ui-sans-serif, system-ui, sans-serif; --scalar-font-code: ui-monospace, "SFMono-Regular", "Cascadia Mono", "Roboto Mono", monospace; }
+body, button, input, select, textarea { font-family: "Space Grotesk", ui-sans-serif, system-ui, sans-serif; }
 .glyph-brand { display: flex; align-items: center; gap: 8px; padding: 14px 14px 2px; font: 500 14px/1.2 var(--scalar-font, ui-sans-serif, system-ui, sans-serif); color: var(--scalar-sidebar-color-1, #fff); text-decoration: none; }
 .glyph-brand:hover { color: var(--scalar-sidebar-color-active, #fff); }
 .glyph-brand__mark { display: block; width: 22px; height: 22px; }
@@ -115,7 +121,6 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/status", get(status))
-        .route("/v1/network", get(network_stats))
         .route("/v1/epochs", get(epochs))
         .route("/v1/epochs/{epoch}", get(epoch))
         .route("/v1/epochs/{epoch}/computors", get(epoch_computors))
@@ -336,17 +341,6 @@ async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiE
                 "archive": state.archive.is_some(),
                 "peers_configured": state.peers.len(),
             }
-        })),
-    ))
-}
-
-async fn network_stats(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let stats = state.store.network_stats().await?;
-    Ok((
-        [(header::CACHE_CONTROL, RECENT)],
-        Json(json!({
-            "data": stats,
-            "meta": { "source": "direct-qubic-peers" },
         })),
     ))
 }
@@ -1165,6 +1159,13 @@ pub async fn docs() -> Html<&'static str> {
 <ul>
 <li><code>GET /v1/status</code></li>
 <li><code>GET /v1/network</code></li>
+<li><code>GET /v1/network/index</code></li>
+<li><code>GET /v1/network/system</code></li>
+<li><code>GET /v1/network/peers</code></li>
+<li><code>GET /v1/network/revenue?limit=&amp;sort=&amp;identity=</code></li>
+<li><code>GET /v1/network/oracles</code></li>
+<li><code>GET /v1/network/oracles/queries?status=&amp;tick=&amp;limit=</code></li>
+<li><code>GET /v1/network/oracles/subscriptions?contract=&amp;limit=</code></li>
 <li><code>GET /v1/epochs?limit=&amp;cursor=</code></li>
 <li><code>GET /v1/epochs/{epoch}</code></li>
 <li><code>GET /v1/epochs/{epoch}/computors</code></li>
@@ -1172,9 +1173,12 @@ pub async fn docs() -> Html<&'static str> {
 <li><code>GET /v1/ticks/{tick}</code></li>
 <li><code>GET /v1/ticks/{tick}/evidence</code></li>
 <li><code>GET /v1/ticks/{tick}/transactions?limit=&amp;cursor=</code></li>
+<li><code>GET /v1/ticks/{tick}/capacity</code></li>
 <li><code>GET /v1/ticks/{tick}/events?limit=&amp;cursor=</code></li>
 <li><code>GET /v1/transactions?epoch=&amp;tick=&amp;identity=&amp;limit=&amp;cursor=</code></li>
 <li><code>GET /v1/transactions/{hash}</code></li>
+<li><code>GET /v1/transactions/{hash}/lifecycle</code></li>
+<li><code>GET /v1/transactions/inclusion-risk?source=&amp;target_tick=&amp;amount=</code></li>
 <li><code>GET /v1/events?epoch=&amp;tick=&amp;type=&amp;limit=&amp;cursor=</code></li>
 <li><code>GET /v1/identities?limit=&amp;cursor=</code></li>
 <li><code>GET /v1/identities/{identity}</code></li>
@@ -1233,6 +1237,7 @@ pub async fn scalar_docs() -> Html<String> {
             "<title>Scalar API Reference</title>",
             "<title>Glyph API Reference</title>",
         )
+        .replace("</head>", &format!("{FONT_PRELOAD}</head>"))
         .replace("</body>", &format!("{DOCS_BRAND}</body>"));
     Html(html)
 }
@@ -1261,6 +1266,30 @@ pub async fn logo_dark() -> Response {
 
 pub async fn logo_light() -> Response {
     png(LOGO_LIGHT_PNG)
+}
+
+pub async fn space_grotesk() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "font/woff2"),
+            (header::CACHE_CONTROL, IMMUTABLE),
+        ],
+        SPACE_GROTESK_WOFF2,
+    )
+        .into_response()
+}
+
+pub async fn space_grotesk_license() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, IMMUTABLE),
+        ],
+        SPACE_GROTESK_LICENSE,
+    )
+        .into_response()
 }
 
 pub async fn favicon() -> Response {

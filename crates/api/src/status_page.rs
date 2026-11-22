@@ -388,6 +388,8 @@ fn render(view: &StatusView) -> String {
     html.push_str("<a href=\"/healthz\">GET /healthz</a>");
     html.push_str("<a href=\"/v1/status\">GET /v1/status</a>");
     html.push_str("<a href=\"/v1/network\">GET /v1/network</a>");
+    html.push_str("<a href=\"/v1/network/system\">GET /v1/network/system</a>");
+    html.push_str("<a href=\"/v1/network/oracles\">GET /v1/network/oracles</a>");
     html.push_str("<a href=\"/openapi.json\">GET /openapi.json</a>");
     html.push_str("<a href=\"/docs\">GET /docs</a>");
     html.push_str(

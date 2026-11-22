@@ -35,6 +35,8 @@ pub const DEFAULT_PEER_PORT: u16 = 21841;
 pub const ENTITY_RECORD_SIZE: usize = 64;
 pub const RESPOND_ENTITY_SIZE: usize = ENTITY_RECORD_SIZE + 8 + 32 * SPECTRUM_DEPTH;
 pub const RESPOND_SYSTEM_INFO_SIZE: usize = 128;
+/// `RespondRevenueData` (`network_messages/revenue_data.h`, packed).
+pub const RESPOND_REVENUE_DATA_SIZE: usize = 4 + 2 + 8 + 3 * 8 * COMPUTOR_COUNT;
 pub const REQUEST_CONTRACT_FUNCTION_SIZE: usize = 8;
 pub const RESPOND_CONTRACT_IPO_SIZE: usize = 8 + 32 * COMPUTOR_COUNT + 8 * COMPUTOR_COUNT;
 pub const RESPOND_ISSUED_ASSETS_SIZE: usize = ASSET_RECORD_SIZE + 8 + 32 * ASSETS_DEPTH;
@@ -136,6 +138,26 @@ pub const ORACLE_RESPOND_QUERY_STATISTICS: u32 = 7;
 pub const ORACLE_RESPOND_REVENUE_POINTS: u32 = 8;
 pub const ORACLE_RESPOND_TICK_RANGE: u32 = 9;
 pub const ORACLE_RESPOND_SUBSCRIPTION_IDS: u32 = 10;
+
+/// Oracle query types from `network_messages/common_def.h`.
+pub const ORACLE_QUERY_TYPE_CONTRACT_QUERY: u8 = 0;
+pub const ORACLE_QUERY_TYPE_CONTRACT_SUBSCRIPTION: u8 = 1;
+pub const ORACLE_QUERY_TYPE_USER_QUERY: u8 = 2;
+
+/// Oracle query statuses from `network_messages/common_def.h`.
+pub const ORACLE_QUERY_STATUS_UNKNOWN: u8 = 0;
+pub const ORACLE_QUERY_STATUS_PENDING: u8 = 1;
+pub const ORACLE_QUERY_STATUS_COMMITTED: u8 = 2;
+pub const ORACLE_QUERY_STATUS_SUCCESS: u8 = 3;
+pub const ORACLE_QUERY_STATUS_TIMEOUT: u8 = 4;
+pub const ORACLE_QUERY_STATUS_UNRESOLVABLE: u8 = 5;
+
+/// `RespondOracleDataQueryStatistics`: 20 `u64` counters.
+pub const RESPOND_ORACLE_DATA_QUERY_STATISTICS_SIZE: usize = 20 * 8;
+/// `RespondOracleDataSubscriber`: subscription, contract, period, next timestamp.
+pub const RESPOND_ORACLE_DATA_SUBSCRIBER_SIZE: usize = 16;
+/// `RespondOracleDataValidTickRange`: first tick and current tick.
+pub const RESPOND_ORACLE_DATA_TICK_RANGE_SIZE: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tick {
@@ -1165,6 +1187,228 @@ impl SystemInfo {
         put(&self.reserve4.to_le_bytes());
         debug_assert_eq!(o, RESPOND_SYSTEM_INFO_SIZE);
         out
+    }
+}
+
+/// Live per-computor revenue scores from `RequestRevenueData`.
+///
+/// Scores are the node's in-memory state at `tick`. They are approximate
+/// mid-epoch and exact only at epoch end, when the sliding-window tail is
+/// finalized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RespondRevenueData {
+    pub tick: u32,
+    /// `REVENUE_DOGE_K`, so consumers use the same root as the network.
+    pub doge_k: u16,
+    /// `REVENUE_IPC`, the per-computor revenue cap.
+    pub ipc: i64,
+    pub tx_score: Vec<u64>,
+    pub oracle_score: Vec<u64>,
+    pub doge_score: Vec<u64>,
+}
+
+impl RespondRevenueData {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() != RESPOND_REVENUE_DATA_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "respond revenue data needs {RESPOND_REVENUE_DATA_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let tick = u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes"));
+        let doge_k = u16::from_le_bytes(payload[4..6].try_into().expect("2 bytes"));
+        let ipc = i64::from_le_bytes(payload[6..14].try_into().expect("8 bytes"));
+        let mut offset = 14;
+        let mut read_scores = || {
+            let mut scores = Vec::with_capacity(COMPUTOR_COUNT);
+            for _ in 0..COMPUTOR_COUNT {
+                scores.push(u64::from_le_bytes(
+                    payload[offset..offset + 8].try_into().expect("8 bytes"),
+                ));
+                offset += 8;
+            }
+            scores
+        };
+        let tx_score = read_scores();
+        let oracle_score = read_scores();
+        let doge_score = read_scores();
+        Ok(Self {
+            tick,
+            doge_k,
+            ipc,
+            tx_score,
+            oracle_score,
+            doge_score,
+        })
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(RESPOND_REVENUE_DATA_SIZE);
+        out.extend_from_slice(&self.tick.to_le_bytes());
+        out.extend_from_slice(&self.doge_k.to_le_bytes());
+        out.extend_from_slice(&self.ipc.to_le_bytes());
+        for score in &self.tx_score {
+            out.extend_from_slice(&score.to_le_bytes());
+        }
+        for score in &self.oracle_score {
+            out.extend_from_slice(&score.to_le_bytes());
+        }
+        for score in &self.doge_score {
+            out.extend_from_slice(&score.to_le_bytes());
+        }
+        debug_assert_eq!(out.len(), RESPOND_REVENUE_DATA_SIZE);
+        out
+    }
+}
+
+/// `RespondOracleDataQueryStatistics`: per-node oracle query counters and
+/// average durations in thousandth ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OracleQueryStatistics {
+    pub pending_count: u64,
+    pub pending_oracle_machine_count: u64,
+    pub pending_commit_count: u64,
+    pub pending_reveal_count: u64,
+    pub successful_count: u64,
+    pub reveal_tx_count: u64,
+    pub unresolvable_count: u64,
+    pub timeout_count: u64,
+    pub timeout_no_reply_count: u64,
+    pub timeout_no_commit_count: u64,
+    pub timeout_no_reveal_count: u64,
+    pub oracle_machine_replies_disagree_count: u64,
+    pub oracle_machine_reply_avg_milli_ticks_per_query: u64,
+    pub commit_avg_milli_ticks_per_query: u64,
+    pub success_avg_milli_ticks_per_query: u64,
+    pub timeout_avg_milli_ticks_per_query: u64,
+    pub wrong_knowledge_proof_count: u64,
+    pub user_queries: u64,
+    pub contract_queries: u64,
+    pub subscription_queries: u64,
+}
+
+impl OracleQueryStatistics {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() != RESPOND_ORACLE_DATA_QUERY_STATISTICS_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "oracle query statistics need {RESPOND_ORACLE_DATA_QUERY_STATISTICS_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let mut r = Reader::new(payload);
+        Ok(Self {
+            pending_count: r.u64()?,
+            pending_oracle_machine_count: r.u64()?,
+            pending_commit_count: r.u64()?,
+            pending_reveal_count: r.u64()?,
+            successful_count: r.u64()?,
+            reveal_tx_count: r.u64()?,
+            unresolvable_count: r.u64()?,
+            timeout_count: r.u64()?,
+            timeout_no_reply_count: r.u64()?,
+            timeout_no_commit_count: r.u64()?,
+            timeout_no_reveal_count: r.u64()?,
+            oracle_machine_replies_disagree_count: r.u64()?,
+            oracle_machine_reply_avg_milli_ticks_per_query: r.u64()?,
+            commit_avg_milli_ticks_per_query: r.u64()?,
+            success_avg_milli_ticks_per_query: r.u64()?,
+            timeout_avg_milli_ticks_per_query: r.u64()?,
+            wrong_knowledge_proof_count: r.u64()?,
+            user_queries: r.u64()?,
+            contract_queries: r.u64()?,
+            subscription_queries: r.u64()?,
+        })
+    }
+
+    pub fn encode(&self) -> [u8; RESPOND_ORACLE_DATA_QUERY_STATISTICS_SIZE] {
+        let mut out = [0u8; RESPOND_ORACLE_DATA_QUERY_STATISTICS_SIZE];
+        let mut offset = 0;
+        for value in [
+            self.pending_count,
+            self.pending_oracle_machine_count,
+            self.pending_commit_count,
+            self.pending_reveal_count,
+            self.successful_count,
+            self.reveal_tx_count,
+            self.unresolvable_count,
+            self.timeout_count,
+            self.timeout_no_reply_count,
+            self.timeout_no_commit_count,
+            self.timeout_no_reveal_count,
+            self.oracle_machine_replies_disagree_count,
+            self.oracle_machine_reply_avg_milli_ticks_per_query,
+            self.commit_avg_milli_ticks_per_query,
+            self.success_avg_milli_ticks_per_query,
+            self.timeout_avg_milli_ticks_per_query,
+            self.wrong_knowledge_proof_count,
+            self.user_queries,
+            self.contract_queries,
+            self.subscription_queries,
+        ] {
+            out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+            offset += 8;
+        }
+        out
+    }
+}
+
+/// `RespondOracleDataSubscriber`: one contract notified by a subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OracleSubscriber {
+    pub subscription_id: i32,
+    pub contract_index: u16,
+    pub notification_period_minutes: u16,
+    /// Next query timestamp in QPI `DateAndTime` form.
+    pub next_query_timestamp: u64,
+}
+
+impl OracleSubscriber {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() < RESPOND_ORACLE_DATA_SUBSCRIBER_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "oracle subscriber needs {RESPOND_ORACLE_DATA_SUBSCRIBER_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        let mut r = Reader::new(payload);
+        Ok(Self {
+            subscription_id: r.u32()? as i32,
+            contract_index: r.u16()?,
+            notification_period_minutes: r.u16()?,
+            next_query_timestamp: r.u64()?,
+        })
+    }
+
+    pub fn encode(&self) -> [u8; RESPOND_ORACLE_DATA_SUBSCRIBER_SIZE] {
+        let mut out = [0u8; RESPOND_ORACLE_DATA_SUBSCRIBER_SIZE];
+        out[0..4].copy_from_slice(&self.subscription_id.to_le_bytes());
+        out[4..6].copy_from_slice(&self.contract_index.to_le_bytes());
+        out[6..8].copy_from_slice(&self.notification_period_minutes.to_le_bytes());
+        out[8..16].copy_from_slice(&self.next_query_timestamp.to_le_bytes());
+        out
+    }
+}
+
+/// `RespondOracleDataValidTickRange`: ticks for which the node retains query
+/// information.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OracleTickRange {
+    pub first_tick: u32,
+    pub current_tick: u32,
+}
+
+impl OracleTickRange {
+    pub fn decode(payload: &[u8]) -> Result<Self> {
+        if payload.len() != RESPOND_ORACLE_DATA_TICK_RANGE_SIZE {
+            return Err(Error::InvalidPacket(format!(
+                "oracle tick range needs {RESPOND_ORACLE_DATA_TICK_RANGE_SIZE} bytes, got {}",
+                payload.len()
+            )));
+        }
+        Ok(Self {
+            first_tick: u32::from_le_bytes(payload[0..4].try_into().expect("4 bytes")),
+            current_tick: u32::from_le_bytes(payload[4..8].try_into().expect("4 bytes")),
+        })
     }
 }
 
@@ -2413,6 +2657,10 @@ pub fn request_system_info() -> Vec<u8> {
     Vec::new()
 }
 
+pub fn request_revenue_data() -> Vec<u8> {
+    Vec::new()
+}
+
 pub fn request_entity(public_key: [u8; 32]) -> Vec<u8> {
     public_key.to_vec()
 }
@@ -2856,5 +3104,60 @@ mod tests {
         assert_eq!(&usdt[..4], b"USDT");
         assert!(usdt[4..].iter().all(|byte| *byte == 0));
         assert_ne!(qubic, usdt);
+    }
+
+    #[test]
+    fn revenue_data_round_trips_at_the_packed_size() {
+        let data = RespondRevenueData {
+            tick: 91_915_000,
+            doge_k: 2,
+            ipc: 1_479_289_940,
+            tx_score: (0..COMPUTOR_COUNT as u64).collect(),
+            oracle_score: (0..COMPUTOR_COUNT as u64).map(|value| value * 2).collect(),
+            doge_score: vec![0; COMPUTOR_COUNT],
+        };
+        let bytes = data.encode();
+        assert_eq!(bytes.len(), RESPOND_REVENUE_DATA_SIZE);
+        assert_eq!(RespondRevenueData::decode(&bytes).unwrap(), data);
+        assert!(RespondRevenueData::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn oracle_statistics_and_subscriber_round_trip() {
+        let stats = OracleQueryStatistics {
+            pending_count: 1,
+            pending_oracle_machine_count: 2,
+            pending_commit_count: 3,
+            pending_reveal_count: 4,
+            successful_count: 5,
+            reveal_tx_count: 6,
+            unresolvable_count: 7,
+            timeout_count: 8,
+            timeout_no_reply_count: 9,
+            timeout_no_commit_count: 10,
+            timeout_no_reveal_count: 11,
+            oracle_machine_replies_disagree_count: 12,
+            oracle_machine_reply_avg_milli_ticks_per_query: 13,
+            commit_avg_milli_ticks_per_query: 14,
+            success_avg_milli_ticks_per_query: 15,
+            timeout_avg_milli_ticks_per_query: 16,
+            wrong_knowledge_proof_count: 17,
+            user_queries: 18,
+            contract_queries: 19,
+            subscription_queries: 20,
+        };
+        let bytes = stats.encode();
+        assert_eq!(bytes.len(), RESPOND_ORACLE_DATA_QUERY_STATISTICS_SIZE);
+        assert_eq!(OracleQueryStatistics::decode(&bytes).unwrap(), stats);
+
+        let subscriber = OracleSubscriber {
+            subscription_id: 5,
+            contract_index: 13,
+            notification_period_minutes: 60,
+            next_query_timestamp: 0x1122_3344_5566_7788,
+        };
+        let bytes = subscriber.encode();
+        assert_eq!(bytes.len(), RESPOND_ORACLE_DATA_SUBSCRIBER_SIZE);
+        assert_eq!(OracleSubscriber::decode(&bytes).unwrap(), subscriber);
     }
 }

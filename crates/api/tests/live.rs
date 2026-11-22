@@ -202,7 +202,7 @@ async fn live_clickhouse_serves_every_collection() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["head"]["tick"], 101);
 
-    let (status, body) = get(&app, "/v1/network").await;
+    let (status, body) = get(&app, "/v1/network/index").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["ticks"], 2);
     assert_eq!(body["data"]["transactions"], 4);

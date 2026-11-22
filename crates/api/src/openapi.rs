@@ -115,10 +115,10 @@ fn data_envelope(schema: &str) -> Value {
 fn info() -> Value {
     json!({
         "title": "Glyph API",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "summary": "Verified Qubic chain data.",
         "x-logo": { "url": "/logo.png", "altText": "Glyph" },
-        "description": "Glyph indexes Qubic directly from peers and verifies quorum evidence.\n\n- `/v1` reads persisted, verified history.\n- `/v1/live` makes a direct peer call.\n- JSON responses use `data` and `meta`; errors use RFC 9457 problem documents.\n\nAmounts are integer QU. Identities are uppercase base-26; hashes are lowercase base-26."
+        "description": "Glyph indexes Qubic directly from peers and verifies quorum evidence.\n\n- `/v1` reads persisted, verified history.\n- `/v1/network` reads live peer state such as system info, revenue, and oracles.\n- `/v1/live` exposes raw peer operations.\n- JSON responses use `data` and `meta`; errors use RFC 9457 problem documents.\n\nAmounts are integer QU. Identities are uppercase base-26; hashes are lowercase base-26."
     })
 }
 
@@ -135,7 +135,9 @@ fn tags() -> Value {
         { "name": "Prices", "description": "QUBIC/USDT series." },
         { "name": "Market", "description": "External market reference." },
         { "name": "Analytics", "description": "Network aggregates." },
-        { "name": "Network", "description": "Index counts and coverage." },
+        { "name": "Network", "description": "Index counts, peer health, and system info." },
+        { "name": "Revenue", "description": "Live computor revenue scores and estimates." },
+        { "name": "Oracles", "description": "Live oracle queries, subscriptions, and statistics." },
         { "name": "Stream", "description": "SSE and WebSocket feeds." },
         { "name": "Live", "description": "Direct peer reads." },
         { "name": "Mempool", "description": "Broadcast tracking." },
@@ -147,7 +149,7 @@ fn tags() -> Value {
 
 fn tag_groups() -> Value {
     json!([
-        { "name": "Operations", "tags": ["Status", "Network"] },
+        { "name": "Operations", "tags": ["Status", "Network", "Revenue", "Oracles"] },
         { "name": "Chain Data", "tags": ["Epochs", "Ticks", "Transactions", "Events", "Archive"] },
         { "name": "Broadcast & Delivery", "tags": ["Mempool", "Webhooks"] },
         { "name": "Accounts & Assets", "tags": ["Identities", "Wallets", "Assets"] },
@@ -211,14 +213,181 @@ fn paths() -> Value {
             },
             "/v1/network": {
                 "get": {
-                    "operationId": "getNetwork",
+                    "operationId": "getNetworkOverview",
                     "tags": ["Network"],
-                    "summary": "Get network counts",
+                    "summary": "Get network overview",
+                    "description": "Indexed counts, live system info, peer health, and sync lag.",
+                    "responses": {
+                        "200": { "description": "Network overview", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "type": "object" }, "meta": { "type": "object" } } } } } },
+                        "500": { "description": "Storage failure" }
+                    }
+                }
+            },
+            "/v1/network/index": {
+                "get": {
+                    "operationId": "getNetworkIndex",
+                    "tags": ["Network"],
+                    "summary": "Get indexed counts",
                     "description": "Entity counts and indexed tick range.",
                     "responses": {
                         "200": { "description": "Network stats", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/NetworkStats" } } } } } },
                         "500": { "description": "Storage failure" }
                     }
+                }
+            },
+            "/v1/network/system": {
+                "get": {
+                    "operationId": "getNetworkSystem",
+                    "tags": ["Network"],
+                    "summary": "Get live system info",
+                    "description": "Peer system info with epoch start, entity counts, and thresholds.",
+                    "responses": {
+                        "200": { "description": "System info", "content": { "application/json": { "schema": data_envelope("NetworkSystem") } } },
+                        "503": { "description": "No peer answered" }
+                    }
+                }
+            },
+            "/v1/network/peers": {
+                "get": {
+                    "operationId": "listNetworkPeers",
+                    "tags": ["Network"],
+                    "summary": "List peer health",
+                    "description": "Score, latency, failures, and quarantine per configured peer.",
+                    "responses": { "200": { "description": "Peer health", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "type": "array", "items": { "type": "object" } }, "meta": { "type": "object" } } } } } } }
+                }
+            },
+            "/v1/network/revenue": {
+                "get": {
+                    "operationId": "listNetworkRevenue",
+                    "tags": ["Revenue"],
+                    "summary": "List live revenue scores",
+                    "description": "Approximate per-computor scores and estimated rewards for the current epoch.",
+                    "parameters": [
+                        { "name": "limit", "in": "query", "required": false, "description": "Rows to return.", "schema": { "type": "integer", "minimum": 1, "maximum": 676, "default": 676 } },
+                        { "name": "offset", "in": "query", "required": false, "description": "Rows to skip.", "schema": { "type": "integer", "minimum": 0, "default": 0 } },
+                        { "name": "sort", "in": "query", "required": false, "description": "reward, tx_score, oracle_score, doge_score, or index.", "schema": { "type": "string" } },
+                        { "name": "identity", "in": "query", "required": false, "description": "Filter to one computor identity.", "schema": { "type": "string" } }
+                    ],
+                    "responses": { "200": { "description": "Revenue rows", "content": { "application/json": { "schema": { "type": "object" } } } }, "503": { "description": "No peer answered" } }
+                }
+            },
+            "/v1/network/revenue/{identity}": {
+                "get": {
+                    "operationId": "getNetworkRevenueIdentity",
+                    "tags": ["Revenue"],
+                    "summary": "Get one computor revenue",
+                    "description": "Live scores for one computor identity.",
+                    "parameters": [identity_param()],
+                    "responses": { "200": { "description": "Computor revenue", "content": { "application/json": { "schema": data_envelope("RevenueComputor") } } }, "404": { "description": "Not a computor this epoch" } }
+                }
+            },
+            "/v1/network/oracles": {
+                "get": {
+                    "operationId": "getOracleOverview",
+                    "tags": ["Oracles"],
+                    "summary": "Get oracle overview",
+                    "description": "Query statistics, pending queries, and active subscriptions.",
+                    "responses": { "200": { "description": "Oracle overview", "content": { "application/json": { "schema": { "type": "object" } } } }, "503": { "description": "No peer answered" } }
+                }
+            },
+            "/v1/network/oracles/stats": {
+                "get": {
+                    "operationId": "getOracleStats",
+                    "tags": ["Oracles"],
+                    "summary": "Get oracle statistics",
+                    "description": "Counters and average durations for one peer's oracle engine.",
+                    "responses": { "200": { "description": "Oracle statistics", "content": { "application/json": { "schema": { "type": "object" } } } }, "503": { "description": "No peer answered" } }
+                }
+            },
+            "/v1/network/oracles/queries": {
+                "get": {
+                    "operationId": "listOracleQueries",
+                    "tags": ["Oracles"],
+                    "summary": "List oracle queries",
+                    "description": "Pending queries, or queries of one tick by type.",
+                    "parameters": [
+                        { "name": "status", "in": "query", "required": false, "description": "pending, all, user, contract, or subscription.", "schema": { "type": "string", "default": "pending" } },
+                        { "name": "tick", "in": "query", "required": false, "description": "Tick for non-pending selectors. Defaults to the indexed head.", "schema": { "type": "integer" } },
+                        { "name": "limit", "in": "query", "required": false, "description": "Queries to materialize.", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25 } },
+                        { "name": "offset", "in": "query", "required": false, "description": "Queries to skip.", "schema": { "type": "integer", "minimum": 0, "default": 0 } }
+                    ],
+                    "responses": { "200": { "description": "Oracle queries", "content": { "application/json": { "schema": { "type": "object" } } } }, "400": { "description": "Unknown status" }, "503": { "description": "No peer answered" } }
+                }
+            },
+            "/v1/network/oracles/queries/{id}": {
+                "get": {
+                    "operationId": "getOracleQuery",
+                    "tags": ["Oracles"],
+                    "summary": "Get oracle query",
+                    "description": "Metadata, raw query and reply, and decoded price data.",
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "description": "Oracle query ID.", "schema": { "type": "integer" } }],
+                    "responses": { "200": { "description": "Oracle query", "content": { "application/json": { "schema": { "type": "object" } } } }, "503": { "description": "No peer answered" } }
+                }
+            },
+            "/v1/network/oracles/subscriptions": {
+                "get": {
+                    "operationId": "listOracleSubscriptions",
+                    "tags": ["Oracles"],
+                    "summary": "List oracle subscriptions",
+                    "description": "Active subscriptions, optionally filtered to one contract.",
+                    "parameters": [
+                        { "name": "contract", "in": "query", "required": false, "description": "Contract index.", "schema": { "type": "integer" } },
+                        { "name": "limit", "in": "query", "required": false, "description": "Subscriptions to materialize.", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25 } }
+                    ],
+                    "responses": { "200": { "description": "Oracle subscriptions", "content": { "application/json": { "schema": { "type": "object" } } } }, "400": { "description": "Invalid contract" }, "503": { "description": "No peer answered" } }
+                }
+            },
+            "/v1/network/oracles/subscriptions/{id}": {
+                "get": {
+                    "operationId": "getOracleSubscription",
+                    "tags": ["Oracles"],
+                    "summary": "Get oracle subscription",
+                    "description": "Subscription info, initial query, and contract subscribers.",
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "description": "Oracle subscription ID.", "schema": { "type": "integer" } }],
+                    "responses": { "200": { "description": "Oracle subscription", "content": { "application/json": { "schema": { "type": "object" } } } }, "503": { "description": "No peer answered" } }
+                }
+            },
+            "/v1/network/oracles/revenue": {
+                "get": {
+                    "operationId": "getOracleRevenue",
+                    "tags": ["Oracles"],
+                    "summary": "Get oracle revenue points",
+                    "description": "676 oracle revenue points for the current epoch.",
+                    "responses": { "200": { "description": "Oracle revenue", "content": { "application/json": { "schema": { "type": "object" } } } }, "503": { "description": "No peer answered" } }
+                }
+            },
+            "/v1/transactions/inclusion-risk": {
+                "get": {
+                    "operationId": "getInclusionRisk",
+                    "tags": ["Transactions"],
+                    "summary": "Estimate inclusion risk",
+                    "description": "Heuristic from recent tick fill, target-tick distance, and balance.",
+                    "parameters": [
+                        { "name": "source", "in": "query", "required": false, "description": "Source identity.", "schema": { "type": "string" } },
+                        { "name": "target_tick", "in": "query", "required": false, "description": "Target tick. Defaults to current plus one.", "schema": { "type": "integer" } },
+                        { "name": "amount", "in": "query", "required": false, "description": "Transfer amount.", "schema": { "type": "integer", "minimum": 0 } }
+                    ],
+                    "responses": { "200": { "description": "Risk estimate", "content": { "application/json": { "schema": { "type": "object" } } } }, "400": { "description": "Invalid identity or amount" }, "503": { "description": "Current tick unavailable" } }
+                }
+            },
+            "/v1/transactions/{hash}/lifecycle": {
+                "get": {
+                    "operationId": "getTransactionLifecycle",
+                    "tags": ["Transactions"],
+                    "summary": "Get transaction lifecycle",
+                    "description": "Indexed, mempool, and peer state with events, effects, and money-flow.",
+                    "parameters": [transaction_hash_param()],
+                    "responses": { "200": { "description": "Transaction lifecycle", "content": { "application/json": { "schema": { "type": "object" } } } }, "400": { "description": "Invalid hash" }, "404": { "description": "Unknown transaction" } }
+                }
+            },
+            "/v1/ticks/{tick}/capacity": {
+                "get": {
+                    "operationId": "getTickCapacity",
+                    "tags": ["Ticks"],
+                    "summary": "Get tick capacity",
+                    "description": "Fill ratio, volume, top senders, and optional money-flow counts.",
+                    "parameters": [tick_param()],
+                    "responses": { "200": { "description": "Tick capacity", "content": { "application/json": { "schema": { "type": "object" } } } }, "404": { "description": "Tick not indexed" } }
                 }
             },
             // Chain data
@@ -823,7 +992,8 @@ fn paths() -> Value {
                     "operationId": "getTransactionStatus",
                     "tags": ["Transactions"],
                     "summary": "Get transaction status",
-                    "description": "Indexed row plus best-effort peer confirmation.",
+                    "description": "Legacy status view. Use transaction lifecycle for events, effects, mempool, and timeline.",
+                    "deprecated": true,
                     "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Indexed and/or peer transaction status" },
@@ -1881,6 +2051,44 @@ fn schemas() -> Value {
                         "ingest": { "type": "object" }
                     }
                 },
+                "NetworkSystem": {
+                    "type": "object",
+                    "properties": {
+                        "version": { "type": "integer" },
+                        "epoch": { "type": "integer" },
+                        "tick": { "type": "integer" },
+                        "initial_tick": { "type": "integer" },
+                        "latest_created_tick": { "type": "integer" },
+                        "epoch_age_ticks": { "type": "integer" },
+                        "started_at": { "type": ["string", "null"], "format": "date-time" },
+                        "entity_count": { "type": "integer" },
+                        "transaction_count": { "type": "integer" },
+                        "total_spectrum_amount": { "type": "integer" },
+                        "dust_threshold": { "type": "integer" },
+                        "solution_threshold": { "type": "integer" },
+                        "solution_additional_threshold": { "type": "integer" },
+                        "target_tick_vote_signature": { "type": "integer" },
+                        "computor_packet_signature": { "type": "integer" },
+                        "random_mining_seed": { "type": "string" },
+                        "reserves": { "type": "array", "items": { "type": "integer" } },
+                        "indexed": { "type": ["object", "null"] }
+                    }
+                },
+                "RevenueComputor": {
+                    "type": "object",
+                    "properties": {
+                        "computor_index": { "type": "integer" },
+                        "identity": { "type": ["string", "null"] },
+                        "public_key": { "type": ["string", "null"] },
+                        "tx_score": { "type": "integer" },
+                        "oracle_score": { "type": "integer" },
+                        "doge_score": { "type": "integer" },
+                        "tx_factor": { "type": "integer" },
+                        "oracle_factor": { "type": "integer" },
+                        "estimated_reward": { "type": "integer" },
+                        "share": { "type": "number" }
+                    }
+                },
                 "Status": {
                     "type": "object",
                     "properties": {
@@ -1946,13 +2154,25 @@ mod tests {
     fn spec_is_openapi_31_and_covers_routes() {
         let spec = spec();
         assert_eq!(spec["openapi"], "3.1.0");
-        assert_eq!(spec["info"]["version"], "0.2.0");
+        assert_eq!(spec["info"]["version"], "0.3.0");
         let paths = spec["paths"].as_object().expect("paths object");
         for path in [
             "/healthz",
             "/v1/status",
             "/status",
             "/v1/network",
+            "/v1/network/index",
+            "/v1/network/system",
+            "/v1/network/peers",
+            "/v1/network/revenue",
+            "/v1/network/revenue/{identity}",
+            "/v1/network/oracles",
+            "/v1/network/oracles/stats",
+            "/v1/network/oracles/queries",
+            "/v1/network/oracles/queries/{id}",
+            "/v1/network/oracles/subscriptions",
+            "/v1/network/oracles/subscriptions/{id}",
+            "/v1/network/oracles/revenue",
             "/v1/epochs",
             "/v1/epochs/{epoch}",
             "/v1/epochs/{epoch}/computors",
@@ -1960,10 +2180,13 @@ mod tests {
             "/v1/ticks/{tick}",
             "/v1/ticks/{tick}/evidence",
             "/v1/ticks/{tick}/transactions",
+            "/v1/ticks/{tick}/capacity",
             "/v1/ticks/{tick}/events",
             "/v1/transactions",
             "/v1/transactions/{hash}",
             "/v1/transactions/{hash}/effects",
+            "/v1/transactions/inclusion-risk",
+            "/v1/transactions/{hash}/lifecycle",
             "/v1/events",
             "/v1/identities",
             "/v1/identities/{identity}",

@@ -9,15 +9,16 @@ use qubic::messages::{
     LogRanges, MAX_AMOUNT, MAX_CONTRACTS, MAX_INPUT_SIZE, ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS,
     ORACLE_REQUEST_QUERY_AND_RESPONSE, ORACLE_REQUEST_SUBSCRIPTION, ORACLE_RESPOND_QUERY_DATA,
     ORACLE_RESPOND_QUERY_METADATA, ORACLE_RESPOND_REPLY_DATA, ORACLE_RESPOND_SUBSCRIPTION,
-    ORACLE_RESPOND_SUBSCRIPTION_IDS, OracleQueryMetadata, OracleSubscription,
-    PRICE_SERIES_MAX_POINTS, PeerAddress, RequestAssets, RespondAssets, RespondAssetsWithSiblings,
-    RespondContractFunction, RespondEntity, RespondIssuedAssets, RespondOracleData,
-    RespondOwnedAssets, RespondPossessedAssets, RespondPriceSeries, RespondTxStatus, TX_PER_TICK,
-    Tick, TickData, Transaction, request_all_log_ranges, request_assets, request_computors,
-    request_contract_function, request_current_tick_info, request_entity, request_issued_assets,
-    request_logs, request_oracle_data, request_owned_assets, request_possessed_assets,
-    request_price_series, request_quorum_tick, request_tick_data, request_tick_transactions,
-    request_transaction_info, request_tx_status,
+    ORACLE_RESPOND_SUBSCRIPTION_IDS, OracleQueryMetadata, OracleQueryStatistics, OracleSubscriber,
+    OracleSubscription, PRICE_SERIES_MAX_POINTS, PeerAddress, RequestAssets, RespondAssets,
+    RespondAssetsWithSiblings, RespondContractFunction, RespondEntity, RespondIssuedAssets,
+    RespondOracleData, RespondOwnedAssets, RespondPossessedAssets, RespondPriceSeries,
+    RespondRevenueData, RespondTxStatus, SystemInfo, TX_PER_TICK, Tick, TickData, Transaction,
+    request_all_log_ranges, request_assets, request_computors, request_contract_function,
+    request_current_tick_info, request_entity, request_issued_assets, request_logs,
+    request_oracle_data, request_owned_assets, request_possessed_assets, request_price_series,
+    request_quorum_tick, request_revenue_data, request_system_info, request_tick_data,
+    request_tick_transactions, request_transaction_info, request_tx_status,
 };
 use qubic::wire::{HEADER_SIZE, MessageType, Packet};
 use serde::Serialize;
@@ -56,6 +57,8 @@ const MAX_ASSET_RECORDS: usize = 1_000_000;
 
 /// Guard against a peer that streams an unbounded oracle response.
 const MAX_ORACLE_PACKETS: usize = 1024;
+/// Largest query-ID list accepted from one peer.
+const MAX_ORACLE_QUERY_IDS: usize = 1_000_000;
 /// Largest active-subscription list accepted from one peer.
 const MAX_ORACLE_SUBSCRIPTIONS: usize = 4096;
 
@@ -292,6 +295,14 @@ pub struct OracleQueryResponse {
     pub reply: Option<Vec<u8>>,
 }
 
+/// Subscription info, its initial query, and every contract subscriber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleSubscriptionDetail {
+    pub subscription: OracleSubscription,
+    pub query: Vec<u8>,
+    pub subscribers: Vec<OracleSubscriber>,
+}
+
 /// A broadcast transaction that passed local validation and was written to the
 /// peer socket. Qubic core does not acknowledge broadcasts, so receipt means
 /// "sent", not "included".
@@ -439,6 +450,30 @@ impl Peer {
         health::check_head(self.observed_head.as_ref(), &head)?;
         self.observed_head = Some(head.clone());
         Ok(head)
+    }
+
+    /// Requests the peer's packed system info snapshot.
+    pub async fn system_info(&mut self) -> Result<SystemInfo> {
+        let packet = self
+            .request_single(
+                MessageType::RequestSystemInfo,
+                request_system_info(),
+                MessageType::RespondSystemInfo,
+            )
+            .await?;
+        Ok(SystemInfo::decode(&packet.payload)?)
+    }
+
+    /// Requests live per-computor revenue scores for the current epoch.
+    pub async fn revenue_data(&mut self) -> Result<RespondRevenueData> {
+        let packet = self
+            .request_single(
+                MessageType::RequestRevenueData,
+                request_revenue_data(),
+                MessageType::RespondRevenueData,
+            )
+            .await?;
+        Ok(RespondRevenueData::decode(&packet.payload)?)
     }
 
     /// Requests the computors for the peer's current epoch.
@@ -642,6 +677,207 @@ impl Peer {
             )
             .await?;
         Ok(RespondPriceSeries::decode(&packet.payload)?)
+    }
+
+    /// Requests the IDs of oracle queries selected by `req_type`.
+    ///
+    /// Use the `ORACLE_REQUEST_*_BY_TICK` selectors or
+    /// [`ORACLE_REQUEST_PENDING_QUERY_IDS`]. `tick_or_id` is a tick for the
+    /// tick-scoped selectors and ignored for pending queries.
+    pub async fn oracle_query_ids(&mut self, req_type: u32, tick_or_id: i64) -> Result<Vec<i64>> {
+        let packets = self
+            .request_stream_bounded(
+                MessageType::RequestOracleData,
+                request_oracle_data(req_type, tick_or_id),
+                MessageType::RespondOracleData,
+                MAX_ORACLE_PACKETS,
+            )
+            .await?;
+        let mut ids = Vec::new();
+        for packet in &packets {
+            let (header, data) = RespondOracleData::decode(&packet.payload)?;
+            match header.res_type {
+                qubic::messages::ORACLE_RESPOND_QUERY_IDS => {
+                    if data.len() % 8 != 0 {
+                        return Err(Error::Verification(format!(
+                            "oracle query ID list has {} trailing bytes",
+                            data.len() % 8
+                        )));
+                    }
+                    for chunk in data.chunks_exact(8) {
+                        if ids.len() >= MAX_ORACLE_QUERY_IDS {
+                            return Err(Error::Verification(format!(
+                                "peer returned more than {MAX_ORACLE_QUERY_IDS} oracle query IDs"
+                            )));
+                        }
+                        ids.push(i64::from_le_bytes(
+                            chunk.try_into().expect("chunks_exact yields 8 bytes"),
+                        ));
+                    }
+                }
+                qubic::messages::ORACLE_RESPOND_TICK_RANGE => {
+                    // The node reports its retained tick range instead of an
+                    // empty ID list when the requested tick is out of range.
+                    qubic::messages::OracleTickRange::decode(data)?;
+                }
+                other => {
+                    return Err(Error::Verification(format!(
+                        "unexpected oracle response type {other} for query ID list"
+                    )));
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Requests oracle query processing statistics from the peer.
+    pub async fn oracle_query_statistics(&mut self) -> Result<OracleQueryStatistics> {
+        let packet = self
+            .request_single(
+                MessageType::RequestOracleData,
+                request_oracle_data(qubic::messages::ORACLE_REQUEST_QUERY_STATISTICS, 0),
+                MessageType::RespondOracleData,
+            )
+            .await?;
+        let (header, data) = RespondOracleData::decode(&packet.payload)?;
+        if header.res_type != qubic::messages::ORACLE_RESPOND_QUERY_STATISTICS {
+            return Err(Error::Verification(format!(
+                "unexpected oracle response type {} for statistics",
+                header.res_type
+            )));
+        }
+        Ok(OracleQueryStatistics::decode(data)?)
+    }
+
+    /// Requests the 676 oracle revenue points for the current epoch.
+    pub async fn oracle_revenue_points(&mut self) -> Result<Vec<u64>> {
+        let packet = self
+            .request_single(
+                MessageType::RequestOracleData,
+                request_oracle_data(qubic::messages::ORACLE_REQUEST_REVENUE_POINTS, 0),
+                MessageType::RespondOracleData,
+            )
+            .await?;
+        let (header, data) = RespondOracleData::decode(&packet.payload)?;
+        if header.res_type != qubic::messages::ORACLE_RESPOND_REVENUE_POINTS {
+            return Err(Error::Verification(format!(
+                "unexpected oracle response type {} for revenue points",
+                header.res_type
+            )));
+        }
+        if data.len() != COMPUTOR_COUNT * 8 {
+            return Err(Error::Verification(format!(
+                "oracle revenue points have {} bytes, expected {}",
+                data.len(),
+                COMPUTOR_COUNT * 8
+            )));
+        }
+        Ok(data
+            .chunks_exact(8)
+            .map(|chunk| u64::from_le_bytes(chunk.try_into().expect("8 bytes")))
+            .collect())
+    }
+
+    /// Requests the IDs of active oracle subscriptions of one contract.
+    pub async fn oracle_active_contract_subscriptions(
+        &mut self,
+        contract_index: u32,
+    ) -> Result<Vec<i32>> {
+        let packets = self
+            .request_stream_bounded(
+                MessageType::RequestOracleData,
+                request_oracle_data(
+                    qubic::messages::ORACLE_REQUEST_ACTIVE_CONTRACT_SUBSCRIPTIONS,
+                    i64::from(contract_index),
+                ),
+                MessageType::RespondOracleData,
+                MAX_ORACLE_PACKETS,
+            )
+            .await?;
+        let mut ids = Vec::new();
+        for packet in &packets {
+            let (header, data) = RespondOracleData::decode(&packet.payload)?;
+            if header.res_type != ORACLE_RESPOND_SUBSCRIPTION_IDS {
+                return Err(Error::Verification(format!(
+                    "unexpected oracle response type {} for contract subscriptions",
+                    header.res_type
+                )));
+            }
+            if data.len() % 4 != 0 {
+                return Err(Error::Verification(format!(
+                    "oracle contract subscription list has {} trailing bytes",
+                    data.len() % 4
+                )));
+            }
+            for chunk in data.chunks_exact(4) {
+                if ids.len() >= MAX_ORACLE_SUBSCRIPTIONS {
+                    return Err(Error::Verification(format!(
+                        "peer returned more than {MAX_ORACLE_SUBSCRIPTIONS} oracle contract subscriptions"
+                    )));
+                }
+                ids.push(i32::from_le_bytes(
+                    chunk.try_into().expect("chunks_exact yields 4 bytes"),
+                ));
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Requests a subscription, its initial query, and every subscriber.
+    pub async fn oracle_subscription_detail(
+        &mut self,
+        subscription_id: i32,
+    ) -> Result<OracleSubscriptionDetail> {
+        let packets = self
+            .request_stream_bounded(
+                MessageType::RequestOracleData,
+                request_oracle_data(ORACLE_REQUEST_SUBSCRIPTION, i64::from(subscription_id)),
+                MessageType::RespondOracleData,
+                MAX_ORACLE_PACKETS,
+            )
+            .await?;
+        let mut subscription = None;
+        let mut query = None;
+        let mut subscribers = Vec::new();
+        for packet in &packets {
+            let (header, data) = RespondOracleData::decode(&packet.payload)?;
+            match header.res_type {
+                ORACLE_RESPOND_SUBSCRIPTION => {
+                    subscription = Some(OracleSubscription::decode(data)?);
+                }
+                ORACLE_RESPOND_QUERY_DATA => query = Some(data.to_vec()),
+                qubic::messages::ORACLE_RESPOND_SUBSCRIBER => {
+                    subscribers.push(OracleSubscriber::decode(data)?);
+                }
+                qubic::messages::ORACLE_RESPOND_NOTIFIED_SUBSCRIBER_CONTRACTS => {}
+                other => {
+                    return Err(Error::Verification(format!(
+                        "unexpected oracle response type {other} for subscription {subscription_id}"
+                    )));
+                }
+            }
+        }
+        let subscription = subscription.ok_or_else(|| {
+            Error::Verification(format!(
+                "peer did not return info for oracle subscription {subscription_id}"
+            ))
+        })?;
+        if subscription.subscription_id != subscription_id {
+            return Err(Error::Verification(format!(
+                "peer returned subscription {}, requested {subscription_id}",
+                subscription.subscription_id
+            )));
+        }
+        let query = query.ok_or_else(|| {
+            Error::Verification(format!(
+                "peer did not return query data for subscription {subscription_id}"
+            ))
+        })?;
+        Ok(OracleSubscriptionDetail {
+            subscription,
+            query,
+            subscribers,
+        })
     }
 
     /// Requests the IDs of all oracle subscriptions active in the current
@@ -1664,6 +1900,16 @@ impl NodePool {
         Err(last_error.unwrap_or(Error::NoPeers))
     }
 
+    /// Requests system info from the best currently reachable peer.
+    pub async fn system_info(&self) -> Result<SystemInfo> {
+        self.connect_best().await?.system_info().await
+    }
+
+    /// Requests live revenue scores from the best currently reachable peer.
+    pub async fn revenue_data(&self) -> Result<RespondRevenueData> {
+        self.connect_best().await?.revenue_data().await
+    }
+
     /// Looks up a spectrum entity on the best currently reachable peer.
     pub async fn entity(&self, public_key: [u8; 32]) -> Result<RespondEntity> {
         self.connect_best().await?.entity(public_key).await
@@ -1732,6 +1978,46 @@ impl NodePool {
     /// currently reachable peer.
     pub async fn oracle_query(&self, query_id: i64) -> Result<OracleQueryResponse> {
         self.connect_best().await?.oracle_query(query_id).await
+    }
+
+    /// Requests oracle query IDs selected by `req_type`.
+    pub async fn oracle_query_ids(&self, req_type: u32, tick_or_id: i64) -> Result<Vec<i64>> {
+        self.connect_best()
+            .await?
+            .oracle_query_ids(req_type, tick_or_id)
+            .await
+    }
+
+    /// Requests oracle query processing statistics.
+    pub async fn oracle_query_statistics(&self) -> Result<OracleQueryStatistics> {
+        self.connect_best().await?.oracle_query_statistics().await
+    }
+
+    /// Requests the current epoch's 676 oracle revenue points.
+    pub async fn oracle_revenue_points(&self) -> Result<Vec<u64>> {
+        self.connect_best().await?.oracle_revenue_points().await
+    }
+
+    /// Requests active oracle subscriptions of one contract.
+    pub async fn oracle_active_contract_subscriptions(
+        &self,
+        contract_index: u32,
+    ) -> Result<Vec<i32>> {
+        self.connect_best()
+            .await?
+            .oracle_active_contract_subscriptions(contract_index)
+            .await
+    }
+
+    /// Requests one subscription with its query and subscribers.
+    pub async fn oracle_subscription_detail(
+        &self,
+        subscription_id: i32,
+    ) -> Result<OracleSubscriptionDetail> {
+        self.connect_best()
+            .await?
+            .oracle_subscription_detail(subscription_id)
+            .await
     }
 
     /// Requests every asset issued by `public_key` from the best currently
