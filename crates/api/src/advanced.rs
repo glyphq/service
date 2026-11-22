@@ -250,6 +250,7 @@ async fn network_transaction(
                 "destination": qubic::PublicKey(transaction.destination).to_identity(),
                 "amount": transaction.amount,
                 "tick": transaction.tick,
+                "target_tick": transaction.tick,
                 "input_type": transaction.input_type,
                 "input_data": hex::encode(&transaction.input),
             },
@@ -703,6 +704,22 @@ pub async fn broadcast_transaction(
             .into_response());
     }
 
+    if !decoded.valid {
+        let failed = decoded.failure_detail();
+        let target_tick_failed = decoded
+            .checks
+            .iter()
+            .any(|check| check.name == "target_tick" && !check.passed);
+        if target_tick_failed {
+            return Err(ApiError::invalid_target_tick(format!(
+                "transaction has an invalid target tick: {failed}"
+            )));
+        }
+        return Err(ApiError::bad_request(format!(
+            "transaction failed local validation: {failed}"
+        )));
+    }
+
     // Submit to the mempool by default when it is enabled. `direct: true`
     // keeps the original fan-out-and-return behavior.
     if !body.direct {
@@ -726,21 +743,6 @@ pub async fn broadcast_transaction(
         }
     }
 
-    if !decoded.valid {
-        let failed = decoded.failure_detail();
-        let target_tick_failed = decoded
-            .checks
-            .iter()
-            .any(|check| check.name == "target_tick" && !check.passed);
-        if target_tick_failed {
-            return Err(ApiError::invalid_target_tick(format!(
-                "transaction has an invalid target tick: {failed}"
-            )));
-        }
-        return Err(ApiError::bad_request(format!(
-            "transaction failed local validation: {failed}"
-        )));
-    }
     if state.peers.is_empty() {
         return Err(ApiError::unavailable(
             "no QUBIC_PEERS configured for transaction broadcast",

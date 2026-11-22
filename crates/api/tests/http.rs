@@ -1182,6 +1182,7 @@ async fn transaction_validation_reports_local_checks() {
         qubic::PublicKey(transaction.source).to_identity()
     );
     assert_eq!(body["data"]["tick"], transaction.tick);
+    assert_eq!(body["data"]["target_tick"], transaction.tick);
     assert_eq!(body["data"]["amount"], transaction.amount);
     assert_eq!(body["data"]["input_bytes"], transaction.input.len());
     assert_eq!(
