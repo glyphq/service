@@ -146,7 +146,7 @@ async fn lifecycle(
         "effects": effects,
         "summary": summary,
         "errors": errors,
-        "mempool": mempool.as_ref().map(crate::mempool::entry_json),
+        "tracking": mempool.as_ref().map(crate::mempool::entry_json),
         "network": network.as_ref().map(network_transaction_json),
         "timeline": timeline_json(
             indexed.as_ref(),
@@ -161,7 +161,7 @@ async fn lifecycle(
         Json(json!({
             "data": data,
             "meta": {
-                "source": if indexed.is_some() { "index" } else if mempool.is_some() { "mempool" } else { "peer" },
+                "source": if indexed.is_some() { "index" } else if mempool.is_some() { "tracking" } else { "peer" },
                 "peer_error": network_error,
                 "pending_pool_public": false,
                 "note": "money_flew is only known when a peer running the tx-status add-on answers. It is null otherwise, not false."

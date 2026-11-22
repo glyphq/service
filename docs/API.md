@@ -4,7 +4,7 @@ Glyph API exposes an HTTP API over the local ClickHouse index. Read routes never
 call a hosted RPC. Live chain state lives under `/v1/network` and raw peer
 passthrough operations live under `/v1/live`; both connect directly to a
 configured Qubic peer per request. Transaction broadcast is disabled unless
-`ALLOW_BROADCAST=true`. Signed transactions are queued in the API mempool by
+`ALLOW_BROADCAST=true`. Signed transactions enter the internal tracker by
 default, or fanned out immediately with `direct: true`. If a resource is not
 indexed, the API returns a problem document instead of proxying upstream.
 
@@ -32,7 +32,6 @@ Route families:
 | `/v1/identities`, `/v1/wallets`, `/v1/assets` | ClickHouse index plus peer joins | Briefly |
 | `/v1/prices`, `/v1/market`, `/v1/analytics` | Stored prices and aggregates | Briefly |
 | `/v1/stream`, `/v1/ws` | Local index head | No |
-| `/v1/mempool` | Local mempool state plus index status | No |
 | `/v1/webhooks` | Local webhook registrations and deliveries | No |
 | `/v1/live` | Direct raw peer call | At most 2 s, some no-store |
 
@@ -886,7 +885,7 @@ whether it moved money, and what it produced.
     "effects": [],
     "summary": { "event_count": 3, "qu_transfer_count": 1 },
     "errors": [],
-    "mempool": null,
+    "tracking": null,
     "network": null,
     "timeline": [
       { "stage": "included", "tick": 91916480, "timestamp": "2026-11-18T15:10:00.000Z" },
@@ -901,8 +900,8 @@ whether it moved money, and what it produced.
 }
 ```
 
-`state` is `queued`, `broadcast`, `confirmed`, `expired`, `failed`, `cancelled`,
-`pending`, or `missed`. The route checks the index, the Glyph mempool, and then
+`state` is `queued`, `broadcast`, `confirmed`, `expired`, `failed`,
+`pending`, or `missed`. The route checks the index, the Glyph tracker, and then
 the peer. `money_flew` is `true` or `false` only when a peer tx-status add-on
 answers; otherwise it is `null`, never a misleading `false`.
 
@@ -1349,9 +1348,9 @@ Responses are `Cache-Control: no-store`.
 ### `POST /v1/transactions`
 
 Submits a signed transaction. Disabled unless `ALLOW_BROADCAST=true`. The
-default path queues the transaction in the mempool and returns `202` with a
-tracked entry. Send `"direct": true` to use the previous behavior: one
-concurrent fan-out to direct peers, with the per-peer report.
+default path records the transaction in an internal tracker and returns `202`
+with its current state. Send `"direct": true` for one concurrent fan-out to
+direct peers, with the per-peer report.
 
 ```json
 {
@@ -1371,14 +1370,13 @@ and runs the same checks as `/v1/transactions/validate` before opening any
 socket. A transaction that fails validation is rejected with `400` and does not
 reach a peer.
 
-`webhook_url` and `webhook_secret` apply to the mempool path. They register a
+`webhook_url` and `webhook_secret` apply to the tracked path. They register a
 transaction-scoped webhook without a separate `POST /v1/webhooks` call. The
 secret must be at least 16 characters.
 
-The mempool path validates, persists, and performs the first broadcast attempt
+The tracked path validates, persists, and performs the first broadcast attempt
 before returning, so the response usually reports `broadcast` or `failed`, not
-`queued`. The response contains the same `MempoolEntry` shape as
-`GET /v1/mempool/{hash}`:
+`queued`:
 
 ```json
 {
@@ -1402,16 +1400,16 @@ before returning, so the response usually reports `broadcast` or `failed`, not
     "updated_at": "2026-11-18T15:10:00.050Z"
   },
   "meta": {
-    "source": "mempool",
+    "source": "tracking",
     "status": "broadcast",
     "broadcast": true,
     "broadcast_peers": 2,
     "confirmed": false,
     "links": {
-      "status": "/v1/mempool/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
+      "status": "/v1/transactions/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh/lifecycle",
       "transaction": "/v1/transactions/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh"
     },
-    "hint": "A broadcast status means at least one peer accepted the packet at the socket. Qubic does not acknowledge broadcasts; poll the status link or the indexed transaction."
+    "hint": "A broadcast status means at least one peer accepted the packet at the socket. Qubic does not acknowledge broadcasts; register a webhook or poll the lifecycle link."
   }
 }
 ```
@@ -1466,25 +1464,27 @@ preview before asking the user to sign.
 
 A direct send returns `202 Accepted`. Qubic does not acknowledge broadcasts, so
 `sent` means the packet reached the peer socket, not that the transaction will
-be included. Use `meta.links.transaction`, `GET /v1/mempool/{hash}`,
+be included. Use `meta.links.transaction`,
 `GET /v1/transactions/{hash}/lifecycle`, or the tick stream to observe inclusion.
 
 - `403 forbidden` when `ALLOW_BROADCAST` is not `true`.
 - `400 bad_request` for malformed hex, a transaction that fails local checks,
   or a `webhook_url` without a matching `webhook_secret`.
-- `429 mempool_full` when `MEMPOOL_MAX_ENTRIES` is reached and the mempool path
+- `429 tracking_full` when `MEMPOOL_MAX_ENTRIES` is reached and the tracked path
   is used. A duplicate hash returns the existing entry with `202` instead.
 - `503 unavailable` when no configured peer accepts a direct packet, or when
-  the mempool service is disabled and the direct path is unavailable.
+  internal tracking is disabled and the direct path is unavailable.
 
 When `MEMPOOL_ENABLED=false`, or with `direct: true`, the request uses the
 direct fan-out path instead.
 
-### Mempool
+### Transaction tracking
 
-The mempool is API-local operational state, not a Qubic protocol mempool. Qubic
-peers do not expose a mempool. Each entry records a broadcast attempt so a
-wallet can poll one resource instead of retrying blindly.
+Qubic peers do not expose a mempool or a broadcast acknowledgement. Glyph keeps
+an internal tracker for transactions submitted through `POST /v1/transactions`.
+The tracker polls the index, expires targets that were not included, and drives
+webhook events. It is an implementation detail, not a public resource: use the
+submission response, the lifecycle route, or a webhook.
 
 Status lifecycle:
 
@@ -1495,7 +1495,6 @@ Status lifecycle:
 | `confirmed` | The transaction hash is present in the local index. `confirmed_tick` and `confirmed_at` are set. |
 | `expired` | The indexed head passed `tick + MEMPOOL_EXPIRY_TICKS` and the hash never appeared. Default expiry is 10 ticks. |
 | `failed` | The most recent attempt reached no peer. Failed entries stay open and are retried until `MEMPOOL_MAX_ATTEMPTS`, then remain failed until retention cleanup. |
-| `cancelled` | An unconfirmed entry was cancelled through the API. A packet a peer already accepted is not recalled. |
 
 A transaction's `tick` field is its target tick. Qubic has no broadcast
 acknowledgement, so the tracker polls the index. Expiry uses the indexed head,
@@ -1506,48 +1505,11 @@ reconciled.
 Every entry retains `raw`, the signed transaction hex, so a retry does not need
 the client to resubmit. `error` carries the last broadcast error when set.
 
-#### `POST /v1/mempool`
-
-```json
-{
-  "raw": "0x...",
-  "peers": 3,
-  "webhook_url": "https://example.com/glyph",
-  "webhook_secret": "at-least-16-characters"
-}
-```
-
-Returns `202` with the entry and `meta.links.status`. Requires
-`ALLOW_BROADCAST=true`. A duplicate tracked hash returns `202` with the existing
-entry, so submissions are idempotent. A full mempool (`MEMPOOL_MAX_ENTRIES`)
-returns `429 mempool_full`. `webhook_url` and `webhook_secret` must be supplied
-together.
-
-#### `GET /v1/mempool`
-
-Lists entries, newest first. Optional `status` filters one lifecycle value;
-an unknown value returns `400 bad_request`. `limit` is clamped to `1..500`
-(default `100`). Returns `data` plus a `meta` object with the effective `limit`
-and `status`.
-
-#### `GET /v1/mempool/{hash}`
-
-One tracked entry, with indexed confirmation merged in before the next
-background poll persists it. A hash that is not tracked returns `404 not_found`
-even when the transaction is already indexed; use
-`GET /v1/transactions/{hash}` for that case. A malformed hash returns
-`400 invalid_transaction_hash`.
-
-#### `DELETE /v1/mempool/{hash}`
-
-Marks an entry `cancelled` and returns it. A confirmed entry returns
-`409 already_confirmed`. `expired`, `failed`, and already `cancelled` entries
-can still be marked cancelled. An unknown hash returns `404 not_found`.
-
 ### Webhooks
 
-Webhooks push mempool status changes to an HTTP or HTTPS endpoint. They are
-optional; polling `/v1/mempool/{hash}` is enough for a single client.
+Webhooks push tracked transaction state changes to an HTTP or HTTPS endpoint.
+They are the supported notification path; polling the lifecycle route is enough
+for a single client.
 
 #### `POST /v1/webhooks`
 
@@ -1597,7 +1559,7 @@ Transaction-scoped registrations (`transaction_hashes` non-empty) close
 automatically after `transaction.confirmed`, `transaction.expired`,
 `transaction.failed`, or `transaction.cancelled` is queued. A registration
 watching several hashes stays active until every hash is terminal. A hash that
-has no mempool entry is reaped once the registration is an hour old, so a
+has no tracker entry is reaped once the registration is an hour old, so a
 restart cannot leave orphaned subscriptions.
 
 #### `GET /v1/webhooks/{id}/deliveries`
@@ -1644,7 +1606,7 @@ Delivery headers:
 | `X-Glyph-Signature` | `sha256=<hex HMAC-SHA256 of "{timestamp}.{body}">`. |
 
 The body is a JSON object with `event` and a `transaction` object carrying the
-mempool entry fields. It is stored on the delivery row and replayed
+tracked transaction fields. It is stored on the delivery row and replayed
 byte-for-byte on retries.
 
 Verify the signature over the exact bytes received, compare in constant time,
@@ -1772,8 +1734,7 @@ Errors are problem documents with exactly these fields:
 | `invalid_cursor` | 400 | Cursor is malformed or belongs to another route/filter set. |
 | `not_found` | 404 | The resource is valid but absent from the index. |
 | `conflict` | 409 | A generic state conflict. |
-| `already_confirmed` | 409 | A confirmed mempool entry cannot be cancelled. |
-| `mempool_full` | 429 | `MEMPOOL_MAX_ENTRIES` is reached. |
+| `tracking_full` | 429 | `MEMPOOL_MAX_ENTRIES` is reached. |
 | `rate_limited` | 429 | `RATE_LIMIT_PER_MINUTE` was exceeded. Includes `Retry-After`. |
 | `forbidden` | 403 | The operation is disabled, for example broadcast without `ALLOW_BROADCAST=true`. |
 | `unavailable` | 503 | A peer, the stream hub, or the raw archive is not available. |
@@ -1830,14 +1791,14 @@ current surface.
 | `RATE_LIMIT_PER_MINUTE` | unset (disabled) | Per-client-IP request budget. |
 | `QUBIC_PEERS` | unset | Comma-separated `host:port` peers for live routes and broadcast. |
 | `QUBIC_PEER` | unset | Single fallback peer when `QUBIC_PEERS` is unset. |
-| `ALLOW_BROADCAST` | `false` | Enable `POST /v1/transactions` and `POST /v1/mempool`. |
+| `ALLOW_BROADCAST` | `false` | Enable `POST /v1/transactions`. |
 | `BROADCAST_PEERS` | `8` | Default and maximum peer fan-out per broadcast attempt (maximum `8`). |
-| `MEMPOOL_ENABLED` | `true` | Enable mempool persistence and background tracking. |
-| `MEMPOOL_POLL_MS` | `500` | Mempool status reconciliation interval. |
+| `MEMPOOL_ENABLED` | `true` | Enable the internal transaction tracker and webhook events. |
+| `MEMPOOL_POLL_MS` | `500` | Tracker status reconciliation interval. |
 | `MEMPOOL_RETRY_MS` | `1000` | Minimum delay between rebroadcasts. |
 | `MEMPOOL_MAX_ATTEMPTS` | `10` | Maximum broadcast attempts per entry. |
 | `MEMPOOL_EXPIRY_TICKS` | `10` | Expiry window after the target tick. |
-| `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open mempool entries. |
+| `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open tracked transactions. |
 | `WEBHOOK_TIMEOUT_MS` | `5000` | Webhook delivery timeout. |
 | `WEBHOOK_MAX_ATTEMPTS` | `6` | Delivery attempts before dead-lettering. |
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private webhook targets. |
@@ -1894,10 +1855,7 @@ curl -sS -X POST localhost:8080/v1/transactions \
   -H 'content-type: application/json' -d '{"raw":"0x..."}' | jq .
 curl -sS -X POST localhost:8080/v1/transactions \
   -H 'content-type: application/json' -d '{"raw":"0x...","direct":true}' | jq .
-curl -sS -X POST localhost:8080/v1/mempool \
-  -H 'content-type: application/json' -d '{"raw":"0x..."}' | jq .
-curl -sS 'localhost:8080/v1/mempool?status=broadcast&limit=20' | jq .
-curl -sS localhost:8080/v1/mempool/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh | jq .
+curl -sS localhost:8080/v1/transactions/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh/lifecycle | jq .
 curl -sS -X POST localhost:8080/v1/webhooks \
   -H 'content-type: application/json' \
   -d '{"url":"https://example.com/glyph","secret":"at-least-16-characters","events":["transaction.confirmed"]}' | jq .

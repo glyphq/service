@@ -747,6 +747,17 @@ async fn tick_and_transaction_resources() {
 }
 
 #[tokio::test]
+async fn public_mempool_routes_are_retired() {
+    for uri in [
+        "/v1/mempool",
+        "/v1/mempool/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
+    ] {
+        let (status, body) = get(uri).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn collection_resources_are_typed_and_enveloped() {
     let (status, body) = get("/v1/epochs").await;
     assert_eq!(status, StatusCode::OK);

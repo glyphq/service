@@ -166,7 +166,6 @@ pub fn router(state: AppState) -> Router {
         .merge(status_page::router())
         .merge(transactions_ext::router())
         .merge(wallet::router())
-        .merge(mempool::router())
         .merge(webhook::router())
         .route(
             "/openapi.json",

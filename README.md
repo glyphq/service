@@ -32,8 +32,7 @@ protocol as the source of truth:
   retention via `PRUNE_KEEP_EPOCHS` or `glyph prune`.
 - Raw tick archive as zstd-compressed QBB1 bundles on local disk or any S3-compatible
   store. Vote headers are opt-in, and the computor set is stored once per epoch.
-- Best-effort transaction mempool with status polling, retries, expiry, and signed
-  webhook delivery.
+- Internal transaction tracking with retries, expiry, and signed webhook delivery.
 - REST resources for ticks, transactions, events, identities, wallets, assets, epochs,
   the on-chain QUBIC/USDT price, analytics, search, and network status.
 - Explorer-shaped reads that answer a whole page in one request: transaction effects,
@@ -168,8 +167,8 @@ The most common variables are below. The full list is in
 | `CLICKHOUSE_URL` | `http://127.0.0.1:8123` | API, CLI, store |
 | `CLICKHOUSE_DB` | `glyph` | API, CLI, store |
 | `QUBIC_PEERS` | unset | Indexer peers, live API routes, and broadcast |
-| `ALLOW_BROADCAST` | `false` | Enables `POST /v1/transactions` and `POST /v1/mempool` |
-| `BROADCAST_PEERS` | `3` | Peers per broadcast fan-out, capped at `8` |
+| `ALLOW_BROADCAST` | `false` | Enables `POST /v1/transactions` |
+| `BROADCAST_PEERS` | `8` | Peers per broadcast fan-out, capped at `8` |
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval |
 | `PRICE_POLL_MS` | `60000` | Live price feed refresh interval |
 | `MARKET_ENABLED` | `true` | Set `false` to disable the external market poller |
@@ -179,12 +178,12 @@ The most common variables are below. The full list is in
 | `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PREFIX` | unset | Raw archive to any S3-compatible store |
 | `ARCHIVE_FAIL_CLOSED` | `false` | Fail a tick instead of indexing when archiving fails |
 | `ARCHIVE_VOTES` | `false` | Store full vote headers in tick bundles |
-| `MEMPOOL_ENABLED` | `true` | Mempool persistence and background tracking |
-| `MEMPOOL_POLL_MS` | `1000` | Mempool status reconciliation interval |
-| `MEMPOOL_RETRY_MS` | `5000` | Minimum delay between rebroadcasts |
-| `MEMPOOL_MAX_ATTEMPTS` | `5` | Maximum broadcast attempts per entry |
+| `MEMPOOL_ENABLED` | `true` | Internal transaction tracker and webhook events |
+| `MEMPOOL_POLL_MS` | `500` | Tracker status reconciliation interval |
+| `MEMPOOL_RETRY_MS` | `1000` | Minimum delay between rebroadcasts |
+| `MEMPOOL_MAX_ATTEMPTS` | `10` | Maximum broadcast attempts per entry |
 | `MEMPOOL_EXPIRY_TICKS` | `10` | Expiry window after the target tick |
-| `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open mempool entries |
+| `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open tracked transactions |
 | `WEBHOOK_TIMEOUT_MS`, `WEBHOOK_MAX_ATTEMPTS` | `5000`, `6` | Webhook delivery timeout and attempt cap |
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private webhook targets |
 | `PRUNE_KEEP_EPOCHS` | unset | Drop partitions older than the newest N epochs |
@@ -241,12 +240,9 @@ curl -sS 'localhost:8080/v1/analytics/activity?interval=3600&limit=24'
 curl -sS -N 'localhost:8080/v1/stream?types=tick,event'
 curl -sS -N 'localhost:8080/v1/stream?identity=<identity>'
 
-# Validation, broadcast, mempool, webhooks, archive, docs
+# Validation, broadcast, webhooks, archive, docs
 curl -sS -X POST localhost:8080/v1/transactions/validate \
   -H 'content-type: application/json' -d '{"raw":"0x..."}'
-curl -sS -X POST localhost:8080/v1/mempool \
-  -H 'content-type: application/json' -d '{"raw":"0x...","peers":3}'
-curl -sS localhost:8080/v1/mempool/<hash>
 curl -sS -X POST localhost:8080/v1/webhooks \
   -H 'content-type: application/json' \
   -d '{"url":"https://example.com/glyph","secret":"at-least-16-chars","events":["transaction.confirmed"]}'

@@ -100,8 +100,8 @@ and the stack is reachable only from the same machine.
 | `API_HOST` | `127.0.0.1` | Host interface for the published API port. Set `0.0.0.0` to expose it. |
 | `API_PORT` | `8080` | Host port for the API. |
 | `QUBIC_PEERS` | `peer.example:21841` | Comma-separated peer addresses used by the indexer and by live API routes. |
-| `ALLOW_BROADCAST` | `false` | Set `true` to enable `POST /v1/transactions` and `POST /v1/mempool`. Keep disabled unless the API is trusted. |
-| `BROADCAST_PEERS` | `3` | Peers contacted concurrently per broadcast. Capped at `8`; each connection is a direct peer socket. |
+| `ALLOW_BROADCAST` | `false` | Set `true` to enable `POST /v1/transactions`. Keep disabled unless the API is trusted. |
+| `BROADCAST_PEERS` | `8` | Peers contacted concurrently per broadcast. Capped at `8`; each connection is a direct peer socket. |
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval. |
 | `PRICE_POLL_MS` | `60000` | Live QUBIC/USDT oracle price refresh interval in the API. |
 | `MARKET_ENABLED` | `true` | Enable the external exchange consensus poller. Set `false` to disable outbound HTTP market reads. |
@@ -126,15 +126,16 @@ and the stack is reachable only from the same machine.
 | `CLICKHOUSE_PASSWORD` | `glyph-dev-secret` | ClickHouse password. `CLICKHOUSE_URL` must embed the same credentials. |
 | `ARCHIVE_FAIL_CLOSED` | `false` | Set `true` to stop ingestion when a bundle cannot be archived. |
 | `ARCHIVE_VOTES` | `false` | Store full vote headers in every tick bundle. Off by default; the computor set is always written once per epoch at `raw/epoch=NNN/computors.bin`. |
-| `MEMPOOL_ENABLED` | `true` | Enable mempool persistence and background tracking in the API. Requires `ALLOW_BROADCAST=true` to reach peers. |
-| `MEMPOOL_POLL_MS` | `1000` | Mempool status poll interval. |
-| `MEMPOOL_RETRY_MS` | `5000` | Minimum delay between rebroadcasts of an unconfirmed transaction. |
-| `MEMPOOL_MAX_ATTEMPTS` | `5` | Maximum broadcast attempts before an entry is marked `failed`. |
+| `MEMPOOL_ENABLED` | `true` | Enable the internal transaction tracker and webhook events. Requires `ALLOW_BROADCAST=true` to reach peers. |
+| `MEMPOOL_POLL_MS` | `500` | Tracker status poll interval. |
+| `MEMPOOL_RETRY_MS` | `1000` | Minimum delay between rebroadcasts of an unconfirmed transaction. |
+| `MEMPOOL_MAX_ATTEMPTS` | `10` | Maximum broadcast attempts before an entry is marked `failed`. |
 | `MEMPOOL_EXPIRY_TICKS` | `10` | Ticks after the target tick before an unindexed transaction expires. |
-| `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open mempool entries. New submissions are rejected when full. |
+| `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open tracked transactions. New submissions are rejected when full. |
 | `WEBHOOK_TIMEOUT_MS` | `5000` | Webhook delivery timeout. |
 | `WEBHOOK_MAX_ATTEMPTS` | `6` | Delivery attempts before an attempt is dead-lettered. |
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private-range webhook targets. Keep `false` unless the receiver is internal and trusted. |
+| `WEBHOOK_ENCRYPTION_KEY` | unset | 32-byte hex or base64 key for webhook URL encryption at rest. `deploy/docker/run-stack.sh` generates and persists one automatically. |
 | `PRUNE_KEEP_EPOCHS` | unset | Optional retention after an epoch rollover. Drops ClickHouse partitions older than the newest N epochs. |
 | `GLYPH_IMAGE` | `glyph:local` | Image tag built and used by all glyph services. |
 | `GLYPH_API_LOG` | `info,tower_http=info` | `RUST_LOG` for the API. |

@@ -13,22 +13,18 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, Query, State};
+use axum::Json;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use chrono::Utc;
 use node::NodePool;
-use serde::Deserialize;
 use serde_json::json;
 use store::gateway::{GatewayStore, MempoolEntry, MempoolStatus};
 use tokio_util::sync::CancellationToken;
 
-use crate::advanced::{decode_transaction, json_body};
+use crate::ApiError;
+use crate::advanced::decode_transaction;
 use crate::webhook::Webhooks;
-use crate::{ApiError, AppState};
 
 /// Runtime limits for the mempool. All values are configurable by environment.
 #[derive(Debug, Clone)]
@@ -135,8 +131,11 @@ impl Mempool {
         {
             return Err(ApiError {
                 status: StatusCode::TOO_MANY_REQUESTS,
-                code: "mempool_full",
-                detail: format!("mempool is full ({} open entries)", self.config.max_entries),
+                code: "tracking_full",
+                detail: format!(
+                    "transaction tracking is full ({} open entries)",
+                    self.config.max_entries
+                ),
             });
         }
 
@@ -219,43 +218,6 @@ impl Mempool {
             }
         }
         Ok(Some(entry))
-    }
-
-    pub async fn list(
-        &self,
-        status: Option<MempoolStatus>,
-        limit: u32,
-    ) -> Result<Vec<MempoolEntry>, ApiError> {
-        Ok(self.gateway.mempool_entries(status, limit).await?)
-    }
-
-    /// Cancels an entry that has not confirmed. A confirmed transaction is
-    /// immutable chain history, so cancelling it is rejected.
-    pub async fn cancel(&self, hash: &str) -> Result<MempoolEntry, ApiError> {
-        let hash = hash.trim().to_ascii_lowercase();
-        let Some(mut entry) = self.gateway.mempool_entry(&hash).await? else {
-            return Err(ApiError::not_found(format!(
-                "mempool entry {hash} does not exist"
-            )));
-        };
-        match entry.status {
-            MempoolStatus::Confirmed => {
-                return Err(ApiError {
-                    status: StatusCode::CONFLICT,
-                    code: "already_confirmed",
-                    detail: format!("transaction {hash} is already confirmed"),
-                });
-            }
-            MempoolStatus::Cancelled => return Ok(entry),
-            _ => {}
-        }
-        entry.status = MempoolStatus::Cancelled;
-        entry.updated_at = Utc::now();
-        self.gateway.update_mempool(&entry).await?;
-        self.webhooks
-            .dispatch_event("transaction.cancelled", &entry)
-            .await?;
-        Ok(entry)
     }
 
     /// Background tracker. Polls until the cancellation token fires.
@@ -401,7 +363,7 @@ fn broadcast_error(attempts: &[node::BroadcastAttempt]) -> String {
     }
 }
 
-/// `202 Accepted` body shared by `/v1/mempool` and `/v1/transactions`.
+/// `202 Accepted` body for `/v1/transactions`.
 pub fn accepted(entry: MempoolEntry) -> Response {
     let hash = entry.hash.clone();
     let broadcast = entry.broadcast_peers > 0;
@@ -413,16 +375,16 @@ pub fn accepted(entry: MempoolEntry) -> Response {
         Json(json!({
             "data": entry_json(&entry),
             "meta": {
-                "source": "mempool",
+                "source": "tracking",
                 "status": status,
                 "broadcast": broadcast,
                 "broadcast_peers": broadcast_peers,
                 "confirmed": false,
                 "links": {
-                    "status": format!("/v1/mempool/{hash}"),
+                    "status": format!("/v1/transactions/{hash}/lifecycle"),
                     "transaction": format!("/v1/transactions/{hash}"),
                 },
-                "hint": "A broadcast status means at least one peer accepted the packet at the socket. Qubic does not acknowledge broadcasts; poll the status link or the indexed transaction."
+                "hint": "A broadcast status means at least one peer accepted the packet at the socket. Qubic does not acknowledge broadcasts; register a webhook or poll the lifecycle link."
             }
         })),
     )
@@ -436,128 +398,6 @@ pub fn entry_json(entry: &MempoolEntry) -> serde_json::Value {
         object.insert("target_tick".into(), json!(entry.tick));
     }
     value
-}
-
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/v1/mempool", post(submit).get(list))
-        .route("/v1/mempool/{hash}", get(status).delete(cancel))
-}
-
-fn service(state: &AppState) -> Result<Arc<Mempool>, ApiError> {
-    state.mempool.clone().ok_or_else(|| {
-        ApiError::unavailable("mempool is disabled; set MEMPOOL_ENABLED=true to enable it")
-    })
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct SubmitBody {
-    #[serde(alias = "transaction", alias = "raw_transaction")]
-    raw: String,
-    #[serde(default)]
-    peers: Option<usize>,
-    #[serde(default)]
-    webhook_url: Option<String>,
-    #[serde(default)]
-    webhook_secret: Option<String>,
-}
-
-async fn submit(
-    State(state): State<AppState>,
-    payload: Result<Json<SubmitBody>, JsonRejection>,
-) -> Result<Response, ApiError> {
-    if !state.allow_broadcast {
-        return Err(ApiError::forbidden(
-            "transaction broadcast is disabled; set ALLOW_BROADCAST=true",
-        ));
-    }
-    let body = json_body(payload)?;
-    let inline = match (body.webhook_url, body.webhook_secret) {
-        (None, None) => None,
-        (Some(url), Some(secret)) => Some(InlineWebhook { url, secret }),
-        _ => {
-            return Err(ApiError::bad_request(
-                "webhook_url and webhook_secret must be provided together",
-            ));
-        }
-    };
-    let peers = body
-        .peers
-        .unwrap_or(state.broadcast_peers)
-        .clamp(1, state.broadcast_peers.min(8));
-    let entry = service(&state)?.submit(&body.raw, peers, inline).await?;
-    Ok(accepted(entry))
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct ListQuery {
-    #[serde(default)]
-    status: Option<String>,
-    #[serde(default)]
-    limit: Option<u32>,
-}
-
-async fn list(
-    State(state): State<AppState>,
-    Query(params): Query<ListQuery>,
-) -> Result<impl IntoResponse, ApiError> {
-    let status = match params.status.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(value) => Some(MempoolStatus::parse(value).ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "unknown mempool status {value:?}; expected queued, broadcast, confirmed, expired, failed, or cancelled"
-            ))
-        })?),
-    };
-    let limit = params.limit.unwrap_or(100).clamp(1, 500);
-    let entries = service(&state)?.list(status, limit).await?;
-    let entries: Vec<serde_json::Value> = entries.iter().map(entry_json).collect();
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({
-            "data": entries,
-            "meta": {
-                "limit": limit,
-                "status": status.map(MempoolStatus::as_str),
-            }
-        })),
-    ))
-}
-
-async fn status(
-    State(state): State<AppState>,
-    Path(hash): Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
-    let hash = hash.trim().to_ascii_lowercase();
-    qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
-    let entry = service(&state)?
-        .status(&hash)
-        .await?
-        .ok_or_else(|| ApiError::not_found(format!("mempool entry {hash} does not exist")))?;
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({
-            "data": entry,
-            "meta": {
-                "links": {
-                    "transaction": format!("/v1/transactions/{hash}"),
-                }
-            }
-        })),
-    ))
-}
-
-async fn cancel(
-    State(state): State<AppState>,
-    Path(hash): Path<String>,
-) -> Result<impl IntoResponse, ApiError> {
-    let hash = hash.trim().to_ascii_lowercase();
-    qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
-    let entry = service(&state)?.cancel(&hash).await?;
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({ "data": entry_json(&entry) })),
-    ))
 }
 
 /// Expiry predicate shared with tests: a target tick is expired once the head

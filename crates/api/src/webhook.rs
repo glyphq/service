@@ -45,7 +45,6 @@ pub const EVENTS: &[&str] = &[
     "transaction.confirmed",
     "transaction.expired",
     "transaction.failed",
-    "transaction.cancelled",
 ];
 
 /// Shortest accepted signing secret.
@@ -620,10 +619,7 @@ pub fn webhook_matches(webhook: &Webhook, event: &str, hash: &str, identity: &st
 pub fn is_terminal_event(event: &str) -> bool {
     matches!(
         event,
-        "transaction.confirmed"
-            | "transaction.expired"
-            | "transaction.failed"
-            | "transaction.cancelled"
+        "transaction.confirmed" | "transaction.expired" | "transaction.failed"
     )
 }
 
@@ -1030,7 +1026,6 @@ mod tests {
             "transaction.confirmed",
             "transaction.expired",
             "transaction.failed",
-            "transaction.cancelled",
         ] {
             assert!(is_terminal_event(event), "{event}");
         }
