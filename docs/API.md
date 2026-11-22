@@ -1362,6 +1362,8 @@ API decodes it and returns a report:
     "destination": "AAAA...AAA",
     "amount": 1000000,
     "tick": 91916480,
+    "target_tick": 91916480,
+    "head_tick": 91916478,
     "input_type": 0,
     "input_data": "",
     "input_bytes": 0,
@@ -1370,7 +1372,11 @@ API decodes it and returns a report:
       { "name": "amount", "passed": true },
       { "name": "input_size", "passed": true },
       { "name": "encoding", "passed": true },
-      { "name": "signature", "passed": false, "detail": "signature does not verify against the source public key" }
+      { "name": "signature", "passed": false, "detail": "signature does not verify against the source public key" },
+      { "name": "target_tick", "passed": true }
+    ],
+    "warnings": [
+      "target tick 91916480 leaves little propagation time; prefer at least 91916482 or the common +20 lead."
     ]
   },
   "meta": { "source": "local", "broadcast": false }
@@ -1378,9 +1384,13 @@ API decodes it and returns a report:
 ```
 
 `valid` is `true` only when every check passes. Failed checks carry a `detail`
-string; passing checks omit it. Malformed hex or bytes that do not decode as a
-transaction return `400 bad_request`, because no report can be produced.
-Responses are `Cache-Control: no-store`.
+string; passing checks omit it. The `target_tick` check compares the signed tick
+with the indexed head. Qubic needs at least two ticks of lead, and the node
+pending pool only accepts a limited window of future ticks. A tick at or before
+`head + 1` fails; a tick at `head + 2` or `head + 3` passes with a warning.
+Malformed hex or bytes that do not decode as a transaction return
+`400 bad_request`, because no report can be produced. Responses are
+`Cache-Control: no-store`.
 
 ### `POST /v1/transactions`
 
@@ -1443,6 +1453,8 @@ before returning, so the response usually reports `broadcast` or `failed`, not
     "broadcast": true,
     "broadcast_peers": 2,
     "confirmed": false,
+    "head_tick": 91916476,
+    "warnings": [],
     "links": {
       "status": "/v1/transactions/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh/lifecycle",
       "transaction": "/v1/transactions/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh"
@@ -1468,6 +1480,13 @@ that field as the client-side timeout: the target tick is the chain deadline,
 and `expiry_tick` adds the API's index grace. A tracked transaction cannot
 execute in a later tick after its target tick passes.
 
+The target tick must be in the future. Qubic builds tick data two ticks ahead,
+so a target at or before `head + 1` is rejected with
+`400 invalid_target_tick`. Targets at `head + 2` or `head + 3` are accepted with
+a warning. Targets beyond the node pending pool window are also rejected. The
+accepted response includes `meta.head_tick` and `meta.warnings` so the caller
+can see the basis for the decision.
+
 ```json
 {
   "data": {
@@ -1479,6 +1498,7 @@ execute in a later tick after its target tick passes.
       "destination": "AAAA...AAA",
       "amount": 1000000,
       "tick": 91916480,
+      "target_tick": 91916480,
       "input_type": 0,
       "input_data": "",
       "input_bytes": 0,
@@ -1497,6 +1517,7 @@ execute in a later tick after its target tick passes.
     "source": "direct-qubic-peers",
     "broadcast": true,
     "confirmed": false,
+    "head_tick": 91916476,
     "links": {
       "transaction": "/v1/transactions/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
       "tick": "/v1/ticks/91916480"
@@ -1514,6 +1535,8 @@ be included. Use `meta.links.transaction`,
 - `403 forbidden` when `ALLOW_BROADCAST` is not `true`.
 - `400 bad_request` for malformed hex, a transaction that fails local checks,
   or a `webhook_url` without a matching `webhook_secret`.
+- `400 invalid_target_tick` when the signed target tick is at or before
+  `head + 1`, or beyond the node pending pool window.
 - `429 tracking_full` when `MEMPOOL_MAX_ENTRIES` is reached and the tracked path
   is used. `429 source_tracking_full` when that source reaches
   `MEMPOOL_MAX_PER_SOURCE`. A duplicate hash returns the existing entry with
@@ -1547,6 +1570,12 @@ acknowledgement, so the tracker polls the index. Expiry uses the indexed head,
 not wall time. Rebroadcasts are at least `MEMPOOL_RETRY_MS` apart and stop after
 `MEMPOOL_MAX_ATTEMPTS`. `MEMPOOL_POLL_MS` controls how often statuses are
 reconciled.
+
+Qubic schedules a transaction for one exact tick. The node pending pool only
+accepts targets inside a rolling window of about 2,666 ticks, and tick data for
+`T + 2` is built during `T`. The API therefore rejects a target at or before
+`head + 1`, warns for `head + 2` and `head + 3`, and rejects targets beyond the
+pending window. A common wallet lead is 20 ticks.
 
 Every entry retains `raw`, the signed transaction hex, so a retry does not need
 the client to resubmit. `error` carries the last broadcast error when set.
@@ -1792,6 +1821,7 @@ Errors are problem documents with exactly these fields:
 | `bad_request` | 400 | Missing or invalid request input, including `q` on search. |
 | `invalid_identity` | 400 | Identity is not a valid base-26 identity. |
 | `invalid_transaction_hash` | 400 | Hash is not a valid base-26 transaction hash. |
+| `invalid_target_tick` | 400 | Target tick is too close to the indexed head or outside the node pending window. |
 | `invalid_cursor` | 400 | Cursor is malformed or belongs to another route/filter set. |
 | `not_found` | 404 | The resource is valid but absent from the index. |
 | `conflict` | 409 | A generic state conflict. |

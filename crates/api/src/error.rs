@@ -51,6 +51,14 @@ impl ApiError {
         }
     }
 
+    pub fn invalid_target_tick(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_target_tick",
+            detail: detail.into(),
+        }
+    }
+
     pub fn invalid_cursor(detail: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

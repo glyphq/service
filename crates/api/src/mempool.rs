@@ -23,7 +23,7 @@ use store::gateway::{GatewayStore, MempoolEntry, MempoolStatus};
 use tokio_util::sync::CancellationToken;
 
 use crate::ApiError;
-use crate::advanced::decode_transaction;
+use crate::advanced::DecodedTransaction;
 use crate::webhook::Webhooks;
 
 /// The request path performs the first broadcast after inserting the entry.
@@ -111,21 +111,25 @@ impl Mempool {
     /// A duplicate hash returns the existing entry unchanged, which makes the
     /// endpoint idempotent. Invalid transactions are rejected before any peer
     /// socket is opened.
-    pub async fn submit(
+    pub(crate) async fn submit(
         &self,
-        raw: &str,
+        decoded: DecodedTransaction,
         peers: usize,
         webhook: Option<InlineWebhook>,
     ) -> Result<MempoolEntry, ApiError> {
-        let decoded = decode_transaction(raw)?;
         if !decoded.valid {
             return Err(ApiError::bad_request(format!(
                 "transaction failed local validation: {}",
                 decoded.failure_detail()
             )));
         }
-        let hash = decoded.hash.clone();
-        let source = qubic::PublicKey(decoded.transaction.source).to_identity();
+        let DecodedTransaction {
+            transaction,
+            bytes,
+            hash,
+            ..
+        } = decoded;
+        let source = qubic::PublicKey(transaction.source).to_identity();
 
         if let Some(existing) = self.gateway.mempool_entry(&hash).await? {
             return Ok(existing);
@@ -164,11 +168,11 @@ impl Mempool {
         let now = Utc::now();
         let mut entry = MempoolEntry {
             hash,
-            raw: hex::encode(&decoded.bytes),
+            raw: hex::encode(&bytes),
             source,
-            destination: qubic::PublicKey(decoded.transaction.destination).to_identity(),
-            amount: decoded.transaction.amount,
-            tick: decoded.transaction.tick,
+            destination: qubic::PublicKey(transaction.destination).to_identity(),
+            amount: transaction.amount,
+            tick: transaction.tick,
             peers: u8::try_from(peers.clamp(1, 8)).unwrap_or(3),
             status: MempoolStatus::Queued,
             attempts: 0,
@@ -187,7 +191,7 @@ impl Mempool {
 
         let attempts = self
             .pool
-            .broadcast_transaction_fanout(&decoded.transaction, peers.max(1))
+            .broadcast_transaction_fanout(&transaction, peers.max(1))
             .await;
         let sent = attempts.iter().filter(|attempt| attempt.sent).count();
         entry.attempts = 1;
@@ -415,7 +419,12 @@ fn submission_in_progress(
 }
 
 /// `202 Accepted` body for `/v1/transactions`.
-pub fn accepted(entry: MempoolEntry, expiry_ticks: u32) -> Response {
+pub fn accepted(
+    entry: MempoolEntry,
+    expiry_ticks: u32,
+    head_tick: Option<u32>,
+    warnings: Vec<String>,
+) -> Response {
     let hash = entry.hash.clone();
     let broadcast = entry.broadcast_peers > 0;
     let broadcast_peers = entry.broadcast_peers;
@@ -431,6 +440,8 @@ pub fn accepted(entry: MempoolEntry, expiry_ticks: u32) -> Response {
                 "broadcast": broadcast,
                 "broadcast_peers": broadcast_peers,
                 "confirmed": false,
+                "head_tick": head_tick,
+                "warnings": warnings,
                 "links": {
                     "status": format!("/v1/transactions/{hash}/lifecycle"),
                     "transaction": format!("/v1/transactions/{hash}"),
@@ -551,7 +562,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let response = accepted(entry, 10);
+        let response = accepted(entry, 10, Some(100), Vec::new());
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 

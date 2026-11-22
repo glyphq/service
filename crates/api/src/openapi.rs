@@ -115,7 +115,7 @@ fn data_envelope(schema: &str) -> Value {
 fn info() -> Value {
     json!({
         "title": "Glyph API",
-        "version": "0.4.1",
+        "version": "0.5.0",
         "summary": "Verified Qubic chain data.",
         "x-logo": { "url": "/logo.png", "altText": "Glyph" },
         "description": "Glyph indexes Qubic directly from peers and verifies quorum evidence.\n\n- `/v1` reads persisted, verified history.\n- `POST /v1/transactions` submits signed bytes and tracks them internally.\n- Signed webhooks report terminal transaction state; a broadcast is not confirmation.\n- `/v1/network` reads live peer state such as system info, revenue, and oracles.\n- `/v1/live` exposes raw peer operations.\n- JSON responses use `data` and `meta`; errors use RFC 9457 problem documents.\n\nAmounts are integer QU. Identities are uppercase base-26; hashes are lowercase base-26."
@@ -1221,7 +1221,7 @@ fn schemas() -> Value {
                         "type": { "type": "string", "default": "about:blank" },
                         "title": { "type": "string" },
                         "status": { "type": "integer" },
-                        "code": { "type": "string", "enum": ["bad_request", "invalid_identity", "invalid_transaction_hash", "invalid_cursor", "not_found", "conflict", "tracking_full", "source_tracking_full", "forbidden", "unavailable", "internal_error", "rate_limited"] },
+                        "code": { "type": "string", "enum": ["bad_request", "invalid_identity", "invalid_transaction_hash", "invalid_target_tick", "invalid_cursor", "not_found", "conflict", "tracking_full", "source_tracking_full", "forbidden", "unavailable", "internal_error", "rate_limited"] },
                         "detail": { "type": "string" }
                     }
                 },
@@ -1326,6 +1326,7 @@ fn schemas() -> Value {
                                 "target_peers": { "type": "integer", "description": "Dry run only." },
                                 "sent": { "type": "integer", "description": "Peers that accepted the packet." },
                                 "targeted": { "type": "integer", "description": "Peers attempted." },
+                                "head_tick": { "type": ["integer", "null"], "description": "Indexed head used for target tick validation." },
                                 "transaction": {
                                     "type": "object",
                                     "properties": {
@@ -1334,6 +1335,7 @@ fn schemas() -> Value {
                                         "destination": { "type": "string" },
                                         "amount": { "type": "integer", "format": "int64" },
                                         "tick": { "type": "integer" },
+                                        "target_tick": { "type": "integer" },
                                         "input_type": { "type": "integer" },
                                         "input_data": { "type": "string" },
                                         "input_bytes": { "type": "integer" },
@@ -1371,7 +1373,7 @@ fn schemas() -> Value {
                     "type": "object",
                     "required": ["name", "passed"],
                     "properties": {
-                        "name": { "type": "string", "enum": ["amount", "input_size", "encoding", "signature"] },
+                        "name": { "type": "string", "enum": ["amount", "input_size", "encoding", "signature", "target_tick"] },
                         "passed": { "type": "boolean" },
                         "detail": { "type": "string" }
                     }
@@ -1390,11 +1392,14 @@ fn schemas() -> Value {
                                 "destination": { "type": "string" },
                                 "amount": { "type": "integer", "format": "int64" },
                                 "tick": { "type": "integer" },
+                                "target_tick": { "type": "integer" },
+                                "head_tick": { "type": ["integer", "null"] },
                                 "input_type": { "type": "integer" },
                                 "input_data": { "type": "string" },
                                 "input_bytes": { "type": "integer" },
                                 "total_bytes": { "type": "integer" },
-                                "checks": { "type": "array", "items": { "$ref": "#/components/schemas/TransactionValidationCheck" } }
+                                "checks": { "type": "array", "items": { "$ref": "#/components/schemas/TransactionValidationCheck" } },
+                                "warnings": { "type": "array", "items": { "type": "string" } }
                             }
                         },
                         "meta": { "type": "object" }
@@ -2086,7 +2091,7 @@ mod tests {
     fn spec_is_openapi_31_and_covers_routes() {
         let spec = spec();
         assert_eq!(spec["openapi"], "3.1.0");
-        assert_eq!(spec["info"]["version"], "0.4.1");
+        assert_eq!(spec["info"]["version"], "0.5.0");
         let paths = spec["paths"].as_object().expect("paths object");
         for path in [
             "/healthz",

@@ -14,7 +14,10 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use node::Peer;
-use qubic::messages::Transaction;
+use qubic::messages::{
+    PENDING_TXS_POOL_TICKS, RECOMMENDED_TARGET_TICK_LEAD, TICK_TRANSACTIONS_PUBLICATION_OFFSET,
+    Transaction,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -395,6 +398,7 @@ pub(crate) fn decode_transaction(raw: &str) -> Result<DecodedTransaction, ApiErr
 /// Local preflight checks for a signed transaction. This never opens a peer
 /// connection and never broadcasts, so it is safe to enable unconditionally.
 async fn validate(
+    State(state): State<AppState>,
     payload: Result<Json<ValidateBody>, JsonRejection>,
 ) -> Result<impl IntoResponse, ApiError> {
     let body = json_body(payload)?;
@@ -408,7 +412,13 @@ async fn validate(
     let transaction = Transaction::decode(&bytes)
         .map_err(|error| ApiError::bad_request(format!("invalid transaction: {error}")))?;
 
-    let checks = transaction_checks(&transaction, &bytes);
+    let mut checks = transaction_checks(&transaction, &bytes);
+    let TickAssessment {
+        head_tick,
+        checks: tick_checks,
+        warnings,
+    } = target_tick_assessment(&state, transaction.tick).await;
+    checks.extend(tick_checks);
     let valid = checks.iter().all(|check| check.passed);
 
     Ok((
@@ -426,10 +436,76 @@ async fn validate(
                 "input_bytes": transaction.input.len(),
                 "total_bytes": transaction.total_size(),
                 "checks": checks,
+                "warnings": warnings,
+                "head_tick": head_tick,
             },
             "meta": { "source": "local", "broadcast": false }
         })),
     ))
+}
+
+struct TickAssessment {
+    head_tick: Option<u32>,
+    checks: Vec<ValidationCheck>,
+    warnings: Vec<String>,
+}
+
+/// Checks the target tick against the indexed head. Qubic only accepts target
+/// ticks inside the node pending window, and tick data for `T + 2` is built
+/// during tick `T`, so a target at or before `head + 1` cannot make it.
+async fn target_tick_assessment(state: &AppState, target_tick: u32) -> TickAssessment {
+    let head_tick = match state.store.head().await {
+        Ok(Some(row)) => Some(row.tick),
+        _ => None,
+    };
+    let Some(head) = head_tick else {
+        return TickAssessment {
+            head_tick: None,
+            checks: Vec::new(),
+            warnings: Vec::new(),
+        };
+    };
+    let (check, warnings) = target_tick_check(head, target_tick);
+    TickAssessment {
+        head_tick: Some(head),
+        checks: vec![check],
+        warnings,
+    }
+}
+
+fn target_tick_check(head: u32, target_tick: u32) -> (ValidationCheck, Vec<String>) {
+    let minimum = head.saturating_add(TICK_TRANSACTIONS_PUBLICATION_OFFSET);
+    let maximum = head.saturating_add(PENDING_TXS_POOL_TICKS);
+    let too_close = target_tick < minimum;
+    let too_far = target_tick > maximum;
+    let passed = !too_close && !too_far;
+    let detail = if too_close {
+        Some(format!(
+            "target tick {target_tick} is too close to indexed head {head}; Qubic publishes tick data {} ticks ahead. Use at least {minimum}, preferably {}.",
+            TICK_TRANSACTIONS_PUBLICATION_OFFSET,
+            head.saturating_add(RECOMMENDED_TARGET_TICK_LEAD)
+        ))
+    } else if too_far {
+        Some(format!(
+            "target tick {target_tick} is more than {PENDING_TXS_POOL_TICKS} ticks beyond indexed head {head}; the node pending pool will not accept it."
+        ))
+    } else {
+        None
+    };
+    let mut warnings = Vec::new();
+    if passed
+        && target_tick < head.saturating_add(TICK_TRANSACTIONS_PUBLICATION_OFFSET.saturating_add(2))
+    {
+        warnings.push(format!(
+            "target tick {target_tick} leaves little propagation time; prefer at least {} or the common +{} lead.",
+            head.saturating_add(TICK_TRANSACTIONS_PUBLICATION_OFFSET.saturating_add(2)),
+            RECOMMENDED_TARGET_TICK_LEAD
+        ));
+    }
+    (
+        ValidationCheck::new("target_tick", passed, detail),
+        warnings,
+    )
 }
 
 async fn tx_status(
@@ -565,14 +641,27 @@ pub async fn broadcast_transaction(
             "transaction broadcast is disabled; set ALLOW_BROADCAST=true",
         ));
     }
-    let decoded = decode_transaction(&body.raw)?;
-    let DecodedTransaction {
-        transaction,
-        bytes: _,
-        checks,
-        hash,
-        valid,
-    } = decoded;
+    let mut decoded = decode_transaction(&body.raw)?;
+    if !body.direct && !body.dry_run {
+        if let Some(mempool) = state.mempool.clone() {
+            if let Some(entry) = mempool.status(&decoded.hash).await? {
+                return Ok(crate::mempool::accepted(
+                    entry,
+                    mempool.config().expiry_ticks,
+                    None,
+                    Vec::new(),
+                ));
+            }
+        }
+    }
+    let TickAssessment {
+        head_tick,
+        checks: tick_checks,
+        mut warnings,
+    } = target_tick_assessment(&state, decoded.transaction.tick).await;
+    decoded.checks.extend(tick_checks);
+    decoded.valid = decoded.checks.iter().all(|check| check.passed);
+    let hash = decoded.hash.clone();
     let peers_requested = body
         .peers
         .unwrap_or(state.broadcast_peers)
@@ -580,14 +669,15 @@ pub async fn broadcast_transaction(
     let target = state.peers.len().min(peers_requested);
     let transaction_json = json!({
         "hash": hash,
-        "source": qubic::PublicKey(transaction.source).to_identity(),
-        "destination": qubic::PublicKey(transaction.destination).to_identity(),
-        "amount": transaction.amount,
-        "tick": transaction.tick,
-        "input_type": transaction.input_type,
-        "input_data": hex::encode(&transaction.input),
-        "input_bytes": transaction.input.len(),
-        "total_bytes": transaction.total_size(),
+        "source": qubic::PublicKey(decoded.transaction.source).to_identity(),
+        "destination": qubic::PublicKey(decoded.transaction.destination).to_identity(),
+        "amount": decoded.transaction.amount,
+        "tick": decoded.transaction.tick,
+        "target_tick": decoded.transaction.tick,
+        "input_type": decoded.transaction.input_type,
+        "input_data": hex::encode(&decoded.transaction.input),
+        "input_bytes": decoded.transaction.input.len(),
+        "total_bytes": decoded.transaction.total_size(),
     });
 
     if body.dry_run {
@@ -595,11 +685,13 @@ pub async fn broadcast_transaction(
             [(axum::http::header::CACHE_CONTROL, "no-store")],
             Json(json!({
                 "data": {
-                    "valid": valid,
+                    "valid": decoded.valid,
                     "dry_run": true,
                     "target_peers": target,
                     "transaction": transaction_json,
-                    "checks": checks,
+                    "checks": decoded.checks,
+                    "warnings": warnings,
+                    "head_tick": head_tick,
                 },
                 "meta": {
                     "source": "local",
@@ -624,21 +716,27 @@ pub async fn broadcast_transaction(
                     ));
                 }
             };
-            let entry = mempool.submit(&body.raw, peers_requested, inline).await?;
+            let entry = mempool.submit(decoded, peers_requested, inline).await?;
             return Ok(crate::mempool::accepted(
                 entry,
                 mempool.config().expiry_ticks,
+                head_tick,
+                warnings,
             ));
         }
     }
 
-    if !valid {
-        let failed = checks
+    if !decoded.valid {
+        let failed = decoded.failure_detail();
+        let target_tick_failed = decoded
+            .checks
             .iter()
-            .filter(|check| !check.passed)
-            .filter_map(|check| check.detail.as_deref())
-            .collect::<Vec<_>>()
-            .join("; ");
+            .any(|check| check.name == "target_tick" && !check.passed);
+        if target_tick_failed {
+            return Err(ApiError::invalid_target_tick(format!(
+                "transaction has an invalid target tick: {failed}"
+            )));
+        }
         return Err(ApiError::bad_request(format!(
             "transaction failed local validation: {failed}"
         )));
@@ -651,7 +749,7 @@ pub async fn broadcast_transaction(
 
     let attempts = state
         .pool
-        .broadcast_transaction_fanout(&transaction, peers_requested)
+        .broadcast_transaction_fanout(&decoded.transaction, peers_requested)
         .await;
     let sent = attempts.iter().filter(|attempt| attempt.sent).count();
     let peers: Vec<Value> = attempts
@@ -675,13 +773,11 @@ pub async fn broadcast_transaction(
             "broadcast reached no peers: {errors}"
         )));
     }
-    let warnings = if sent < target {
-        vec![format!(
+    if sent < target {
+        warnings.push(format!(
             "transaction reached {sent} of {target} peers; propagation may be slower"
-        )]
-    } else {
-        Vec::new()
-    };
+        ));
+    }
     Ok((
         StatusCode::ACCEPTED,
         [(axum::http::header::CACHE_CONTROL, "no-store")],
@@ -697,9 +793,10 @@ pub async fn broadcast_transaction(
                 "source": "direct-qubic-peers",
                 "broadcast": true,
                 "confirmed": false,
+                "head_tick": head_tick,
                 "links": {
                     "transaction": format!("/v1/transactions/{hash}"),
-                    "tick": format!("/v1/ticks/{}", transaction.tick),
+                    "tick": format!("/v1/ticks/{}", decoded.transaction.tick),
                 },
                 "hint": "A sent peer accepted the packet at the socket. Qubic does not acknowledge broadcasts; poll the transaction link or stream new ticks to observe inclusion."
             }
@@ -760,4 +857,43 @@ fn transaction_checks(transaction: &Transaction, bytes: &[u8]) -> Vec<Validation
                 .then(|| "signature does not verify against the source public key".to_owned()),
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_tick_rejects_too_close_and_too_far() {
+        let head = 1000;
+        assert!(!target_tick_check(head, head).0.passed);
+        assert!(!target_tick_check(head, head + 1).0.passed);
+        assert!(target_tick_check(head, head + 2).0.passed);
+        assert!(target_tick_check(head, head + 3).0.passed);
+        assert!(target_tick_check(head, head + 4).0.passed);
+        assert!(
+            target_tick_check(head, head + PENDING_TXS_POOL_TICKS)
+                .0
+                .passed
+        );
+        assert!(
+            !target_tick_check(head, head + PENDING_TXS_POOL_TICKS + 1)
+                .0
+                .passed
+        );
+    }
+
+    #[test]
+    fn target_tick_warns_when_propagation_time_is_short() {
+        let head = 1000;
+        assert!(!target_tick_check(head, head + 2).1.is_empty());
+        assert!(!target_tick_check(head, head + 3).1.is_empty());
+        assert!(target_tick_check(head, head + 4).1.is_empty());
+    }
+
+    #[test]
+    fn protocol_scheduling_constants_match_qubic_core() {
+        assert_eq!(PENDING_TXS_POOL_TICKS, 2_666);
+        assert_eq!(TICK_TRANSACTIONS_PUBLICATION_OFFSET, 2);
+    }
 }

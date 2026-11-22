@@ -7,6 +7,17 @@ pub const COMPUTOR_COUNT: usize = 676;
 pub const QUORUM: usize = 451;
 pub const EMPTY_TICK_QUORUM: usize = 226;
 pub const TX_PER_TICK: usize = 4096;
+/// Slots available to user transactions. Four of the 4,096 tick slots are
+/// reserved for protocol transactions.
+pub const USER_TX_PER_TICK: usize = TX_PER_TICK - 4;
+/// Target ticks accepted by the node pending pool. qubic-core sizes this as
+/// ten minutes at the 225 ms allocation tick duration.
+pub const PENDING_TXS_POOL_TICKS: u32 = (10 * 60 * 1000) / 225;
+/// Tick data for `T + 2` is built during tick `T`.
+pub const TICK_TRANSACTIONS_PUBLICATION_OFFSET: u32 = 2;
+/// Common wallet scheduling lead. Near-term ticks are valid but leave little
+/// time for propagation before the tick leader builds the tick data.
+pub const RECOMMENDED_TARGET_TICK_LEAD: u32 = 20;
 pub const SPECIAL_EVENT_COUNT: usize = 6;
 pub const LOG_TX_PER_TICK: usize = TX_PER_TICK + SPECIAL_EVENT_COUNT;
 pub const MAX_CONTRACTS: usize = 1024;

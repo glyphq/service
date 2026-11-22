@@ -1142,7 +1142,9 @@ async fn transaction_validation_reports_local_checks() {
     let transaction = qubic::Transaction::decode(raw).expect("fixture transaction decodes");
 
     let (status, body, headers) = {
-        let app = router(AppState::new(Arc::new(MockStore::new())));
+        let mut store = MockStore::new();
+        store.ticks[0].tick = transaction.tick - 4;
+        let app = router(AppState::new(Arc::new(store)));
         let response = app
             .oneshot(
                 Request::builder()
@@ -1187,8 +1189,10 @@ async fn transaction_validation_reports_local_checks() {
         qubic::Transaction::BASE_SIZE + transaction.input.len() + 64
     );
     let checks = body["data"]["checks"].as_array().expect("checks array");
-    assert_eq!(checks.len(), 4);
+    assert_eq!(checks.len(), 5);
     assert!(checks.iter().all(|check| check["passed"] == true));
+    assert_eq!(body["data"]["head_tick"], transaction.tick - 4);
+    assert_eq!(body["data"]["warnings"], serde_json::json!([]));
     assert_eq!(body["meta"]["source"], "local");
     assert_eq!(body["meta"]["broadcast"], false);
 }
