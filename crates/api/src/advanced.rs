@@ -470,7 +470,8 @@ async fn target_tick_assessment(state: &AppState, target_tick: u32) -> TickAsses
     };
     let mut warnings = Vec::new();
     let head_tick = match (live, indexed) {
-        (Some(live), _) => Some(live),
+        (Some(live), Some(indexed)) => Some(live.max(indexed)),
+        (Some(live), None) => Some(live),
         (None, Some(indexed)) => {
             let effective = indexed.saturating_add(INDEX_LAG_MARGIN);
             warnings.push(format!(
@@ -542,11 +543,9 @@ async fn tx_status(
             let transactions: Vec<Value> = status
                 .transactions
                 .iter()
-                .enumerate()
-                .map(|(index, entry)| {
+                .map(|entry| {
                     json!({
                         "hash": qubic::encode_tx_hash(&entry.digest),
-                        "tx_index": index,
                         "money_flew": entry.money_flew,
                     })
                 })
@@ -595,11 +594,9 @@ async fn tx_status(
             })?;
             let transactions: Vec<Value> = transactions
                 .iter()
-                .enumerate()
-                .map(|(index, transaction)| {
+                .map(|transaction| {
                     json!({
                         "hash": qubic::encode_tx_hash(&transaction.hash()),
-                        "tx_index": index,
                         "source": qubic::PublicKey(transaction.source).to_identity(),
                         "destination": qubic::PublicKey(transaction.destination).to_identity(),
                         "amount": transaction.amount,

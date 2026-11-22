@@ -362,9 +362,11 @@ impl Mempool {
                 entry.error = None;
                 event
             } else if entry.attempts >= self.config.max_attempts {
-                entry.status = MempoolStatus::Failed;
-                entry.broadcast_peers = 0;
                 entry.error = Some(broadcast_error(&attempts));
+                if !was_broadcast {
+                    entry.status = MempoolStatus::Failed;
+                    entry.broadcast_peers = 0;
+                }
                 event
             } else {
                 entry.broadcast_peers = 0;
@@ -403,7 +405,7 @@ fn retry_event(
 ) -> Option<&'static str> {
     if sent > 0 {
         (!was_broadcast).then_some("transaction.broadcast")
-    } else if attempts >= max_attempts {
+    } else if attempts >= max_attempts && !was_broadcast {
         Some("transaction.failed")
     } else {
         None
@@ -528,6 +530,7 @@ mod tests {
         assert_eq!(retry_event(true, 3, 2, 10), None);
         assert_eq!(retry_event(false, 0, 9, 10), None);
         assert_eq!(retry_event(false, 0, 10, 10), Some("transaction.failed"));
+        assert_eq!(retry_event(true, 0, 10, 10), None);
     }
 
     #[test]
