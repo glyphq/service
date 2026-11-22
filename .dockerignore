@@ -11,6 +11,7 @@ scripts
 README.md
 *.log
 .env
+.webhook-key
 .env.*
 !.env.example
 deploy/clickhouse

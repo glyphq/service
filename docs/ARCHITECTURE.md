@@ -333,9 +333,14 @@ dispatcher. They are operational state, not consensus.
    at-least-once.
 
 ClickHouse TTL clauses keep the gateway tables bounded. Terminal mempool entries and
-delivered or dead-lettered deliveries expire after 7 days, and inactive webhooks after
-30 days. Open mempool entries and pending deliveries are excluded, so TTL never drops
+delivered or dead-lettered deliveries expire after 1 day, and inactive webhooks after
+7 days. Open mempool entries and pending deliveries are excluded, so TTL never drops
 work the tracker or dispatcher still needs.
+
+Transaction-scoped webhooks close when a terminal event is queued. The dispatcher
+deletes a closed registration as soon as it has no pending delivery, so failed or
+consumed subscriptions do not accumulate. Webhook targets are encrypted at rest when
+`WEBHOOK_ENCRYPTION_KEY` is set, and API responses only expose a scheme-and-host hint.
 
 The loops run inside every API replica. Sharing ClickHouse keeps status consistent, but
 two replicas can both dispatch the same event. Run one dispatcher or accept duplicate

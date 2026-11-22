@@ -551,6 +551,7 @@ Transactions in slot order.
     {
       "epoch": 240,
       "tick": 91916480,
+      "target_tick": 91916480,
       "tx_index": 3,
       "hash": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
       "source": "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK",
@@ -833,6 +834,7 @@ One transaction by lowercase base-26 hash.
   "data": {
     "epoch": 240,
     "tick": 91916480,
+    "target_tick": 91916480,
     "tx_index": 3,
     "hash": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
     "source": "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK",
@@ -1387,6 +1389,7 @@ before returning, so the response usually reports `broadcast` or `failed`, not
     "destination": "AAAA...AAA",
     "amount": 1000000,
     "tick": 91916480,
+    "target_tick": 91916480,
     "peers": 3,
     "status": "broadcast",
     "attempts": 1,
@@ -1414,7 +1417,7 @@ before returning, so the response usually reports `broadcast` or `failed`, not
 ```
 
 The direct path sends valid transactions with `dejavu=0` to up to `peers` peers
-concurrently. The default and ceiling come from `BROADCAST_PEERS` (default `3`,
+concurrently. The default and ceiling come from `BROADCAST_PEERS` (default `8`,
 maximum `8`). Fan-out avoids a single slow peer dropping the transaction before
 it propagates.
 
@@ -1491,7 +1494,7 @@ Status lifecycle:
 | `broadcast` | At least one peer accepted the packet at the socket in a recent attempt. Not a confirmation. |
 | `confirmed` | The transaction hash is present in the local index. `confirmed_tick` and `confirmed_at` are set. |
 | `expired` | The indexed head passed `tick + MEMPOOL_EXPIRY_TICKS` and the hash never appeared. Default expiry is 10 ticks. |
-| `failed` | The most recent attempt reached no peer. Failed entries stay open and are retried until `MEMPOOL_MAX_ATTEMPTS`, then remain failed until they expire. |
+| `failed` | The most recent attempt reached no peer. Failed entries stay open and are retried until `MEMPOOL_MAX_ATTEMPTS`, then remain failed until retention cleanup. |
 | `cancelled` | An unconfirmed entry was cancelled through the API. A packet a peer already accepted is not recalled. |
 
 A transaction's `tick` field is its target tick. Qubic has no broadcast
@@ -1565,19 +1568,35 @@ empty or omitted `events` list subscribes to every transaction event. Empty
 `transaction_hashes` means all hashes. Empty `identity` means all source
 identities; a non-empty value matches only the transaction source.
 
-Returns `201` with the registration. The secret is never returned. Localhost and
+`transaction.failed` is terminal and is emitted only after
+`MEMPOOL_MAX_ATTEMPTS` is exhausted. A broadcast attempt that reaches no peer
+while attempts remain stays in the retry path without a terminal event.
+
+Returns `201` with the registration. Neither the secret nor the full URL is
+returned: `url_hint` keeps only the scheme and host (`https://example.com/***`),
+because paths and query strings often carry receiver credentials. Localhost and
 private address targets are rejected with `400 bad_request` unless
 `WEBHOOK_ALLOW_PRIVATE=true`.
 
+When `WEBHOOK_ENCRYPTION_KEY` is set, the URL is encrypted with
+ChaCha20-Poly1305 before it is stored. Rows written before encryption was
+enabled stay readable.
+
 #### `GET /v1/webhooks`
 
-Active registrations only, without secrets. `meta.count` reports the number
-returned.
+Active registrations only, without secrets or full URLs. `meta.count` reports
+the number returned.
 
 #### `DELETE /v1/webhooks/{id}`
 
-Deactivates a registration and returns the updated record without its secret.
-Pending deliveries are not retried. The record and its delivery history remain.
+Deactivates a registration and returns the updated record without its secret or
+full URL. Already queued deliveries are still attempted; new events stop
+matching. Closed registrations are deleted once their deliveries are terminal.
+
+Transaction-scoped registrations (`transaction_hashes` non-empty) close
+automatically after `transaction.confirmed`, `transaction.expired`,
+`transaction.failed`, or `transaction.cancelled` is queued. A registration
+watching several hashes stays active until every hash is terminal.
 
 #### `GET /v1/webhooks/{id}/deliveries`
 
@@ -1810,16 +1829,17 @@ current surface.
 | `QUBIC_PEERS` | unset | Comma-separated `host:port` peers for live routes and broadcast. |
 | `QUBIC_PEER` | unset | Single fallback peer when `QUBIC_PEERS` is unset. |
 | `ALLOW_BROADCAST` | `false` | Enable `POST /v1/transactions` and `POST /v1/mempool`. |
-| `BROADCAST_PEERS` | `3` | Default and maximum peer fan-out per broadcast attempt (maximum `8`). |
+| `BROADCAST_PEERS` | `8` | Default and maximum peer fan-out per broadcast attempt (maximum `8`). |
 | `MEMPOOL_ENABLED` | `true` | Enable mempool persistence and background tracking. |
-| `MEMPOOL_POLL_MS` | `1000` | Mempool status reconciliation interval. |
-| `MEMPOOL_RETRY_MS` | `5000` | Minimum delay between rebroadcasts. |
-| `MEMPOOL_MAX_ATTEMPTS` | `5` | Maximum broadcast attempts per entry. |
+| `MEMPOOL_POLL_MS` | `500` | Mempool status reconciliation interval. |
+| `MEMPOOL_RETRY_MS` | `1000` | Minimum delay between rebroadcasts. |
+| `MEMPOOL_MAX_ATTEMPTS` | `10` | Maximum broadcast attempts per entry. |
 | `MEMPOOL_EXPIRY_TICKS` | `10` | Expiry window after the target tick. |
 | `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open mempool entries. |
 | `WEBHOOK_TIMEOUT_MS` | `5000` | Webhook delivery timeout. |
 | `WEBHOOK_MAX_ATTEMPTS` | `6` | Delivery attempts before dead-lettering. |
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private webhook targets. |
+| `WEBHOOK_ENCRYPTION_KEY` | unset | 32-byte hex or base64 key for webhook URL encryption at rest. |
 | `STREAM_POLL_MS` | `1000` | Index-head poll interval for the stream hub. |
 | `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PREFIX` | unset | Raw archive object storage. Presence of `S3_BUCKET` enables it; the `_ID`/`_SECRET_ACCESS_KEY` aliases are also accepted. |
 | `ARCHIVE_DIR` | unset | Filesystem raw archive used when S3 is not configured. |

@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use store::{EventFilter, TransactionFilter};
 
-use crate::dto::{PageParams, event_value};
+use crate::dto::{PageParams, event_value, transaction_value};
 use crate::{ApiError, AppState};
 
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
@@ -540,6 +540,7 @@ async fn tick_transactions(
         .await?;
     let has_more = rows.len() > page.limit as usize;
     rows.truncate(page.limit as usize);
+    let rows: Vec<Value> = rows.iter().map(transaction_value).collect();
     Ok((
         [(header::CACHE_CONTROL, IMMUTABLE)],
         Json(json!({
@@ -588,7 +589,7 @@ async fn transaction(
         .ok_or_else(|| ApiError::not_found(format!("transaction {hash} is not indexed")))?;
     Ok((
         [(header::CACHE_CONTROL, IMMUTABLE)],
-        Json(json!({ "data": row })),
+        Json(json!({ "data": transaction_value(&row) })),
     ))
 }
 
@@ -624,11 +625,7 @@ async fn transactions_batch(
         .collect();
     let data: Vec<Value> = hashes
         .iter()
-        .filter_map(|hash| {
-            found
-                .get(hash)
-                .map(|row| serde_json::to_value(row).unwrap_or(Value::Null))
-        })
+        .filter_map(|hash| found.get(hash).map(transaction_value))
         .collect();
     let missing: Vec<&String> = hashes
         .iter()
@@ -672,6 +669,7 @@ async fn transactions(
         .await?;
     let has_more = rows.len() > page.limit as usize;
     rows.truncate(page.limit as usize);
+    let rows: Vec<Value> = rows.iter().map(transaction_value).collect();
     Ok((
         [(header::CACHE_CONTROL, RECENT)],
         Json(json!({
@@ -746,6 +744,7 @@ async fn identity_transactions(
         .await?;
     let has_more = rows.len() > page.limit as usize;
     rows.truncate(page.limit as usize);
+    let rows: Vec<Value> = rows.iter().map(transaction_value).collect();
     Ok((
         [(header::CACHE_CONTROL, AGGREGATE)],
         Json(json!({

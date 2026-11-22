@@ -4,4 +4,5 @@
 /logs
 *.log
 .env
+.webhook-key
 .DS_Store

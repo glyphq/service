@@ -98,6 +98,8 @@ impl MempoolEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Webhook {
     pub id: String,
+    /// Stored target, encrypted when the API has a key. Never serialized.
+    #[serde(skip_serializing)]
     pub url: String,
     /// HMAC signing key. Never serialized into API responses.
     #[serde(skip_serializing)]
@@ -534,6 +536,47 @@ impl GatewayStore {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// Closed webhooks, newest first. The dispatcher deletes them once their
+    /// deliveries are terminal.
+    pub async fn inactive_webhooks(&self, limit: u32) -> Result<Vec<Webhook>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM (\
+                     SELECT * FROM webhooks \
+                     ORDER BY version DESC LIMIT 1 BY id\
+                 ) WHERE active = 0 ORDER BY updated_at ASC LIMIT ?",
+            )
+            .bind(limit.clamp(1, 1_000))
+            .fetch_all::<WebhookRow>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    pub async fn has_pending_delivery(&self, webhook_id: &str) -> Result<bool> {
+        let row = self
+            .client
+            .query(
+                "SELECT count() AS n FROM (\
+                     SELECT status FROM webhook_deliveries \
+                     ORDER BY version DESC LIMIT 1 BY id\
+                 ) WHERE webhook_id = ? AND status = 'pending'",
+            )
+            .bind(webhook_id)
+            .fetch_one::<CountRow>()
+            .await?;
+        Ok(row.n > 0)
+    }
+
+    pub async fn delete_webhook(&self, id: &str) -> Result<()> {
+        self.client
+            .query("ALTER TABLE webhooks DELETE WHERE id = ?")
+            .bind(id)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
     /// Appends one delivery attempt. The same delivery id keeps its logical
     /// identity while its attempt counter and next attempt advance.
     pub async fn insert_delivery(&self, delivery: &WebhookDelivery) -> Result<()> {
@@ -613,7 +656,7 @@ fn create_statements(database: &str) -> Vec<String> {
              )\n\
              ENGINE = ReplacingMergeTree(version)\n\
              ORDER BY hash\n\
-             TTL updated_at + INTERVAL 7 DAY DELETE \
+             TTL updated_at + INTERVAL 1 DAY DELETE \
                  WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')"
         ),
         format!(
@@ -631,7 +674,7 @@ fn create_statements(database: &str) -> Vec<String> {
              )\n\
              ENGINE = ReplacingMergeTree(version)\n\
              ORDER BY id\n\
-             TTL updated_at + INTERVAL 30 DAY DELETE WHERE active = 0"
+             TTL updated_at + INTERVAL 7 DAY DELETE WHERE active = 0"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {database}.webhook_deliveries\n(\n\
@@ -650,7 +693,7 @@ fn create_statements(database: &str) -> Vec<String> {
              )\n\
              ENGINE = ReplacingMergeTree(version)\n\
              ORDER BY id\n\
-             TTL created_at + INTERVAL 7 DAY DELETE \
+             TTL created_at + INTERVAL 1 DAY DELETE \
                  WHERE status IN ('delivered', 'failed')"
         ),
     ]
@@ -660,15 +703,15 @@ fn create_statements(database: &str) -> Vec<String> {
 fn retention_statements(database: &str) -> Vec<String> {
     vec![
         format!(
-            "ALTER TABLE {database}.mempool MODIFY TTL updated_at + INTERVAL 7 DAY DELETE \
+            "ALTER TABLE {database}.mempool MODIFY TTL updated_at + INTERVAL 1 DAY DELETE \
              WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')"
         ),
         format!(
-            "ALTER TABLE {database}.webhooks MODIFY TTL updated_at + INTERVAL 30 DAY DELETE \
+            "ALTER TABLE {database}.webhooks MODIFY TTL updated_at + INTERVAL 7 DAY DELETE \
              WHERE active = 0"
         ),
         format!(
-            "ALTER TABLE {database}.webhook_deliveries MODIFY TTL created_at + INTERVAL 7 DAY \
+            "ALTER TABLE {database}.webhook_deliveries MODIFY TTL created_at + INTERVAL 1 DAY \
              DELETE WHERE status IN ('delivered', 'failed')"
         ),
     ]
@@ -706,6 +749,9 @@ mod tests {
         );
         assert!(statements.contains("WHERE active = 0"));
         assert!(statements.contains("WHERE status IN ('delivered', 'failed')"));
+        assert!(statements.contains("TTL updated_at + INTERVAL 1 DAY DELETE"));
+        assert!(statements.contains("TTL updated_at + INTERVAL 7 DAY DELETE WHERE active = 0"));
+        assert!(statements.contains("TTL created_at + INTERVAL 1 DAY DELETE"));
     }
 
     #[test]
@@ -717,6 +763,11 @@ mod tests {
                 "missing retention for {table}"
             );
         }
+        assert!(statements.contains("mempool MODIFY TTL updated_at + INTERVAL 1 DAY DELETE"));
+        assert!(statements.contains("webhooks MODIFY TTL updated_at + INTERVAL 7 DAY DELETE"));
+        assert!(
+            statements.contains("webhook_deliveries MODIFY TTL created_at + INTERVAL 1 DAY DELETE")
+        );
     }
 
     #[test]
@@ -772,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn webhook_secret_is_never_serialized() {
+    fn webhook_url_and_secret_are_never_serialized() {
         let webhook = Webhook {
             id: "id".into(),
             url: "https://example.com/hook".into(),
@@ -786,6 +837,7 @@ mod tests {
         };
         let encoded = serde_json::to_string(&webhook).unwrap();
         assert!(!encoded.contains("0123456789abcdef"));
+        assert!(!encoded.contains("example.com"));
         assert!(encoded.contains("transaction.confirmed"));
     }
 

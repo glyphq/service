@@ -453,7 +453,7 @@ CREATE TABLE IF NOT EXISTS glyph.mempool
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY hash
-TTL updated_at + INTERVAL 7 DAY DELETE
+TTL updated_at + INTERVAL 1 DAY DELETE
     WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')
 ```
 
@@ -482,14 +482,16 @@ CREATE TABLE IF NOT EXISTS glyph.webhooks
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY id
-TTL updated_at + INTERVAL 30 DAY DELETE WHERE active = 0
+TTL updated_at + INTERVAL 7 DAY DELETE WHERE active = 0
 ```
 
 `events` and `transaction_hashes` are JSON-encoded arrays in a `String` column. An empty
 `events` array matches every transaction event, an empty `transaction_hashes` array matches
 every hash, and an empty `identity` matches every source identity. `secret` must be at
 least 16 characters and is used to sign deliveries. It is never serialized into API
-responses.
+responses. When `WEBHOOK_ENCRYPTION_KEY` is set, `url` is stored as
+`enc:v1:<base64 nonce and ChaCha20-Poly1305 ciphertext>` and only the dispatcher decrypts
+it. API responses expose a scheme-and-host `url_hint` instead of the full URL.
 
 ```sql
 CREATE TABLE IF NOT EXISTS glyph.webhook_deliveries
@@ -509,7 +511,7 @@ CREATE TABLE IF NOT EXISTS glyph.webhook_deliveries
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY id
-TTL created_at + INTERVAL 7 DAY DELETE
+TTL created_at + INTERVAL 1 DAY DELETE
     WHERE status IN ('delivered', 'failed')
 ```
 
@@ -522,8 +524,9 @@ These tables are created by `Store::init`/`glyph db-init` alongside the canonica
 not by a separate gateway migration. Startup also applies `ALTER TABLE ... MODIFY TTL` so
 existing deployments pick up retention without a manual migration.
 
-Retention is intentionally conservative: terminal mempool entries and delivered or
-dead-lettered deliveries are removed after 7 days, and inactive webhooks after 30 days.
+Retention is intentionally short because Qubic broadcast has no fee: terminal mempool
+entries and delivered or dead-lettered deliveries are removed after 1 day, and inactive
+webhooks after 7 days.
 Open mempool entries and pending deliveries are never removed by TTL. ClickHouse evaluates
 TTL during background merges, so deletion is eventual rather than immediate.
 

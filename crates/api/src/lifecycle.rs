@@ -17,6 +17,7 @@ use axum::{Json, Router};
 use qubic::messages::TX_PER_TICK;
 use serde_json::{Value, json};
 
+use crate::dto::transaction_value;
 use crate::transactions_ext::{effect_json, effect_summary};
 use crate::{ApiError, AppState, peer};
 
@@ -139,13 +140,13 @@ async fn lifecycle(
         "current_tick": current,
         "confirmations": confirmations,
         "money_flew": money_flew,
-        "transaction": indexed,
+        "transaction": indexed.as_ref().map(transaction_value),
         "execution": execution,
         "events": events,
         "effects": effects,
         "summary": summary,
         "errors": errors,
-        "mempool": mempool,
+        "mempool": mempool.as_ref().map(crate::mempool::entry_json),
         "network": network.as_ref().map(network_transaction_json),
         "timeline": timeline_json(
             indexed.as_ref(),
@@ -230,6 +231,7 @@ fn network_transaction_json(transaction: &qubic::messages::Transaction) -> Value
         "source": qubic::PublicKey(transaction.source).to_identity(),
         "destination": qubic::PublicKey(transaction.destination).to_identity(),
         "amount": transaction.amount,
+        "target_tick": transaction.tick,
         "tick": transaction.tick,
         "input_type": transaction.input_type,
         "input_data": hex::encode(&transaction.input),

@@ -3,12 +3,24 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use store::EventRow;
+use store::TransactionRow;
 
 use crate::ApiError;
 
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 200;
 const CURSOR_VERSION: u8 = 1;
+
+/// Serializes a transaction with both the indexed tick and the explicit target
+/// tick. Qubic executes a transaction in the tick named by its header, so the
+/// two values match for indexed rows.
+pub fn transaction_value(row: &TransactionRow) -> Value {
+    let mut value = serde_json::to_value(row).unwrap_or(Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("target_tick".into(), json!(row.tick));
+    }
+    value
+}
 
 /// Query parameters shared by every collection.
 ///

@@ -38,6 +38,16 @@ peers="${QUBIC_PEERS:-157.180.10.49:21841}"
 image="${GLYPH_IMAGE:-glyph:local}"
 api_host="${API_HOST:-127.0.0.1}"
 api_port="${API_PORT:-8080}"
+webhook_key="${WEBHOOK_ENCRYPTION_KEY:-}"
+webhook_key_file="${WEBHOOK_ENCRYPTION_KEY_FILE:-$repo_root/.webhook-key}"
+if [[ -z "$webhook_key" ]]; then
+  if [[ -f "$webhook_key_file" ]]; then
+    webhook_key="$(<"$webhook_key_file")"
+  else
+    webhook_key="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    (umask 077 && printf '%s' "$webhook_key" > "$webhook_key_file")
+  fi
+fi
 s3_user="${S3_ACCESS_KEY:-glyph}"
 s3_password="${S3_SECRET_KEY:-glyph-dev-secret}"
 s3_bucket="${S3_BUCKET:-glyph-archive}"
@@ -57,16 +67,17 @@ app_env=(
   -e "ARCHIVE_VOTES=${ARCHIVE_VOTES:-false}"
   -e "PRUNE_KEEP_EPOCHS=${PRUNE_KEEP_EPOCHS:-}"
   -e "ALLOW_BROADCAST=${ALLOW_BROADCAST:-false}"
-  -e "BROADCAST_PEERS=${BROADCAST_PEERS:-3}"
+  -e "BROADCAST_PEERS=${BROADCAST_PEERS:-8}"
   -e "MEMPOOL_ENABLED=${MEMPOOL_ENABLED:-true}"
-  -e "MEMPOOL_POLL_MS=${MEMPOOL_POLL_MS:-1000}"
-  -e "MEMPOOL_RETRY_MS=${MEMPOOL_RETRY_MS:-5000}"
-  -e "MEMPOOL_MAX_ATTEMPTS=${MEMPOOL_MAX_ATTEMPTS:-5}"
+  -e "MEMPOOL_POLL_MS=${MEMPOOL_POLL_MS:-500}"
+  -e "MEMPOOL_RETRY_MS=${MEMPOOL_RETRY_MS:-1000}"
+  -e "MEMPOOL_MAX_ATTEMPTS=${MEMPOOL_MAX_ATTEMPTS:-10}"
   -e "MEMPOOL_EXPIRY_TICKS=${MEMPOOL_EXPIRY_TICKS:-10}"
   -e "MEMPOOL_MAX_ENTRIES=${MEMPOOL_MAX_ENTRIES:-10000}"
   -e "WEBHOOK_TIMEOUT_MS=${WEBHOOK_TIMEOUT_MS:-5000}"
   -e "WEBHOOK_MAX_ATTEMPTS=${WEBHOOK_MAX_ATTEMPTS:-6}"
   -e "WEBHOOK_ALLOW_PRIVATE=${WEBHOOK_ALLOW_PRIVATE:-false}"
+  -e "WEBHOOK_ENCRYPTION_KEY=$webhook_key"
   -e "STREAM_POLL_MS=${STREAM_POLL_MS:-1000}"
   -e "PRICE_POLL_MS=${PRICE_POLL_MS:-60000}"
   -e "MARKET_ENABLED=${MARKET_ENABLED:-true}"

@@ -1325,6 +1325,7 @@ fn schemas() -> Value {
                         "destination": { "type": "string", "description": "Destination identity." },
                         "amount": { "type": "integer", "format": "int64" },
                         "tick": { "type": "integer", "description": "Target tick." },
+                        "target_tick": { "type": "integer", "description": "Scheduled execution tick." },
                         "peers": { "type": "integer", "description": "Requested peers." },
                         "status": { "type": "string", "enum": ["queued", "broadcast", "confirmed", "expired", "failed", "cancelled"] },
                         "attempts": { "type": "integer", "description": "Attempts so far." },
@@ -1354,10 +1355,10 @@ fn schemas() -> Value {
                 },
                 "Webhook": {
                     "type": "object",
-                    "required": ["id", "url", "active", "created_at"],
+                    "required": ["id", "url_hint", "active", "created_at"],
                     "properties": {
                         "id": { "type": "string" },
-                        "url": { "type": "string", "format": "uri" },
+                        "url_hint": { "type": "string", "description": "Scheme and host only; the path and query are redacted." },
                         "events": { "type": "array", "items": { "type": "string" } },
                         "transaction_hashes": { "type": "array", "items": { "type": "string" } },
                         "identity": { "type": "string", "description": "Empty matches all identities." },
@@ -1655,6 +1656,7 @@ fn schemas() -> Value {
                     "type": "object",
                     "properties": {
                         "epoch": { "type": "integer" }, "tick": { "type": "integer" },
+                        "target_tick": { "type": "integer", "description": "Scheduled execution tick." },
                         "tx_index": { "type": "integer" }, "hash": { "type": "string" },
                         "source": { "type": "string" }, "destination": { "type": "string" },
                         "amount": { "type": "integer", "format": "int64" },

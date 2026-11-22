@@ -47,9 +47,9 @@ impl MempoolConfig {
             .is_ok_and(|value| value.trim().eq_ignore_ascii_case("false"));
         Self {
             enabled,
-            poll: Duration::from_millis(env_u64("MEMPOOL_POLL_MS", 1_000)),
-            retry: Duration::from_millis(env_u64("MEMPOOL_RETRY_MS", 5_000)),
-            max_attempts: env_u64("MEMPOOL_MAX_ATTEMPTS", 5).clamp(1, 255) as u8,
+            poll: Duration::from_millis(env_u64("MEMPOOL_POLL_MS", 500)),
+            retry: Duration::from_millis(env_u64("MEMPOOL_RETRY_MS", 1_000)),
+            max_attempts: env_u64("MEMPOOL_MAX_ATTEMPTS", 10).clamp(1, 255) as u8,
             expiry_ticks: env_u64("MEMPOOL_EXPIRY_TICKS", 10).min(1_000_000) as u32,
             max_entries: env_u64("MEMPOOL_MAX_ENTRIES", 10_000).max(1) as usize,
         }
@@ -182,15 +182,17 @@ impl Mempool {
             entry.status = MempoolStatus::Broadcast;
             entry.broadcast_peers = u8::try_from(sent).unwrap_or(u8::MAX);
             entry.error = None;
-            "transaction.broadcast"
+            Some("transaction.broadcast")
         } else {
             entry.status = MempoolStatus::Failed;
             entry.broadcast_peers = 0;
             entry.error = Some(broadcast_error(&attempts));
-            "transaction.failed"
+            None
         };
         self.gateway.update_mempool(&entry).await?;
-        self.webhooks.dispatch_event(event, &entry).await?;
+        if let Some(event) = event {
+            self.webhooks.dispatch_event(event, &entry).await?;
+        }
         Ok(entry)
     }
 
@@ -207,9 +209,13 @@ impl Mempool {
                 entry.confirmed_tick = Some(row.tick);
                 entry.confirmed_at = Some(Utc::now());
                 entry.updated_at = Utc::now();
-                // Best effort: the background poll will persist it if this
-                // write races the indexer.
-                let _ = self.gateway.update_mempool(&entry).await;
+                // If this write races the indexer, the background poll
+                // persists the same state on its next pass.
+                if self.gateway.update_mempool(&entry).await.is_ok() {
+                    self.webhooks
+                        .dispatch_event("transaction.confirmed", &entry)
+                        .await?;
+                }
             }
         }
         Ok(Some(entry))
@@ -330,6 +336,9 @@ impl Mempool {
                     entry.error = Some(format!("stored transaction is not hex: {error}"));
                     entry.updated_at = now;
                     self.gateway.update_mempool(&entry).await?;
+                    self.webhooks
+                        .dispatch_event("transaction.failed", &entry)
+                        .await?;
                     continue;
                 }
             };
@@ -340,6 +349,9 @@ impl Mempool {
                     entry.error = Some(format!("stored transaction is invalid: {error}"));
                     entry.updated_at = now;
                     self.gateway.update_mempool(&entry).await?;
+                    self.webhooks
+                        .dispatch_event("transaction.failed", &entry)
+                        .await?;
                     continue;
                 }
             };
@@ -399,7 +411,7 @@ pub fn accepted(entry: MempoolEntry) -> Response {
         StatusCode::ACCEPTED,
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
-            "data": entry,
+            "data": entry_json(&entry),
             "meta": {
                 "source": "mempool",
                 "status": status,
@@ -415,6 +427,15 @@ pub fn accepted(entry: MempoolEntry) -> Response {
         })),
     )
         .into_response()
+}
+
+/// API shape for a mempool entry, with the scheduled tick made explicit.
+pub fn entry_json(entry: &MempoolEntry) -> serde_json::Value {
+    let mut value = serde_json::to_value(entry).unwrap_or(serde_json::Value::Null);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("target_tick".into(), json!(entry.tick));
+    }
+    value
 }
 
 pub fn router() -> Router<AppState> {
@@ -490,6 +511,7 @@ async fn list(
     };
     let limit = params.limit.unwrap_or(100).clamp(1, 500);
     let entries = service(&state)?.list(status, limit).await?;
+    let entries: Vec<serde_json::Value> = entries.iter().map(entry_json).collect();
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
@@ -534,7 +556,7 @@ async fn cancel(
     let entry = service(&state)?.cancel(&hash).await?;
     Ok((
         [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({ "data": entry })),
+        Json(json!({ "data": entry_json(&entry) })),
     ))
 }
 
@@ -615,5 +637,30 @@ mod tests {
         };
         let response = accepted(entry);
         assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[test]
+    fn entry_json_exposes_the_target_tick() {
+        let entry = MempoolEntry {
+            hash: "ab".into(),
+            raw: "00".into(),
+            source: "SRC".into(),
+            destination: "DST".into(),
+            amount: 1,
+            tick: 42,
+            peers: 8,
+            status: MempoolStatus::Broadcast,
+            attempts: 1,
+            broadcast_peers: 3,
+            broadcast_at: None,
+            confirmed_at: None,
+            confirmed_tick: None,
+            error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let value = entry_json(&entry);
+        assert_eq!(value["target_tick"], 42);
+        assert_eq!(value["tick"], 42);
     }
 }

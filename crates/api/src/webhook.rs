@@ -22,12 +22,16 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
-use store::gateway::{MempoolEntry, Webhook, WebhookDelivery};
+use store::gateway::{MempoolEntry, MempoolStatus, Webhook, WebhookDelivery};
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
@@ -46,12 +50,92 @@ pub const EVENTS: &[&str] = &[
 
 /// Shortest accepted signing secret.
 pub const MIN_SECRET_LEN: usize = 16;
+const ENCRYPTED_URL_PREFIX: &str = "enc:v1:";
+
+/// Encrypts webhook targets at rest with a deployment-provided key.
+#[derive(Clone)]
+pub struct UrlCipher {
+    key: [u8; 32],
+}
+
+impl std::fmt::Debug for UrlCipher {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("UrlCipher(..)")
+    }
+}
+
+impl UrlCipher {
+    pub fn from_env() -> Option<Self> {
+        let raw = std::env::var("WEBHOOK_ENCRYPTION_KEY").ok()?;
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        match decode_key(raw) {
+            Some(key) => Some(Self { key }),
+            None => {
+                tracing::warn!(
+                    "WEBHOOK_ENCRYPTION_KEY is not 32 bytes as hex or base64; webhook URLs will be stored in plaintext"
+                );
+                None
+            }
+        }
+    }
+
+    pub fn encrypt(&self, plaintext: &str) -> Result<String, String> {
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
+            .map_err(|_| "invalid webhook encryption key".to_owned())?;
+        let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let ciphertext = cipher
+            .encrypt(&nonce, plaintext.as_bytes())
+            .map_err(|_| "webhook url encryption failed".to_owned())?;
+        let mut payload = nonce.to_vec();
+        payload.extend_from_slice(&ciphertext);
+        Ok(format!(
+            "{ENCRYPTED_URL_PREFIX}{}",
+            URL_SAFE_NO_PAD.encode(payload)
+        ))
+    }
+
+    /// Plaintext rows written before encryption was enabled pass through.
+    pub fn decrypt(&self, stored: &str) -> Result<String, String> {
+        let Some(encoded) = stored.strip_prefix(ENCRYPTED_URL_PREFIX) else {
+            return Ok(stored.to_owned());
+        };
+        let payload = URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|error| format!("webhook url is not valid base64: {error}"))?;
+        if payload.len() < 12 {
+            return Err("encrypted webhook url is truncated".into());
+        }
+        let (nonce, ciphertext) = payload.split_at(12);
+        let cipher = ChaCha20Poly1305::new_from_slice(&self.key)
+            .map_err(|_| "invalid webhook encryption key".to_owned())?;
+        let plaintext = cipher
+            .decrypt(Nonce::from_slice(nonce), ciphertext)
+            .map_err(|_| "webhook url decryption failed".to_owned())?;
+        String::from_utf8(plaintext).map_err(|_| "webhook url is not valid UTF-8".to_owned())
+    }
+}
+
+fn decode_key(raw: &str) -> Option<[u8; 32]> {
+    let bytes = if raw.len() == 64 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        hex::decode(raw).ok()?
+    } else {
+        URL_SAFE_NO_PAD
+            .decode(raw)
+            .or_else(|_| STANDARD.decode(raw))
+            .ok()?
+    };
+    bytes.try_into().ok()
+}
 
 #[derive(Debug, Clone)]
 pub struct WebhookConfig {
     pub timeout: Duration,
     pub max_attempts: u32,
     pub allow_private: bool,
+    pub cipher: Option<UrlCipher>,
 }
 
 impl WebhookConfig {
@@ -60,6 +144,7 @@ impl WebhookConfig {
             timeout: Duration::from_millis(env_u64("WEBHOOK_TIMEOUT_MS", 5_000)),
             max_attempts: env_u64("WEBHOOK_MAX_ATTEMPTS", 6).clamp(1, 100) as u32,
             allow_private: env_flag("WEBHOOK_ALLOW_PRIVATE"),
+            cipher: UrlCipher::from_env(),
         }
     }
 }
@@ -171,10 +256,16 @@ impl Webhooks {
             }
         };
 
+        let stored_url = match &self.config.cipher {
+            Some(cipher) => cipher
+                .encrypt(target.as_str())
+                .map_err(ApiError::internal)?,
+            None => target.to_string(),
+        };
         let now = Utc::now();
         let webhook = Webhook {
             id: uuid::Uuid::new_v4().to_string(),
-            url: target.to_string(),
+            url: stored_url,
             secret: request.secret,
             events,
             transaction_hashes: hashes,
@@ -225,6 +316,32 @@ impl Webhooks {
         Ok(self.gateway.deliveries(id, limit).await?)
     }
 
+    /// Decrypted target used by the dispatcher.
+    fn target(&self, webhook: &Webhook) -> Result<String, ApiError> {
+        match &self.config.cipher {
+            Some(cipher) => cipher.decrypt(&webhook.url).map_err(ApiError::internal),
+            None => Ok(webhook.url.clone()),
+        }
+    }
+
+    /// Public shape. The URL is never returned: only a scheme-and-host hint.
+    pub fn public(&self, webhook: &Webhook) -> Value {
+        let hint = self
+            .target(webhook)
+            .map(|url| redact_url(&url))
+            .unwrap_or_else(|_| "***".to_owned());
+        json!({
+            "id": webhook.id,
+            "url_hint": hint,
+            "events": webhook.events,
+            "transaction_hashes": webhook.transaction_hashes,
+            "identity": webhook.identity,
+            "active": webhook.active,
+            "created_at": webhook.created_at,
+            "updated_at": webhook.updated_at,
+        })
+    }
+
     /// Queues a pending delivery for every active webhook that matches the
     /// event, transaction hash, and source identity.
     pub async fn dispatch_event(&self, event: &str, entry: &MempoolEntry) -> Result<(), ApiError> {
@@ -253,11 +370,35 @@ impl Webhooks {
             };
             self.gateway.insert_delivery(&delivery).await?;
         }
+        if is_terminal_event(event) {
+            self.close_transaction(&entry.hash).await?;
+        }
+        Ok(())
+    }
+
+    /// Transaction-scoped registrations stop matching once the transaction is
+    /// terminal. Queued deliveries still run; the row is deleted after they
+    /// finish.
+    async fn close_transaction(&self, hash: &str) -> Result<(), ApiError> {
+        for mut webhook in self.gateway.active_webhooks().await? {
+            if !webhook.transaction_hashes.iter().any(|value| value == hash) {
+                continue;
+            }
+            webhook.transaction_hashes.retain(|value| value != hash);
+            if webhook.transaction_hashes.is_empty() {
+                webhook.active = false;
+            }
+            webhook.updated_at = Utc::now();
+            self.gateway.update_webhook(&webhook).await?;
+        }
         Ok(())
     }
 
     /// Background dispatcher. Polls due deliveries until cancelled.
     pub async fn run(self: Arc<Self>) {
+        if let Err(error) = self.reconcile().await {
+            tracing::warn!(?error, "webhook reconciliation failed");
+        }
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -272,11 +413,51 @@ impl Webhooks {
         }
     }
 
+    /// Closes transaction-scoped registrations left behind by an older build
+    /// or a restart between a terminal status write and its event.
+    async fn reconcile(&self) -> Result<(), ApiError> {
+        for mut webhook in self.gateway.active_webhooks().await? {
+            if webhook.transaction_hashes.is_empty() {
+                continue;
+            }
+            let mut remaining = Vec::new();
+            for hash in &webhook.transaction_hashes {
+                let terminal = self
+                    .gateway
+                    .mempool_entry(hash)
+                    .await?
+                    .is_some_and(|entry| is_terminal_status(entry.status));
+                if !terminal {
+                    remaining.push(hash.clone());
+                }
+            }
+            if remaining == webhook.transaction_hashes {
+                continue;
+            }
+            webhook.transaction_hashes = remaining;
+            webhook.active = !webhook.transaction_hashes.is_empty();
+            webhook.updated_at = Utc::now();
+            self.gateway.update_webhook(&webhook).await?;
+        }
+        Ok(())
+    }
+
     async fn dispatch_due(&self) -> Result<(), ApiError> {
         let due = self.gateway.due_deliveries(Utc::now(), 50).await?;
         for delivery in due {
             if let Err(error) = self.attempt(delivery).await {
                 tracing::warn!(?error, "webhook delivery attempt failed to persist");
+            }
+        }
+        self.purge_consumed().await?;
+        Ok(())
+    }
+
+    /// Deletes closed registrations once every queued delivery is terminal.
+    async fn purge_consumed(&self) -> Result<(), ApiError> {
+        for webhook in self.gateway.inactive_webhooks(200).await? {
+            if !self.gateway.has_pending_delivery(&webhook.id).await? {
+                self.gateway.delete_webhook(&webhook.id).await?;
             }
         }
         Ok(())
@@ -295,22 +476,19 @@ impl Webhooks {
                 )
                 .await;
         };
-        if !webhook.active {
-            return self
-                .finish(
-                    delivery,
-                    "failed",
-                    None,
-                    Some("webhook is inactive".to_owned()),
-                )
-                .await;
-        }
-
         let timestamp = Utc::now().timestamp().to_string();
         let signature = signature_header(&webhook.secret, &timestamp, &delivery.payload);
+        let target = match self.target(&webhook) {
+            Ok(target) => target,
+            Err(error) => {
+                return self
+                    .finish(delivery, "failed", None, Some(error.detail))
+                    .await;
+            }
+        };
         let response = self
             .client
-            .post(&webhook.url)
+            .post(target)
             .header("X-Glyph-Event", &delivery.event)
             .header("X-Glyph-Delivery", &delivery.id)
             .header("X-Glyph-Timestamp", &timestamp)
@@ -406,7 +584,7 @@ impl Webhooks {
 pub fn delivery_payload(event: &str, entry: &MempoolEntry) -> String {
     json!({
         "event": event,
-        "transaction": entry,
+        "transaction": crate::mempool::entry_json(entry),
     })
     .to_string()
 }
@@ -428,6 +606,42 @@ pub fn webhook_matches(webhook: &Webhook, event: &str, hash: &str, identity: &st
         return false;
     }
     true
+}
+
+pub fn is_terminal_event(event: &str) -> bool {
+    matches!(
+        event,
+        "transaction.confirmed"
+            | "transaction.expired"
+            | "transaction.failed"
+            | "transaction.cancelled"
+    )
+}
+
+pub fn is_terminal_status(status: MempoolStatus) -> bool {
+    matches!(
+        status,
+        MempoolStatus::Confirmed | MempoolStatus::Expired | MempoolStatus::Cancelled
+    )
+}
+
+/// Scheme and host only. The path and query can carry receiver credentials.
+pub fn redact_url(raw: &str) -> String {
+    match Url::parse(raw) {
+        Ok(url) => {
+            let port = url
+                .port()
+                .map(|port| format!(":{port}"))
+                .unwrap_or_default();
+            format!(
+                "{}://{}{}/***",
+                url.scheme(),
+                url.host_str().unwrap_or_default(),
+                port
+            )
+        }
+        Err(_) => "***".to_owned(),
+    }
 }
 
 /// Validates a webhook target. Returns the normalized URL.
@@ -500,8 +714,8 @@ pub fn validate_secret(secret: &str) -> Result<(), String> {
 
 /// Hex HMAC-SHA256 of `message` under `secret`.
 pub fn hmac_sha256_hex(secret: &str, message: &str) -> String {
-    let mut mac =
-        Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts keys of any length");
     mac.update(message.as_bytes());
     hex::encode(mac.finalize().into_bytes())
 }
@@ -544,17 +758,26 @@ async fn register(
     payload: Result<Json<RegisterRequest>, JsonRejection>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
     let body = json_body(payload)?;
-    let webhook = service(&state)?.register(body).await?;
-    Ok((StatusCode::CREATED, Json(json!({ "data": webhook }))))
+    let service = service(&state)?;
+    let webhook = service.register(body).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(json!({ "data": service.public(&webhook) })),
+    ))
 }
 
 async fn list(
     State(state): State<AppState>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
-    let webhooks = service(&state)?.list().await?;
+    let service = service(&state)?;
+    let webhooks = service.list().await?;
+    let data: Vec<Value> = webhooks
+        .iter()
+        .map(|webhook| service.public(webhook))
+        .collect();
     Ok(Json(json!({
-        "data": webhooks,
-        "meta": { "count": webhooks.len() }
+        "data": data,
+        "meta": { "count": data.len() }
     })))
 }
 
@@ -562,11 +785,12 @@ async fn deactivate(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
-    let webhook = service(&state)?
+    let service = service(&state)?;
+    let webhook = service
         .deactivate(&id)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("webhook {id} does not exist")))?;
-    Ok(Json(json!({ "data": webhook })))
+    Ok(Json(json!({ "data": service.public(&webhook) })))
 }
 
 async fn deliveries(
@@ -590,12 +814,6 @@ async fn deliveries(
 struct DeliveryQuery {
     #[serde(default)]
     limit: Option<u32>,
-}
-
-/// Helper for tests and callers that want the public webhook shape without the
-/// secret.
-pub fn public_webhook(webhook: &Webhook) -> Value {
-    serde_json::to_value(webhook).unwrap_or(Value::Null)
 }
 
 #[cfg(test)]
@@ -744,5 +962,86 @@ mod tests {
         assert_eq!(retry_delay(2).num_seconds(), 2);
         assert_eq!(retry_delay(3).num_seconds(), 4);
         assert_eq!(retry_delay(20).num_seconds(), 60);
+    }
+
+    #[test]
+    fn url_cipher_round_trips_and_hides_plaintext() {
+        let cipher = UrlCipher { key: [7u8; 32] };
+        let stored = cipher
+            .encrypt("https://example.com/hook?token=secret")
+            .unwrap();
+        assert!(stored.starts_with(ENCRYPTED_URL_PREFIX));
+        assert!(!stored.contains("secret"));
+        assert_eq!(
+            cipher.decrypt(&stored).unwrap(),
+            "https://example.com/hook?token=secret"
+        );
+    }
+
+    #[test]
+    fn url_cipher_reads_legacy_plaintext() {
+        let cipher = UrlCipher { key: [7u8; 32] };
+        assert_eq!(
+            cipher.decrypt("https://example.com/hook").unwrap(),
+            "https://example.com/hook"
+        );
+    }
+
+    #[test]
+    fn encryption_key_accepts_hex_and_base64() {
+        let hex = "00".repeat(32);
+        assert_eq!(decode_key(&hex), Some([0u8; 32]));
+        let encoded = URL_SAFE_NO_PAD.encode([3u8; 32]);
+        assert_eq!(decode_key(&encoded), Some([3u8; 32]));
+        assert_eq!(decode_key("too-short"), None);
+    }
+
+    #[test]
+    fn redacted_url_keeps_scheme_and_host_only() {
+        assert_eq!(
+            redact_url("https://example.com:8443/hook?token=secret"),
+            "https://example.com:8443/***"
+        );
+        assert_eq!(redact_url("not a url"), "***");
+    }
+
+    #[test]
+    fn terminal_events_close_transaction_webhooks() {
+        for event in [
+            "transaction.confirmed",
+            "transaction.expired",
+            "transaction.failed",
+            "transaction.cancelled",
+        ] {
+            assert!(is_terminal_event(event), "{event}");
+        }
+        assert!(!is_terminal_event("transaction.queued"));
+        assert!(!is_terminal_event("transaction.broadcast"));
+    }
+
+    #[test]
+    fn terminal_statuses_close_transaction_webhooks() {
+        for status in [
+            MempoolStatus::Confirmed,
+            MempoolStatus::Expired,
+            MempoolStatus::Cancelled,
+        ] {
+            assert!(is_terminal_status(status), "{status:?}");
+        }
+        for status in [
+            MempoolStatus::Queued,
+            MempoolStatus::Broadcast,
+            MempoolStatus::Failed,
+        ] {
+            assert!(!is_terminal_status(status), "{status:?}");
+        }
+    }
+
+    #[test]
+    fn webhook_serialization_omits_url_and_secret() {
+        let value = serde_json::to_value(webhook(&[], &["abc"], "")).unwrap();
+        assert!(value.get("url").is_none());
+        assert!(value.get("secret").is_none());
+        assert_eq!(value["id"], "id");
     }
 }

@@ -729,6 +729,10 @@ async fn tick_and_transaction_resources() {
     let (status, body) = get("/v1/transactions?limit=1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        body["data"][0]["target_tick"], body["data"][0]["tick"],
+        "indexed transactions expose the executed tick as target_tick"
+    );
     assert_eq!(body["meta"]["has_more"], true);
     assert!(body["meta"]["next_cursor"].is_string());
 

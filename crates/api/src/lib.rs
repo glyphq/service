@@ -73,7 +73,7 @@ impl AppState {
             peers: Vec::new(),
             pool: NodePool::new(Vec::new()),
             allow_broadcast: false,
-            broadcast_peers: 3,
+            broadcast_peers: 8,
             archive: None,
             started_at: Instant::now(),
             progress: Arc::new(ProgressSampler::default()),
@@ -326,7 +326,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
     let broadcast_peers = std::env::var("BROADCAST_PEERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(3)
+        .unwrap_or(8)
         .clamp(1, 8);
     let pool = NodePool::new(peers.clone());
     let archive = archive_from_env();

@@ -15,6 +15,7 @@ anyhow.workspace = true
 async-stream.workspace = true
 axum.workspace = true
 base64.workspace = true
+chacha20poly1305 = "0.10"
 chrono.workspace = true
 futures-util.workspace = true
 hex.workspace = true

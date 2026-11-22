@@ -43,6 +43,10 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(8);
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Extra attempts after the first one for a request.
 pub const DEFAULT_RETRIES: u32 = 2;
+/// Broadcasts are fire-and-forget. A slow peer must not delay the submission or
+/// the next retry, so broadcast connections use a tighter budget.
+const BROADCAST_CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
+const BROADCAST_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1_500);
 /// Timeout for the all-ranges log request. Logs are optional, so this must not
 /// dominate a tick fetch on peers without logging.
 pub const DEFAULT_LOG_RANGE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -2104,7 +2108,10 @@ impl NodePool {
         }
 
         let mut tasks = tokio::task::JoinSet::new();
-        for config in candidates {
+        for mut config in candidates {
+            config.connect_timeout = config.connect_timeout.min(BROADCAST_CONNECT_TIMEOUT);
+            config.timeout = config.timeout.min(BROADCAST_HANDSHAKE_TIMEOUT);
+            config.retries = 0;
             let transaction = transaction.clone();
             tasks.spawn(async move {
                 let started = std::time::Instant::now();
