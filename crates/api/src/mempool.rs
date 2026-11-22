@@ -400,7 +400,7 @@ fn retry_event(
 }
 
 /// `202 Accepted` body for `/v1/transactions`.
-pub fn accepted(entry: MempoolEntry) -> Response {
+pub fn accepted(entry: MempoolEntry, expiry_ticks: u32) -> Response {
     let hash = entry.hash.clone();
     let broadcast = entry.broadcast_peers > 0;
     let broadcast_peers = entry.broadcast_peers;
@@ -409,7 +409,7 @@ pub fn accepted(entry: MempoolEntry) -> Response {
         StatusCode::ACCEPTED,
         [(header::CACHE_CONTROL, "no-store")],
         Json(json!({
-            "data": entry_json(&entry),
+            "data": entry_json(&entry, expiry_ticks),
             "meta": {
                 "source": "tracking",
                 "status": status,
@@ -428,10 +428,14 @@ pub fn accepted(entry: MempoolEntry) -> Response {
 }
 
 /// API shape for a mempool entry, with the scheduled tick made explicit.
-pub fn entry_json(entry: &MempoolEntry) -> serde_json::Value {
+pub fn entry_json(entry: &MempoolEntry, expiry_ticks: u32) -> serde_json::Value {
     let mut value = serde_json::to_value(entry).unwrap_or(serde_json::Value::Null);
     if let Some(object) = value.as_object_mut() {
         object.insert("target_tick".into(), json!(entry.tick));
+        object.insert(
+            "expiry_tick".into(),
+            json!(entry.tick.saturating_add(expiry_ticks)),
+        );
     }
     value
 }
@@ -520,12 +524,12 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let response = accepted(entry);
+        let response = accepted(entry, 10);
         assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[test]
-    fn entry_json_exposes_the_target_tick() {
+    fn entry_json_exposes_the_target_and_expiry_ticks() {
         let entry = MempoolEntry {
             hash: "ab".into(),
             raw: "00".into(),
@@ -544,8 +548,9 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let value = entry_json(&entry);
+        let value = entry_json(&entry, 10);
         assert_eq!(value["target_tick"], 42);
+        assert_eq!(value["expiry_tick"], 52);
         assert_eq!(value["tick"], 42);
     }
 }

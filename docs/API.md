@@ -1425,6 +1425,7 @@ before returning, so the response usually reports `broadcast` or `failed`, not
     "amount": 1000000,
     "tick": 91916480,
     "target_tick": 91916480,
+    "expiry_tick": 91916490,
     "peers": 3,
     "status": "broadcast",
     "attempts": 1,
@@ -1460,6 +1461,12 @@ Set `"dry_run": true` to get the validation report, transaction summary, and
 target peer count without broadcasting or queueing. A dry run returns `200` and
 never opens a peer connection. It is also the easiest way for a wallet to show a
 preview before asking the user to sign.
+
+`expiry_tick` is `target_tick + MEMPOOL_EXPIRY_TICKS` (default `10`). The
+tracker marks the transaction `expired` once the indexed head passes it. Use
+that field as the client-side timeout: the target tick is the chain deadline,
+and `expiry_tick` adds the API's index grace. A tracked transaction cannot
+execute in a later tick after its target tick passes.
 
 ```json
 {
@@ -1579,7 +1586,7 @@ for a single client.
 
 `secret` is required and must be at least 16 characters. Events are
 `transaction.queued`, `transaction.broadcast`, `transaction.confirmed`,
-`transaction.expired`, `transaction.failed`, and `transaction.cancelled`. An
+`transaction.expired`, and `transaction.failed`. An
 empty or omitted `events` list subscribes to every transaction event. Empty
 `transaction_hashes` means all hashes. Empty `identity` means all source
 identities; a non-empty value matches only the transaction source.
@@ -1611,10 +1618,10 @@ matching. Closed registrations are deleted once their deliveries are terminal.
 
 Transaction-scoped registrations (`transaction_hashes` non-empty) close
 automatically after `transaction.confirmed`, `transaction.expired`,
-`transaction.failed`, or `transaction.cancelled` is queued. A registration
-watching several hashes stays active until every hash is terminal. A hash that
-has no tracker entry is reaped once the registration is an hour old, so a
-restart cannot leave orphaned subscriptions.
+or `transaction.failed` is queued. A registration watching several hashes stays
+active until every hash is terminal. A hash that has no tracker entry is reaped
+once the registration is an hour old, so a restart cannot leave orphaned
+subscriptions.
 
 #### `GET /v1/webhooks/{id}/deliveries`
 
@@ -1638,7 +1645,7 @@ Recent deliveries, newest first. Each row tracks one delivery across retries. Op
       "created_at": "2026-11-18T15:10:02.000Z"
     }
   ],
-  "meta": { "limit": 50 }
+  "meta": { "count": 1, "limit": 50 }
 }
 ```
 
@@ -1660,8 +1667,8 @@ Delivery headers:
 | `X-Glyph-Signature` | `sha256=<hex HMAC-SHA256 of "{timestamp}.{body}">`. |
 
 The body is a JSON object with `event` and a `transaction` object carrying the
-tracked transaction fields. It is stored on the delivery row and replayed
-byte-for-byte on retries.
+tracked transaction fields, including `hash`, `target_tick`, and `expiry_tick`.
+It is stored on the delivery row and replayed byte-for-byte on retries.
 
 Verify the signature over the exact bytes received, compare in constant time,
 and reject stale timestamps. Example in Node:

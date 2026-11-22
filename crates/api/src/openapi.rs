@@ -115,7 +115,7 @@ fn data_envelope(schema: &str) -> Value {
 fn info() -> Value {
     json!({
         "title": "Glyph API",
-        "version": "0.4.0",
+        "version": "0.4.1",
         "summary": "Verified Qubic chain data.",
         "x-logo": { "url": "/logo.png", "altText": "Glyph" },
         "description": "Glyph indexes Qubic directly from peers and verifies quorum evidence.\n\n- `/v1` reads persisted, verified history.\n- `POST /v1/transactions` submits signed bytes and tracks them internally.\n- Signed webhooks report terminal transaction state; a broadcast is not confirmation.\n- `/v1/network` reads live peer state such as system info, revenue, and oracles.\n- `/v1/live` exposes raw peer operations.\n- JSON responses use `data` and `meta`; errors use RFC 9457 problem documents.\n\nAmounts are integer QU. Identities are uppercase base-26; hashes are lowercase base-26."
@@ -1255,6 +1255,7 @@ fn schemas() -> Value {
                         "amount": { "type": "integer", "format": "int64" },
                         "tick": { "type": "integer", "description": "Target tick." },
                         "target_tick": { "type": "integer", "description": "Scheduled execution tick." },
+                        "expiry_tick": { "type": "integer", "description": "The tracker marks the transaction expired once the chain head passes this tick." },
                         "peers": { "type": "integer", "description": "Requested peers." },
                         "status": { "type": "string", "enum": ["queued", "broadcast", "confirmed", "expired", "failed"] },
                         "attempts": { "type": "integer", "description": "Attempts so far." },
@@ -2085,7 +2086,7 @@ mod tests {
     fn spec_is_openapi_31_and_covers_routes() {
         let spec = spec();
         assert_eq!(spec["openapi"], "3.1.0");
-        assert_eq!(spec["info"]["version"], "0.4.0");
+        assert_eq!(spec["info"]["version"], "0.4.1");
         let paths = spec["paths"].as_object().expect("paths object");
         for path in [
             "/healthz",

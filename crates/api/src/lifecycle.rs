@@ -121,6 +121,11 @@ async fn lifecycle(
         .collect();
 
     let execution = execution_json(&events, money_flew);
+    let expiry_ticks = state
+        .mempool
+        .as_ref()
+        .map(|mempool| mempool.config().expiry_ticks)
+        .unwrap_or(10);
     let state_name = lifecycle_state(
         indexed.is_some(),
         mempool.as_ref(),
@@ -146,7 +151,9 @@ async fn lifecycle(
         "effects": effects,
         "summary": summary,
         "errors": errors,
-        "tracking": mempool.as_ref().map(crate::mempool::entry_json),
+        "tracking": mempool
+            .as_ref()
+            .map(|entry| crate::mempool::entry_json(entry, expiry_ticks)),
         "network": network.as_ref().map(network_transaction_json),
         "timeline": timeline_json(
             indexed.as_ref(),

@@ -625,7 +625,10 @@ pub async fn broadcast_transaction(
                 }
             };
             let entry = mempool.submit(&body.raw, peers_requested, inline).await?;
-            return Ok(crate::mempool::accepted(entry));
+            return Ok(crate::mempool::accepted(
+                entry,
+                mempool.config().expiry_ticks,
+            ));
         }
     }
 

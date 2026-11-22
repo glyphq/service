@@ -140,6 +140,7 @@ pub struct WebhookConfig {
     pub allow_private: bool,
     pub cipher: Option<UrlCipher>,
     pub mempool_max_attempts: u8,
+    pub mempool_expiry_ticks: u32,
 }
 
 impl WebhookConfig {
@@ -149,7 +150,8 @@ impl WebhookConfig {
             max_attempts: env_u64("WEBHOOK_MAX_ATTEMPTS", 6).clamp(1, 100) as u32,
             allow_private: env_flag("WEBHOOK_ALLOW_PRIVATE"),
             cipher: UrlCipher::from_env(),
-            mempool_max_attempts: 10,
+            mempool_max_attempts: env_u64("MEMPOOL_MAX_ATTEMPTS", 10).clamp(1, 255) as u8,
+            mempool_expiry_ticks: env_u64("MEMPOOL_EXPIRY_TICKS", 10).min(1_000_000) as u32,
         }
     }
 }
@@ -354,7 +356,7 @@ impl Webhooks {
         if webhooks.is_empty() {
             return Ok(());
         }
-        let payload = delivery_payload(event, entry);
+        let payload = delivery_payload(event, entry, self.config.mempool_expiry_ticks);
         let now = Utc::now();
         for webhook in webhooks {
             if !webhook_matches(&webhook, event, &entry.hash, &entry.source) {
@@ -589,10 +591,10 @@ impl Webhooks {
 
 /// JSON body sent to a webhook endpoint. It is stored on the delivery row so
 /// every retry sends byte-identical content.
-pub fn delivery_payload(event: &str, entry: &MempoolEntry) -> String {
+pub fn delivery_payload(event: &str, entry: &MempoolEntry, expiry_ticks: u32) -> String {
     json!({
         "event": event,
-        "transaction": crate::mempool::entry_json(entry),
+        "transaction": crate::mempool::entry_json(entry, expiry_ticks),
     })
     .to_string()
 }
@@ -961,10 +963,12 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
-        let payload = delivery_payload("transaction.queued", &entry);
+        let payload = delivery_payload("transaction.queued", &entry, 10);
         let value: Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(value["event"], "transaction.queued");
         assert_eq!(value["transaction"]["hash"], "ab");
+        assert_eq!(value["transaction"]["target_tick"], 9);
+        assert_eq!(value["transaction"]["expiry_tick"], 19);
     }
 
     #[test]
