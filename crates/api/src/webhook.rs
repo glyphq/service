@@ -809,12 +809,7 @@ async fn deliveries(
     axum::extract::Query(params): axum::extract::Query<DeliveryQuery>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
     let service = service(&state)?;
-    if !service
-        .gateway
-        .webhook(&id)
-        .await?
-        .is_some_and(|webhook| webhook.active)
-    {
+    if service.gateway.webhook(&id).await?.is_none() {
         return Err(ApiError::not_found(format!("webhook {id} does not exist")));
     }
     let limit = params.limit.unwrap_or(50).clamp(1, 500);

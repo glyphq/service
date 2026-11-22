@@ -566,7 +566,7 @@ impl GatewayStore {
             .client
             .query(
                 "SELECT count() AS n FROM (\
-                     SELECT status FROM webhook_deliveries \
+                     SELECT webhook_id, status FROM webhook_deliveries \
                      ORDER BY version DESC LIMIT 1 BY id\
                  ) WHERE webhook_id = ? AND status = 'pending'",
             )
