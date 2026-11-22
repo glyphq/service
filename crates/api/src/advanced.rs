@@ -432,6 +432,7 @@ async fn validate(
                 "destination": qubic::PublicKey(transaction.destination).to_identity(),
                 "amount": transaction.amount,
                 "tick": transaction.tick,
+                "target_tick": transaction.tick,
                 "input_type": transaction.input_type,
                 "input_data": hex::encode(&transaction.input),
                 "input_bytes": transaction.input.len(),
