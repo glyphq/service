@@ -624,6 +624,23 @@ fn paths() -> Value {
                     }
                 }
             },
+            "/v1/identities/{identity}/assets": {
+                "get": {
+                    "operationId": "listIdentityAssets",
+                    "tags": ["Identities"],
+                    "summary": "List identity assets",
+                    "description": "Live issued, owned, and possessed asset records from a peer. Not cached.",
+                    "parameters": [
+                        identity_param(),
+                        { "name": "kind", "in": "query", "schema": { "type": "string", "enum": ["all", "issued", "owned", "possessed"], "default": "all" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Asset holdings grouped by relationship", "content": { "application/json": { "schema": { "type": "object" } } } },
+                        "400": { "description": "Invalid identity or kind" },
+                        "503": { "description": "No peer configured or peer lookup failed" }
+                    }
+                }
+            },
             "/v1/identities/{identity}/activity": {
                 "get": {
                     "operationId": "getIdentityActivity",
@@ -2105,6 +2122,7 @@ mod tests {
             "/v1/identities",
             "/v1/identities/{identity}",
             "/v1/identities/{identity}/transactions",
+            "/v1/identities/{identity}/assets",
             "/v1/identities/{identity}/activity",
             "/v1/identities/{identity}/counterparties",
             "/v1/identities/{identity}/flow",

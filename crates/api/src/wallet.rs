@@ -35,6 +35,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/wallets/{identity}", get(wallet))
         .route("/v1/wallets/{identity}/assets", get(wallet_assets))
+        .route("/v1/identities/{identity}/assets", get(wallet_assets))
         .route("/v1/live/wallets/{identity}", get(wallet_snapshot))
         .route("/v1/assets/{issuer}/{name}/holders", get(asset_holders))
         .route("/v1/assets/{issuer}/{name}/transfers", get(asset_transfers))

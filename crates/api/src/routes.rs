@@ -819,7 +819,13 @@ async fn identity(
         Json(json!({
             "data": row,
             "meta": {
-                "notice": "balance is the net QU flow observed in the indexed epoch range"
+                "notice": "balance is the net QU flow observed in the indexed epoch range",
+                "links": {
+                    "wallet": format!("/v1/wallets/{identity}"),
+                    "assets": format!("/v1/identities/{identity}/assets"),
+                    "live": format!("/v1/live/wallets/{identity}"),
+                    "transactions": format!("/v1/identities/{identity}/transactions")
+                }
             }
         })),
     ))
@@ -1182,6 +1188,7 @@ pub async fn docs() -> Html<&'static str> {
 <li><code>GET /v1/identities?limit=&amp;cursor=</code></li>
 <li><code>GET /v1/identities/{identity}</code></li>
 <li><code>GET /v1/identities/{identity}/transactions?limit=&amp;cursor=</code></li>
+<li><code>GET /v1/identities/{identity}/assets?kind=</code></li>
 <li><code>GET /v1/assets?issuer=&amp;limit=&amp;cursor=</code></li>
 <li><code>GET /v1/assets/{issuer}/{name}</code></li>
 <li><code>GET /v1/assets/{issuer}/{name}/holders?limit=</code></li>

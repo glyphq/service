@@ -946,7 +946,13 @@ Identity summary derived from indexed QU transfer events.
     "last_seen_tick": 91916480
   },
   "meta": {
-    "notice": "balance is the net QU flow observed in the indexed epoch range"
+    "notice": "balance is the net QU flow observed in the indexed epoch range",
+    "links": {
+      "wallet": "/v1/wallets/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK",
+      "assets": "/v1/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK/assets",
+      "live": "/v1/live/wallets/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK",
+      "transactions": "/v1/identities/BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK/transactions"
+    }
   }
 }
 ```
@@ -957,6 +963,37 @@ Identity summary derived from indexed QU transfer events.
 - `balance` is the net QU flow over the indexed epoch range. It is not a
   spectrum snapshot and does not include balances from unindexed history.
 - `first_seen_tick` and `last_seen_tick` are bounded by the indexed range.
+
+### `GET /v1/identities/{identity}/assets`
+
+Live asset relationships from a peer, grouped as `issued`, `owned`, and
+`possessed`. `kind` selects one group or `all` (default). The response is not
+cached because it reads peer state directly.
+
+```json
+{
+  "data": {
+    "identity": "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK",
+    "issued": [
+      { "issuer": "BZBQ...EXK", "name": "QX", "decimals": 0, "unit": "", "shares": 1000 }
+    ],
+    "owned": [
+      { "issuer": "BZBQ...EXK", "name": "QX", "owner": "BZBQ...EXK", "shares": 1000 }
+    ],
+    "possessed": [
+      { "issuer": "BZBQ...EXK", "name": "QX", "possessor": "BZBQ...EXK", "shares": 1000 }
+    ]
+  },
+  "meta": {
+    "source": "peer",
+    "kind": "all",
+    "counts": { "issued": 1, "owned": 1, "possessed": 1 }
+  }
+}
+```
+
+This is the same data as `GET /v1/wallets/{identity}/assets`, exposed under the
+identity resource so account pages do not need a second resource family.
 
 ### `GET /v1/search?q=`
 
