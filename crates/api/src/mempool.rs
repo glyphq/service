@@ -127,7 +127,12 @@ impl Mempool {
         if let Some(existing) = self.gateway.mempool_entry(&hash).await? {
             return Ok(existing);
         }
-        if self.gateway.open_mempool_count().await? >= self.config.max_entries as u64 {
+        if self
+            .gateway
+            .open_mempool_count(self.config.max_attempts)
+            .await?
+            >= self.config.max_entries as u64
+        {
             return Err(ApiError {
                 status: StatusCode::TOO_MANY_REQUESTS,
                 code: "mempool_full",
@@ -264,7 +269,10 @@ impl Mempool {
     }
 
     async fn tick(&self) -> Result<(), ApiError> {
-        let entries = self.gateway.open_mempool_entries(500).await?;
+        let entries = self
+            .gateway
+            .open_mempool_entries(500, self.config.max_attempts)
+            .await?;
         if entries.is_empty() {
             return Ok(());
         }

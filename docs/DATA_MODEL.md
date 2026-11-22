@@ -453,16 +453,18 @@ CREATE TABLE IF NOT EXISTS glyph.mempool
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY hash
+TTL updated_at + INTERVAL 7 DAY DELETE
+    WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')
 ```
 
 `raw` is retained so a retry can rebroadcast without asking the client again. `tick` is the
 transaction's target tick and `peers` is the requested fan-out. `status` is one of
 `queued`, `broadcast`, `confirmed`, `expired`, `failed`, or `cancelled`. `queued`,
-`broadcast`, and `failed` are open and still tracked; the others are terminal. Optional
-timestamps and counters use `0` as a sentinel rather than ClickHouse `Nullable` columns,
-so `broadcast_at`, `confirmed_at`, and `confirmed_tick` are `0` when unset. An entry
-expires when the indexed head is greater than `tick + MEMPOOL_EXPIRY_TICKS` and the hash is
-still absent from the index.
+`broadcast`, and `failed` with attempts remaining are open and still tracked; the others
+are terminal. Optional timestamps and counters use `0` as a sentinel rather than ClickHouse
+`Nullable` columns, so `broadcast_at`, `confirmed_at`, and `confirmed_tick` are `0` when
+unset. An entry expires when the indexed head is greater than
+`tick + MEMPOOL_EXPIRY_TICKS` and the hash is still absent from the index.
 
 ```sql
 CREATE TABLE IF NOT EXISTS glyph.webhooks
@@ -480,6 +482,7 @@ CREATE TABLE IF NOT EXISTS glyph.webhooks
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY id
+TTL updated_at + INTERVAL 30 DAY DELETE WHERE active = 0
 ```
 
 `events` and `transaction_hashes` are JSON-encoded arrays in a `String` column. An empty
@@ -506,6 +509,8 @@ CREATE TABLE IF NOT EXISTS glyph.webhook_deliveries
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY id
+TTL created_at + INTERVAL 7 DAY DELETE
+    WHERE status IN ('delivered', 'failed')
 ```
 
 A delivery row is updated in place (with a new version) across retries. `status` is
@@ -514,7 +519,13 @@ A delivery row is updated in place (with a new version) across retries. `status`
 1 s, 2 s, 4 s, ... backoff capped at 60 s and stop after `WEBHOOK_MAX_ATTEMPTS`.
 
 These tables are created by `Store::init`/`glyph db-init` alongside the canonical schema,
-not by a separate gateway migration.
+not by a separate gateway migration. Startup also applies `ALTER TABLE ... MODIFY TTL` so
+existing deployments pick up retention without a manual migration.
+
+Retention is intentionally conservative: terminal mempool entries and delivered or
+dead-lettered deliveries are removed after 7 days, and inactive webhooks after 30 days.
+Open mempool entries and pending deliveries are never removed by TTL. ClickHouse evaluates
+TTL during background merges, so deletion is eventual rather than immediate.
 
 ## Invariants
 

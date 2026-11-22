@@ -332,6 +332,11 @@ dispatcher. They are operational state, not consensus.
    `WEBHOOK_MAX_ATTEMPTS`, then are recorded as `failed` (dead-lettered). Delivery is
    at-least-once.
 
+ClickHouse TTL clauses keep the gateway tables bounded. Terminal mempool entries and
+delivered or dead-lettered deliveries expire after 7 days, and inactive webhooks after
+30 days. Open mempool entries and pending deliveries are excluded, so TTL never drops
+work the tracker or dispatcher still needs.
+
 The loops run inside every API replica. Sharing ClickHouse keeps status consistent, but
 two replicas can both dispatch the same event. Run one dispatcher or accept duplicate
 deliveries. Losing the gateway tables loses only pending operational state, never chain

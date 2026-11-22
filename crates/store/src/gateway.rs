@@ -365,6 +365,9 @@ impl GatewayStore {
         for statement in create_statements(&self.database) {
             self.client.query(&statement).execute().await?;
         }
+        for statement in retention_statements(&self.database) {
+            self.client.query(&statement).execute().await?;
+        }
         Ok(())
     }
 
@@ -454,16 +457,22 @@ impl GatewayStore {
     }
 
     /// Entries the background tracker should still consider, oldest first.
-    pub async fn open_mempool_entries(&self, limit: u32) -> Result<Vec<MempoolEntry>> {
+    pub async fn open_mempool_entries(
+        &self,
+        limit: u32,
+        max_attempts: u8,
+    ) -> Result<Vec<MempoolEntry>> {
         let rows = self
             .client
             .query(
                 "SELECT ?fields FROM (\
                      SELECT * FROM mempool \
                      ORDER BY version DESC LIMIT 1 BY hash\
-                 ) WHERE status IN ('queued', 'broadcast', 'failed') \
+                 ) WHERE (status IN ('queued', 'broadcast') \
+                     OR (status = 'failed' AND attempts < ?)) \
                  ORDER BY created_at ASC LIMIT ?",
             )
+            .bind(max_attempts)
             .bind(limit.clamp(1, 10_000))
             .fetch_all::<MempoolRow>()
             .await?;
@@ -471,15 +480,17 @@ impl GatewayStore {
     }
 
     /// Number of open entries, used to enforce `MEMPOOL_MAX_ENTRIES`.
-    pub async fn open_mempool_count(&self) -> Result<u64> {
+    pub async fn open_mempool_count(&self, max_attempts: u8) -> Result<u64> {
         let row = self
             .client
             .query(
                 "SELECT count() AS n FROM (\
-                     SELECT status FROM mempool \
+                     SELECT status, attempts FROM mempool \
                      ORDER BY version DESC LIMIT 1 BY hash\
-                 ) WHERE status IN ('queued', 'broadcast', 'failed')",
+                 ) WHERE (status IN ('queued', 'broadcast') \
+                     OR (status = 'failed' AND attempts < ?))",
             )
+            .bind(max_attempts)
             .fetch_one::<CountRow>()
             .await?;
         Ok(row.n)
@@ -601,7 +612,9 @@ fn create_statements(database: &str) -> Vec<String> {
                  version UInt64\n\
              )\n\
              ENGINE = ReplacingMergeTree(version)\n\
-             ORDER BY hash"
+             ORDER BY hash\n\
+             TTL updated_at + INTERVAL 7 DAY DELETE \
+                 WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {database}.webhooks\n(\n\
@@ -617,7 +630,8 @@ fn create_statements(database: &str) -> Vec<String> {
                  version UInt64\n\
              )\n\
              ENGINE = ReplacingMergeTree(version)\n\
-             ORDER BY id"
+             ORDER BY id\n\
+             TTL updated_at + INTERVAL 30 DAY DELETE WHERE active = 0"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {database}.webhook_deliveries\n(\n\
@@ -635,7 +649,27 @@ fn create_statements(database: &str) -> Vec<String> {
                  version UInt64\n\
              )\n\
              ENGINE = ReplacingMergeTree(version)\n\
-             ORDER BY id"
+             ORDER BY id\n\
+             TTL created_at + INTERVAL 7 DAY DELETE \
+                 WHERE status IN ('delivered', 'failed')"
+        ),
+    ]
+}
+
+/// Applies retention to tables created before the TTL clauses were added.
+fn retention_statements(database: &str) -> Vec<String> {
+    vec![
+        format!(
+            "ALTER TABLE {database}.mempool MODIFY TTL updated_at + INTERVAL 7 DAY DELETE \
+             WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')"
+        ),
+        format!(
+            "ALTER TABLE {database}.webhooks MODIFY TTL updated_at + INTERVAL 30 DAY DELETE \
+             WHERE active = 0"
+        ),
+        format!(
+            "ALTER TABLE {database}.webhook_deliveries MODIFY TTL created_at + INTERVAL 7 DAY \
+             DELETE WHERE status IN ('delivered', 'failed')"
         ),
     ]
 }
@@ -666,6 +700,23 @@ mod tests {
         assert!(statements.contains("created_at DateTime64(3, 'UTC')"));
         assert!(statements.contains("ORDER BY hash"));
         assert!(statements.contains("ORDER BY id"));
+        assert_eq!(statements.matches("TTL ").count(), 3);
+        assert!(
+            statements.contains("WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')")
+        );
+        assert!(statements.contains("WHERE active = 0"));
+        assert!(statements.contains("WHERE status IN ('delivered', 'failed')"));
+    }
+
+    #[test]
+    fn retention_statements_apply_to_existing_tables() {
+        let statements = retention_statements("glyph").join("\n");
+        for table in ["mempool", "webhooks", "webhook_deliveries"] {
+            assert!(
+                statements.contains(&format!("ALTER TABLE glyph.{table} MODIFY TTL")),
+                "missing retention for {table}"
+            );
+        }
     }
 
     #[test]
