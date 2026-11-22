@@ -1608,8 +1608,9 @@ applies TTL during merges, but it never holds a capacity slot.
 ### Webhooks
 
 Webhooks push tracked transaction state changes to an HTTP or HTTPS endpoint.
-They are the supported notification path; polling the lifecycle route is enough
-for a single client.
+Each event is delivered with one POST attempt, with no retries. They are the
+supported notification path; polling the lifecycle route is enough for a single
+client.
 
 #### `POST /v1/webhooks`
 
@@ -1630,9 +1631,8 @@ empty or omitted `events` list subscribes to every transaction event. Empty
 `transaction_hashes` means all hashes. Empty `identity` means all source
 identities; a non-empty value matches only the transaction source.
 
-`transaction.failed` is terminal and is emitted only after
-`MEMPOOL_MAX_ATTEMPTS` is exhausted. A broadcast attempt that reaches no peer
-while attempts remain stays in the retry path without a terminal event.
+`transaction.failed` is terminal and is emitted only after the tracker's
+`MEMPOOL_MAX_ATTEMPTS` is exhausted.
 
 Returns `201` with the registration. Neither the secret nor the full URL is
 returned: `url_hint` keeps only the scheme and host (`https://example.com/***`),
@@ -1652,8 +1652,9 @@ the number returned.
 #### `DELETE /v1/webhooks/{id}`
 
 Deactivates a registration and returns the updated record without its secret or
-full URL. Already queued deliveries are still attempted; new events stop
+full URL. Already queued deliveries are still attempted once; new events stop
 matching. Closed registrations are deleted once their deliveries are terminal.
+Deleting a registration also deletes its delivery rows.
 
 Transaction-scoped registrations (`transaction_hashes` non-empty) close
 automatically after `transaction.confirmed`, `transaction.expired`,
@@ -1664,8 +1665,8 @@ subscriptions.
 
 #### `GET /v1/webhooks/{id}/deliveries`
 
-Recent deliveries, newest first. Each row tracks one delivery across retries. Optional
-`limit` is clamped to `1..500` (default `50`).
+Recent deliveries, newest first. Each row is one event with one POST attempt.
+Optional `limit` is clamped to `1..500` (default `50`).
 
 ```json
 {
@@ -1688,26 +1689,25 @@ Recent deliveries, newest first. Each row tracks one delivery across retries. Op
 }
 ```
 
-`status` is `pending`, `delivered`, or `failed`. `attempt` counts completed
-attempts and `next_attempt_at` is set while a retry is scheduled. `payload` is
-the exact JSON body sent to the receiver, retained so retries are
-byte-identical. Delivery is at-least-once: retries use a 1 s, 2 s, 4 s, ...
-backoff capped at 60 s and stop after `WEBHOOK_MAX_ATTEMPTS`, at which point the
-row becomes `failed`. A non-2xx response or a timeout counts as a failed
-attempt. `WEBHOOK_TIMEOUT_MS` bounds each request.
+`status` is `pending`, `sending`, `delivered`, or `failed`. `attempt` is `1`
+once claimed. `next_attempt_at` is null after an outcome and briefly carries
+the claim time while a request is in flight. `payload` is the exact JSON body
+sent to the receiver. A non-2xx response, timeout, or transport error is a
+final `failed` outcome. `WEBHOOK_TIMEOUT_MS` bounds the request. There are no
+retries.
 
 Delivery headers:
 
 | Header | Meaning |
 | --- | --- |
 | `X-Glyph-Event` | Event name, for example `transaction.confirmed`. |
-| `X-Glyph-Delivery` | Unique delivery id, stable across retries. Use it for receiver-side deduplication. |
+| `X-Glyph-Delivery` | Unique delivery id. Use it for receiver-side deduplication. |
 | `X-Glyph-Timestamp` | Unix seconds when the request was signed. |
 | `X-Glyph-Signature` | `sha256=<hex HMAC-SHA256 of "{timestamp}.{body}">`. |
 
 The body is a JSON object with `event` and a `transaction` object carrying the
 tracked transaction fields, including `hash`, `target_tick`, and `expiry_tick`.
-It is stored on the delivery row and replayed byte-for-byte on retries.
+It is stored on the delivery row.
 
 Verify the signature over the exact bytes received, compare in constant time,
 and reject stale timestamps. Example in Node:
@@ -1739,15 +1739,15 @@ Security caveats:
   `WEBHOOK_ALLOW_PRIVATE=true` removes that protection. Do not enable it on a
   public deployment unless clients are trusted.
 - The secret is a credential. Never log it, return it, or reuse it across
-  receivers. It is stored in ClickHouse so the dispatcher can sign retries;
+  receivers. It is stored in ClickHouse so the dispatcher can sign deliveries;
   protect database credentials and backups accordingly.
-- Delivery is at-least-once and retries can repeat an event. Deduplicate with
-  `X-Glyph-Delivery` or by `(transaction_hash, event)`.
+- Delivery is one POST per event. A process crash can still leave the final
+  outcome unwritten, so deduplicate with `X-Glyph-Delivery` or by
+  `(transaction_hash, event)` if the receiver needs idempotency.
 - Reject timestamps outside a short window to limit replay of a captured
   request.
 - Running more than one API replica with webhooks enabled can duplicate
-  deliveries because each replica runs its own dispatcher. Use one dispatcher
-  or accept at-least-once delivery.
+  deliveries because each replica runs its own dispatcher. Use one dispatcher.
 
 ### `GET /v1/ticks/{tick}/raw`
 
@@ -1902,8 +1902,7 @@ current surface.
 | `MEMPOOL_EXPIRY_TICKS` | `10` | Expiry window after the target tick. |
 | `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open tracked transactions. |
 | `MEMPOOL_MAX_PER_SOURCE` | `100` | Maximum open tracked transactions per source identity. |
-| `WEBHOOK_TIMEOUT_MS` | `5000` | Webhook delivery timeout. |
-| `WEBHOOK_MAX_ATTEMPTS` | `6` | Delivery attempts before dead-lettering. |
+| `WEBHOOK_TIMEOUT_MS` | `5000` | Webhook request timeout. Each event is attempted once. |
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private webhook targets. |
 | `WEBHOOK_ENCRYPTION_KEY` | unset | 32-byte hex or base64 key for webhook URL encryption at rest. |
 | `STREAM_POLL_MS` | `1000` | Index-head poll interval for the stream hub. |

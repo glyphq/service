@@ -2,8 +2,9 @@
 //!
 //! Webhooks are operational state: a registration binds a URL and an HMAC
 //! secret to a set of events and optional transaction hashes. The dispatcher
-//! persists every attempt in `webhook_deliveries`, retries with exponential
-//! backoff, and dead-letters after `WEBHOOK_MAX_ATTEMPTS`.
+//! sends each event once and records the outcome in `webhook_deliveries`.
+//! There are no retries. A transaction-scoped registration closes after a
+//! terminal event and is deleted once its deliveries have finished.
 //!
 //! Signing is `X-Glyph-Signature: sha256=<hex hmac of "{timestamp}.{body}">`.
 //! Consumers should recompute the HMAC with the shared secret and reject a
@@ -26,7 +27,7 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -136,7 +137,6 @@ fn decode_key(raw: &str) -> Option<[u8; 32]> {
 #[derive(Debug, Clone)]
 pub struct WebhookConfig {
     pub timeout: Duration,
-    pub max_attempts: u32,
     pub allow_private: bool,
     pub cipher: Option<UrlCipher>,
     pub mempool_max_attempts: u8,
@@ -147,7 +147,6 @@ impl WebhookConfig {
     pub fn from_env() -> Self {
         Self {
             timeout: Duration::from_millis(env_u64("WEBHOOK_TIMEOUT_MS", 5_000)),
-            max_attempts: env_u64("WEBHOOK_MAX_ATTEMPTS", 6).clamp(1, 100) as u32,
             allow_private: env_flag("WEBHOOK_ALLOW_PRIVATE"),
             cipher: UrlCipher::from_env(),
             mempool_max_attempts: env_u64("MEMPOOL_MAX_ATTEMPTS", 10).clamp(1, 255) as u8,
@@ -453,6 +452,7 @@ impl Webhooks {
     }
 
     async fn dispatch_due(&self) -> Result<(), ApiError> {
+        self.recover_stale_sending().await?;
         let due = self.gateway.due_deliveries(Utc::now(), 50).await?;
         for delivery in due {
             if let Err(error) = self.attempt(delivery).await {
@@ -460,6 +460,24 @@ impl Webhooks {
             }
         }
         self.purge_consumed().await?;
+        Ok(())
+    }
+
+    /// A delivery is claimed before its POST. If the process dies between the
+    /// claim and the outcome write, mark it failed without sending again.
+    async fn recover_stale_sending(&self) -> Result<(), ApiError> {
+        let grace = TimeDelta::from_std(self.config.timeout + Duration::from_secs(30))
+            .unwrap_or_else(|_| TimeDelta::seconds(60));
+        let before = Utc::now() - grace;
+        for delivery in self.gateway.stale_sending_deliveries(before, 50).await? {
+            self.finish(
+                delivery,
+                "failed",
+                None,
+                Some("delivery interrupted; not retried".to_owned()),
+            )
+            .await?;
+        }
         Ok(())
     }
 
@@ -473,8 +491,8 @@ impl Webhooks {
         Ok(())
     }
 
-    /// Sends one delivery and persists the outcome. Retryable failures stay
-    /// `pending` with a backoff; exhausted attempts become `failed`.
+    /// Claims one delivery, sends one POST, and persists the outcome.
+    /// Non-2xx responses, timeouts, and transport errors are final failures.
     async fn attempt(&self, delivery: WebhookDelivery) -> Result<(), ApiError> {
         let Some(webhook) = self.gateway.webhook(&delivery.webhook_id).await? else {
             return self
@@ -486,6 +504,7 @@ impl Webhooks {
                 )
                 .await;
         };
+        self.claim(&delivery).await?;
         let timestamp = Utc::now().timestamp().to_string();
         let signature = signature_header(&webhook.secret, &timestamp, &delivery.payload);
         let target = match self.target(&webhook) {
@@ -520,42 +539,29 @@ impl Webhooks {
             }
             Ok(response) => {
                 let status = response.status();
-                self.retry_or_fail(delivery, Some(status.as_u16()), format!("HTTP {status}"))
+                self.finish(
+                    delivery,
+                    "failed",
+                    Some(status.as_u16()),
+                    Some(format!("HTTP {status}")),
+                )
+                .await
+            }
+            Err(error) => {
+                self.finish(delivery, "failed", None, Some(error.to_string()))
                     .await
             }
-            Err(error) => self.retry_or_fail(delivery, None, error.to_string()).await,
         }
     }
 
-    async fn retry_or_fail(
-        &self,
-        delivery: WebhookDelivery,
-        response_status: Option<u16>,
-        error: String,
-    ) -> Result<(), ApiError> {
-        let attempt = delivery.attempt.saturating_add(1);
-        if attempt >= self.config.max_attempts {
-            return self
-                .finish_with_attempt(
-                    delivery,
-                    "failed",
-                    response_status,
-                    Some(error),
-                    attempt,
-                    None,
-                )
-                .await;
-        }
-        let next = Utc::now() + retry_delay(attempt);
-        self.finish_with_attempt(
-            delivery,
-            "pending",
-            response_status,
-            Some(error),
-            attempt,
-            Some(next),
-        )
-        .await
+    /// Persist the claim before the network call so a restart cannot replay it.
+    async fn claim(&self, delivery: &WebhookDelivery) -> Result<(), ApiError> {
+        let mut claimed = delivery.clone();
+        claimed.status = "sending".to_owned();
+        claimed.attempt = 1;
+        claimed.next_attempt_at = Some(Utc::now());
+        self.gateway.insert_delivery(&claimed).await?;
+        Ok(())
     }
 
     async fn finish(
@@ -565,32 +571,19 @@ impl Webhooks {
         response_status: Option<u16>,
         error: Option<String>,
     ) -> Result<(), ApiError> {
-        let attempt = delivery.attempt.saturating_add(1);
-        self.finish_with_attempt(delivery, status, response_status, error, attempt, None)
-            .await
-    }
-
-    async fn finish_with_attempt(
-        &self,
-        mut delivery: WebhookDelivery,
-        status: &str,
-        response_status: Option<u16>,
-        error: Option<String>,
-        attempt: u32,
-        next: Option<chrono::DateTime<Utc>>,
-    ) -> Result<(), ApiError> {
+        let mut delivery = delivery;
         delivery.status = status.to_owned();
         delivery.response_status = response_status;
         delivery.error = error;
-        delivery.attempt = attempt;
-        delivery.next_attempt_at = next;
+        delivery.attempt = delivery.attempt.max(1);
+        delivery.next_attempt_at = None;
         self.gateway.insert_delivery(&delivery).await?;
         Ok(())
     }
 }
 
 /// JSON body sent to a webhook endpoint. It is stored on the delivery row so
-/// every retry sends byte-identical content.
+/// the exact payload remains auditable.
 pub fn delivery_payload(event: &str, entry: &MempoolEntry, expiry_ticks: u32) -> String {
     json!({
         "event": event,
@@ -740,15 +733,6 @@ pub fn sign_payload(secret: &str, timestamp: &str, body: &str) -> String {
 /// Full `X-Glyph-Signature` header value.
 pub fn signature_header(secret: &str, timestamp: &str, body: &str) -> String {
     format!("sha256={}", sign_payload(secret, timestamp, body))
-}
-
-fn retry_delay(attempt: u32) -> chrono::TimeDelta {
-    // 1s, 2s, 4s, 8s, ... capped at 60s.
-    let seconds = 1u64
-        .checked_shl(attempt.saturating_sub(1).min(6))
-        .unwrap_or(64)
-        .min(60);
-    chrono::TimeDelta::seconds(i64::try_from(seconds).unwrap_or(60))
 }
 
 pub fn router() -> Router<AppState> {
@@ -969,14 +953,6 @@ mod tests {
         assert_eq!(value["transaction"]["hash"], "ab");
         assert_eq!(value["transaction"]["target_tick"], 9);
         assert_eq!(value["transaction"]["expiry_tick"], 19);
-    }
-
-    #[test]
-    fn retry_delay_grows_then_caps() {
-        assert_eq!(retry_delay(1).num_seconds(), 1);
-        assert_eq!(retry_delay(2).num_seconds(), 2);
-        assert_eq!(retry_delay(3).num_seconds(), 4);
-        assert_eq!(retry_delay(20).num_seconds(), 60);
     }
 
     #[test]

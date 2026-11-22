@@ -115,7 +115,7 @@ fn data_envelope(schema: &str) -> Value {
 fn info() -> Value {
     json!({
         "title": "Glyph API",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "summary": "Verified Qubic chain data.",
         "x-logo": { "url": "/logo.png", "altText": "Glyph" },
         "description": "Glyph indexes Qubic directly from peers and verifies quorum evidence.\n\n- `/v1` reads persisted, verified history.\n- `POST /v1/transactions` submits signed bytes and tracks them internally.\n- Signed webhooks report terminal transaction state; a broadcast is not confirmation.\n- `/v1/network` reads live peer state such as system info, revenue, and oracles.\n- `/v1/live` exposes raw peer operations.\n- JSON responses use `data` and `meta`; errors use RFC 9457 problem documents.\n\nAmounts are integer QU. Identities are uppercase base-26; hashes are lowercase base-26."
@@ -1095,7 +1095,7 @@ fn paths() -> Value {
                     "operationId": "registerWebhook",
                     "tags": ["Webhooks"],
                     "summary": "Register webhook",
-                    "description": "Signed at-least-once delivery for tracked transaction events. Secrets and full URLs are never returned.",
+                    "description": "Signed single-attempt delivery for tracked transaction events. Secrets and full URLs are never returned.",
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookRegistration" } } }
@@ -1124,7 +1124,7 @@ fn paths() -> Value {
                     "operationId": "listWebhookDeliveries",
                     "tags": ["Webhooks"],
                     "summary": "List deliveries",
-                    "description": "Delivery attempts, newest first.",
+                    "description": "Delivery outcomes, newest first. Each event is attempted once.",
                     "parameters": [
                         { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
                         { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 } }
@@ -1305,9 +1305,9 @@ fn schemas() -> Value {
                         "webhook_id": { "type": "string" },
                         "event": { "type": "string", "enum": ["transaction.queued", "transaction.broadcast", "transaction.confirmed", "transaction.expired", "transaction.failed"] },
                         "transaction_hash": { "type": "string" },
-                        "status": { "type": "string", "enum": ["pending", "delivered", "failed"] },
-                        "attempt": { "type": "integer", "description": "Completed attempts." },
-                        "next_attempt_at": { "type": ["string", "null"], "format": "date-time" },
+                        "status": { "type": "string", "enum": ["pending", "sending", "delivered", "failed"] },
+                        "attempt": { "type": "integer", "description": "0 before claim, 1 after the single attempt." },
+                        "next_attempt_at": { "type": ["string", "null"], "format": "date-time", "description": "Null after an outcome. A claimed row briefly carries the claim time." },
                         "response_status": { "type": ["integer", "null"], "description": "Receiver HTTP status." },
                         "error": { "type": ["string", "null"] },
                         "payload": { "type": "string", "description": "Exact JSON body." },
@@ -2091,7 +2091,7 @@ mod tests {
     fn spec_is_openapi_31_and_covers_routes() {
         let spec = spec();
         assert_eq!(spec["openapi"], "3.1.0");
-        assert_eq!(spec["info"]["version"], "0.5.0");
+        assert_eq!(spec["info"]["version"], "0.6.0");
         let paths = spec["paths"].as_object().expect("paths object");
         for path in [
             "/healthz",

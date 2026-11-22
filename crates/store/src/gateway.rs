@@ -568,7 +568,7 @@ impl GatewayStore {
                 "SELECT count() AS n FROM (\
                      SELECT webhook_id, status FROM webhook_deliveries \
                      ORDER BY version DESC LIMIT 1 BY id\
-                 ) WHERE webhook_id = ? AND status = 'pending'",
+                ) WHERE webhook_id = ? AND status IN ('pending', 'sending')",
             )
             .bind(webhook_id)
             .fetch_one::<CountRow>()
@@ -579,6 +579,14 @@ impl GatewayStore {
     pub async fn delete_webhook(&self, id: &str) -> Result<()> {
         self.client
             .query("ALTER TABLE webhooks DELETE WHERE id = ? SETTINGS mutations_sync = 2")
+            .bind(id)
+            .execute()
+            .await?;
+        self.client
+            .query(
+                "ALTER TABLE webhook_deliveries DELETE WHERE webhook_id = ? \
+                 SETTINGS mutations_sync = 2",
+            )
             .bind(id)
             .execute()
             .await?;
@@ -629,6 +637,28 @@ impl GatewayStore {
                  ORDER BY next_attempt_at ASC LIMIT ?",
             )
             .bind(millis(Some(now)))
+            .bind(limit.clamp(1, 500))
+            .fetch_all::<DeliveryRow>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Deliveries claimed by a dispatcher that never wrote an outcome.
+    pub async fn stale_sending_deliveries(
+        &self,
+        before: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<WebhookDelivery>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM (\
+                     SELECT * FROM webhook_deliveries \
+                     ORDER BY version DESC LIMIT 1 BY id\
+                 ) WHERE status = 'sending' AND next_attempt_at > 0 AND next_attempt_at <= ? \
+                 ORDER BY next_attempt_at ASC LIMIT ?",
+            )
+            .bind(millis(Some(before)))
             .bind(limit.clamp(1, 500))
             .fetch_all::<DeliveryRow>()
             .await?;
