@@ -136,6 +136,7 @@ pub struct WebhookConfig {
     pub max_attempts: u32,
     pub allow_private: bool,
     pub cipher: Option<UrlCipher>,
+    pub mempool_max_attempts: u8,
 }
 
 impl WebhookConfig {
@@ -145,6 +146,7 @@ impl WebhookConfig {
             max_attempts: env_u64("WEBHOOK_MAX_ATTEMPTS", 6).clamp(1, 100) as u32,
             allow_private: env_flag("WEBHOOK_ALLOW_PRIVATE"),
             cipher: UrlCipher::from_env(),
+            mempool_max_attempts: 10,
         }
     }
 }
@@ -426,7 +428,9 @@ impl Webhooks {
                     .gateway
                     .mempool_entry(hash)
                     .await?
-                    .is_some_and(|entry| is_terminal_status(entry.status));
+                    .is_some_and(|entry| {
+                        is_terminal_entry(&entry, self.config.mempool_max_attempts)
+                    });
                 if !terminal {
                     remaining.push(hash.clone());
                 }
@@ -623,6 +627,11 @@ pub fn is_terminal_status(status: MempoolStatus) -> bool {
         status,
         MempoolStatus::Confirmed | MempoolStatus::Expired | MempoolStatus::Cancelled
     )
+}
+
+pub fn is_terminal_entry(entry: &MempoolEntry, max_attempts: u8) -> bool {
+    is_terminal_status(entry.status)
+        || (entry.status == MempoolStatus::Failed && entry.attempts >= max_attempts)
 }
 
 /// Scheme and host only. The path and query can carry receiver credentials.
@@ -1035,6 +1044,31 @@ mod tests {
         ] {
             assert!(!is_terminal_status(status), "{status:?}");
         }
+    }
+
+    #[test]
+    fn exhausted_failed_entries_are_terminal() {
+        let entry = |status, attempts| MempoolEntry {
+            hash: "ab".into(),
+            raw: "00".into(),
+            source: "SRC".into(),
+            destination: "DST".into(),
+            amount: 1,
+            tick: 9,
+            peers: 8,
+            status,
+            attempts,
+            broadcast_peers: 0,
+            broadcast_at: None,
+            confirmed_at: None,
+            confirmed_tick: None,
+            error: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        assert!(!is_terminal_entry(&entry(MempoolStatus::Failed, 9), 10));
+        assert!(is_terminal_entry(&entry(MempoolStatus::Failed, 10), 10));
+        assert!(is_terminal_entry(&entry(MempoolStatus::Confirmed, 0), 10));
     }
 
     #[test]

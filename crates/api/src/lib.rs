@@ -361,7 +361,8 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         )))
     };
     let mempool_config = mempool::MempoolConfig::from_env();
-    let webhook_config = webhook::WebhookConfig::from_env();
+    let mut webhook_config = webhook::WebhookConfig::from_env();
+    webhook_config.mempool_max_attempts = mempool_config.max_attempts;
     // Operational state is optional: a deployment without ClickHouse gateway
     // storage still serves the indexed read API. `MEMPOOL_ENABLED=false`
     // skips construction entirely.
