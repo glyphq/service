@@ -51,6 +51,10 @@ pub const EVENTS: &[&str] = &[
 /// Shortest accepted signing secret.
 pub const MIN_SECRET_LEN: usize = 16;
 const ENCRYPTED_URL_PREFIX: &str = "enc:v1:";
+/// Transaction-scoped webhooks whose hash is absent from the mempool are
+/// stale after this long. The grace period covers registration before submit.
+const MISSING_ENTRY_GRACE: chrono::TimeDelta = chrono::TimeDelta::minutes(60);
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Encrypts webhook targets at rest with a deployment-provided key.
 #[derive(Clone)]
@@ -398,17 +402,21 @@ impl Webhooks {
 
     /// Background dispatcher. Polls due deliveries until cancelled.
     pub async fn run(self: Arc<Self>) {
-        if let Err(error) = self.reconcile().await {
-            tracing::warn!(?error, "webhook reconciliation failed");
-        }
         let mut interval = tokio::time::interval(Duration::from_millis(500));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
+        reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => break,
                 _ = interval.tick() => {
                     if let Err(error) = self.dispatch_due().await {
                         tracing::warn!(?error, "webhook dispatcher iteration failed");
+                    }
+                }
+                _ = reconcile.tick() => {
+                    if let Err(error) = self.reconcile().await {
+                        tracing::warn!(?error, "webhook reconciliation failed");
                     }
                 }
             }
@@ -424,14 +432,11 @@ impl Webhooks {
             }
             let mut remaining = Vec::new();
             for hash in &webhook.transaction_hashes {
-                let terminal = self
-                    .gateway
-                    .mempool_entry(hash)
-                    .await?
-                    .is_some_and(|entry| {
-                        is_terminal_entry(&entry, self.config.mempool_max_attempts)
-                    });
-                if !terminal {
+                let keep = match self.gateway.mempool_entry(hash).await? {
+                    Some(entry) => !is_terminal_entry(&entry, self.config.mempool_max_attempts),
+                    None => Utc::now() - webhook.updated_at < MISSING_ENTRY_GRACE,
+                };
+                if keep {
                     remaining.push(hash.clone());
                 }
             }
@@ -808,7 +813,12 @@ async fn deliveries(
     axum::extract::Query(params): axum::extract::Query<DeliveryQuery>,
 ) -> Result<impl axum::response::IntoResponse, ApiError> {
     let service = service(&state)?;
-    if service.gateway.webhook(&id).await?.is_none() {
+    if !service
+        .gateway
+        .webhook(&id)
+        .await?
+        .is_some_and(|webhook| webhook.active)
+    {
         return Err(ApiError::not_found(format!("webhook {id} does not exist")));
     }
     let limit = params.limit.unwrap_or(50).clamp(1, 500);

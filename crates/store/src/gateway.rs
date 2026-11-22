@@ -570,7 +570,7 @@ impl GatewayStore {
 
     pub async fn delete_webhook(&self, id: &str) -> Result<()> {
         self.client
-            .query("ALTER TABLE webhooks DELETE WHERE id = ?")
+            .query("ALTER TABLE webhooks DELETE WHERE id = ? SETTINGS mutations_sync = 2")
             .bind(id)
             .execute()
             .await?;

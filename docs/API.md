@@ -1596,7 +1596,9 @@ matching. Closed registrations are deleted once their deliveries are terminal.
 Transaction-scoped registrations (`transaction_hashes` non-empty) close
 automatically after `transaction.confirmed`, `transaction.expired`,
 `transaction.failed`, or `transaction.cancelled` is queued. A registration
-watching several hashes stays active until every hash is terminal.
+watching several hashes stays active until every hash is terminal. A hash that
+has no mempool entry is reaped once the registration is an hour old, so a
+restart cannot leave orphaned subscriptions.
 
 #### `GET /v1/webhooks/{id}/deliveries`
 

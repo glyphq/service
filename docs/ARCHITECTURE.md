@@ -339,7 +339,8 @@ work the tracker or dispatcher still needs.
 
 Transaction-scoped webhooks close when a terminal event is queued. The dispatcher
 deletes a closed registration as soon as it has no pending delivery, so failed or
-consumed subscriptions do not accumulate. Webhook targets are encrypted at rest when
+consumed subscriptions do not accumulate. A periodic reconcile reaps hashes whose
+mempool entry is gone. Webhook targets are encrypted at rest when
 `WEBHOOK_ENCRYPTION_KEY` is set, and API responses only expose a scheme-and-host hint.
 
 The loops run inside every API replica. Sharing ClickHouse keeps status consistent, but
