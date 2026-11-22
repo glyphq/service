@@ -28,7 +28,12 @@ protocol as the source of truth:
 - Live indexing from direct Qubic peers, with bounded concurrent fetch and ordered
   writes.
 - Quorum and data verification tiers. Every stored tick records the tier it reached.
-- Raw tick archive as zstd-compressed QBB1 bundles on local disk or any S3-compatible store.
+- Observed epoch boundaries persisted in `glyph.epochs`, with optional partition
+  retention via `PRUNE_KEEP_EPOCHS` or `glyph prune`.
+- Raw tick archive as zstd-compressed QBB1 bundles on local disk or any S3-compatible
+  store. Vote headers are opt-in, and the computor set is stored once per epoch.
+- Best-effort transaction mempool with status polling, retries, expiry, and signed
+  webhook delivery.
 - REST resources for ticks, transactions, events, identities, wallets, assets, epochs,
   the on-chain QUBIC/USDT price, analytics, search, and network status.
 - Explorer-shaped reads that answer a whole page in one request: transaction effects,
@@ -111,10 +116,12 @@ The API listens on `127.0.0.1:8080` by default.
 | Network | Outbound TCP | Low-latency route to peers | Qubic core peers use port `21841`; Bob peers use `21842`. |
 | Local ports | `8080`, `8123`, `8333` | Same | API, ClickHouse HTTP, S3-compatible API. All are configurable. |
 
-An epoch is 604,800 ticks. At current activity, a sizing run of 1,000 ticks measured
-about 26 MB with the schema and its projections, or roughly **16 GB per epoch**. Raw
-archiving is much larger: expect about **213 GiB per epoch uncompressed** before zstd
-compression. Size archive storage separately and enable it only when replay matters.
+Epoch length is observed, not fixed. The current network runs roughly 330k ticks per
+epoch, and Glyph records the boundary in `glyph.epochs` rather than assuming 604,800.
+At current activity, a sizing run of 1,000 ticks measured about 26 MB with the schema
+and its projections, or roughly **16 GB per epoch**. Raw archiving is much larger:
+expect about **213 GiB per epoch uncompressed** before zstd compression. Size archive
+storage separately and enable it only when replay matters.
 
 ## How ingestion works
 
@@ -161,7 +168,7 @@ The most common variables are below. The full list is in
 | `CLICKHOUSE_URL` | `http://127.0.0.1:8123` | API, CLI, store |
 | `CLICKHOUSE_DB` | `glyph` | API, CLI, store |
 | `QUBIC_PEERS` | unset | Indexer peers, live API routes, and broadcast |
-| `ALLOW_BROADCAST` | `false` | Enables `POST /v1/transactions` |
+| `ALLOW_BROADCAST` | `false` | Enables `POST /v1/transactions` and `POST /v1/mempool` |
 | `BROADCAST_PEERS` | `3` | Peers per broadcast fan-out, capped at `8` |
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval |
 | `PRICE_POLL_MS` | `60000` | Live price feed refresh interval |
@@ -171,6 +178,16 @@ The most common variables are below. The full list is in
 | `ARCHIVE_DIR` | unset | Filesystem raw archive when S3 is unset |
 | `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PREFIX` | unset | Raw archive to any S3-compatible store |
 | `ARCHIVE_FAIL_CLOSED` | `false` | Fail a tick instead of indexing when archiving fails |
+| `ARCHIVE_VOTES` | `false` | Store full vote headers in tick bundles |
+| `MEMPOOL_ENABLED` | `true` | Mempool persistence and background tracking |
+| `MEMPOOL_POLL_MS` | `1000` | Mempool status reconciliation interval |
+| `MEMPOOL_RETRY_MS` | `5000` | Minimum delay between rebroadcasts |
+| `MEMPOOL_MAX_ATTEMPTS` | `5` | Maximum broadcast attempts per entry |
+| `MEMPOOL_EXPIRY_TICKS` | `10` | Expiry window after the target tick |
+| `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open mempool entries |
+| `WEBHOOK_TIMEOUT_MS`, `WEBHOOK_MAX_ATTEMPTS` | `5000`, `6` | Webhook delivery timeout and attempt cap |
+| `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private webhook targets |
+| `PRUNE_KEEP_EPOCHS` | unset | Drop partitions older than the newest N epochs |
 
 Peer selection starts from the configured seeds. `NodePool::connect_best` picks the
 peer with the fastest handshake, and the indexer reconnects across the seed list on
@@ -214,11 +231,19 @@ curl -sS 'localhost:8080/v1/analytics/activity?interval=3600&limit=24'
 curl -sS -N 'localhost:8080/v1/stream?types=tick,event'
 curl -sS -N 'localhost:8080/v1/stream?identity=<identity>'
 
-# Validation, broadcast, archive, docs
+# Validation, broadcast, mempool, webhooks, archive, docs
 curl -sS -X POST localhost:8080/v1/transactions/validate \
   -H 'content-type: application/json' -d '{"raw":"0x..."}'
+curl -sS -X POST localhost:8080/v1/mempool \
+  -H 'content-type: application/json' -d '{"raw":"0x...","peers":3}'
+curl -sS localhost:8080/v1/mempool/<hash>
+curl -sS -X POST localhost:8080/v1/webhooks \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com/glyph","secret":"at-least-16-chars","events":["transaction.confirmed"]}'
 curl -sS -X POST localhost:8080/v1/transactions \
   -H 'content-type: application/json' -d '{"raw":"0x..."}'
+curl -sS -X POST localhost:8080/v1/transactions \
+  -H 'content-type: application/json' -d '{"raw":"0x...","direct":true}'
 curl -sS 'localhost:8080/v1/ticks/91915000/raw?section=transactions' -o tick.bin
 curl -sS localhost:8080/docs
 ```
@@ -249,11 +274,11 @@ served as QUBIC.
 | --- | --- | --- |
 | [`crates/qubic`](crates/qubic) | none | Wire framing, message payloads, identity base-26, log decoding, K12, SchnorrQ |
 | [`crates/node`](crates/node) | none | Direct TCP connections, handshake, request correlation, peer pool, bundle assembly |
-| [`crates/indexer`](crates/indexer) | none | Fetch pipeline, verification, ordered buffering, cursor checkpoints |
-| [`crates/store`](crates/store) | none | ClickHouse schema, row types, batched writer, queries |
-| [`crates/archive`](crates/archive) | none | QBB1 bundle encoding and local/S3 archive backends |
-| [`crates/api`](crates/api) | `glyph-api` | Axum router, response models, OpenAPI, pagination, streaming, search |
-| [`crates/cli`](crates/cli) | `glyph` | Operator commands: `head`, `peers`, `tick`, `sync`, `db-init`, `serve` |
+| [`crates/indexer`](crates/indexer) | none | Fetch pipeline, verification, epoch boundaries, archive policy, ordered buffering, cursor checkpoints |
+| [`crates/store`](crates/store) | none | ClickHouse schema, gateway tables, row types, batched writer, queries |
+| [`crates/archive`](crates/archive) | none | QBB1 bundle encoding, epoch computor sidecar, local/S3 archive backends |
+| [`crates/api`](crates/api) | `glyph-api` | Axum router, response models, OpenAPI, pagination, streaming, search, mempool, webhooks |
+| [`crates/cli`](crates/cli) | `glyph` | Operator commands: `head`, `peers`, `tick`, `sync`, `db-init`, `prune`, `serve` |
 
 The dependency direction is acyclic. `cli` depends on `api`, `archive`, `indexer`,
 `node`, `store`, and `qubic`. `api` depends on `archive`, `node`, `store`, and `qubic`.
@@ -284,6 +309,9 @@ cargo run -p cli --bin glyph -- sync --peer peer.example:21841 --no-verify-signa
 # Apply the ClickHouse schema
 cargo run -p cli --bin glyph -- db-init
 
+# Drop chain partitions older than the newest 54 epochs. Add --dry-run first.
+cargo run -p cli --bin glyph -- prune --keep 54 --dry-run
+
 # Serve the API
 cargo run -p cli --bin glyph -- serve
 ```
@@ -291,8 +319,15 @@ cargo run -p cli --bin glyph -- serve
 ## Operations
 
 - ClickHouse is the only hot store. Epoch partitions make retention and replay cheap.
+- Epoch boundaries are observed from peer heads and persisted in `glyph.epochs`. One
+  `glyph` database holds every epoch partition; per-epoch databases are deprecated.
+- Retention is opt-in. `PRUNE_KEEP_EPOCHS=N` drops chain partitions older than the
+  newest N epochs after a rollover, and `glyph prune --keep N [--dry-run]` does the
+  same on demand. Neither deletes archive objects, `identities`, or `price_points`.
 - The raw archive is the cold store and replay source. Each verified tick can be written
-  as a zstd-compressed QBB1 bundle before it is persisted.
+  as a zstd-compressed QBB1 bundle before it is persisted. Vote headers are omitted by
+  default (`ARCHIVE_VOTES=false`); the computor set is written once per epoch to
+  `raw/epoch=NNN/computors.bin`.
 - Log IDs are epoch-scoped. The canonical event identifier is `{epoch}:{logId}`.
 - Epochs below 240 are not indexed. Tick lookups outside the indexed range return
   `404 not_found`.

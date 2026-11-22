@@ -27,8 +27,11 @@
 //!
 //! # Object layout
 //!
-//! Keys are `raw/epoch=NNN/tick=NNNNNNNN.qbb.zst`, produced by [`object_key`].
-//! A configured S3 prefix is prepended to that path.
+//! Tick bundle keys are `raw/epoch=NNN/tick=NNNNNNNN.qbb.zst`, produced by
+//! [`object_key`]. The epoch's computor set is stored once at
+//! `raw/epoch=NNN/computors.bin`, produced by [`computor_key`], instead of
+//! being repeated in every tick bundle. A configured S3 prefix is prepended to
+//! both paths.
 //!
 //! ```
 //! # use archive::{FileArchive, RawBundle, put_bundle};
@@ -57,9 +60,106 @@ pub use bundle::{
 pub use config::{Config, DEFAULT_REGION};
 pub use digest::xxh64;
 pub use file::FileArchive;
-pub use key::{BUNDLE_SUFFIX, RAW_PREFIX, object_key, validate_key};
+pub use key::{
+    BUNDLE_SUFFIX, COMPUTORS_SUFFIX, RAW_PREFIX, computor_key, object_key, validate_key,
+};
 pub use object::{HeadObject, RawArchive, SharedArchive};
 pub use s3::S3Archive;
+
+use bytes::Bytes;
+
+/// Controls which optional sections are written into tick bundles.
+///
+/// The default policy omits full vote headers to keep the long-term archive
+/// small. Operators can opt back in with `ARCHIVE_VOTES=true`. The computor
+/// set is never repeated per tick; it is written once per epoch with
+/// [`put_computors`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ArchivePolicy {
+    /// Whether to include the `Votes` section in per-tick bundles.
+    pub include_votes: bool,
+}
+
+impl ArchivePolicy {
+    /// Policy that stores only the default sections.
+    pub const fn default_policy() -> Self {
+        Self {
+            include_votes: false,
+        }
+    }
+
+    /// Creates a policy with an explicit `include_votes` setting.
+    pub const fn new(include_votes: bool) -> Self {
+        Self { include_votes }
+    }
+
+    /// Reads `ARCHIVE_VOTES` from the process environment.
+    ///
+    /// Missing or unrecognized values fall back to the default (`false`).
+    pub fn from_env() -> Self {
+        Self::from_pairs(std::env::vars())
+    }
+
+    /// Builds a policy from key/value pairs, intended for tests.
+    ///
+    /// Only `ARCHIVE_VOTES` is read. When it appears more than once, the last
+    /// occurrence wins, matching `std::env::var` semantics for a single key.
+    pub fn from_pairs<I, K, V>(pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut policy = Self::default_policy();
+        for (key, value) in pairs {
+            if key.as_ref() == "ARCHIVE_VOTES" {
+                policy.include_votes = parse_bool(value.as_ref()).unwrap_or(false);
+            }
+        }
+        policy
+    }
+}
+
+/// Parses a human-friendly boolean. Unrecognized values return `None`.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Writes the computor set for `epoch` to its sidecar object and returns the
+/// key.
+///
+/// The payload is the encoded computor set as received from a peer. It is
+/// written once per epoch, at [`computor_key`], rather than repeated in every
+/// tick bundle.
+pub async fn put_computors<A: RawArchive + ?Sized>(
+    archive: &A,
+    epoch: u16,
+    bytes: &[u8],
+) -> Result<String> {
+    let key = computor_key(epoch);
+    archive.put(&key, Bytes::copy_from_slice(bytes)).await?;
+    Ok(key)
+}
+
+/// Reads the computor set sidecar for `epoch`.
+///
+/// A missing object returns `Ok(None)`. Any other storage failure is returned
+/// as an error.
+pub async fn get_computors<A: RawArchive + ?Sized>(
+    archive: &A,
+    epoch: u16,
+) -> Result<Option<Bytes>> {
+    let key = computor_key(epoch);
+    match archive.get(&key).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(Error::NotFound(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 /// Archive errors.
 #[derive(Debug, thiserror::Error)]
@@ -94,8 +194,38 @@ mod tests {
     #[test]
     fn public_api_is_wired() {
         let _: fn(u16, u32) -> String = object_key;
+        let _: fn(u16) -> String = computor_key;
         let _: fn(&str) -> Result<()> = validate_key;
         let _ = FileArchive::new("/tmp/does-not-need-to-exist");
         let _ = Config::new("bucket");
+    }
+
+    #[test]
+    fn policy_defaults_to_no_votes() {
+        assert!(!ArchivePolicy::default().include_votes);
+        assert!(!ArchivePolicy::default_policy().include_votes);
+        assert!(!ArchivePolicy::from_pairs(Vec::<(String, String)>::new()).include_votes);
+    }
+
+    #[test]
+    fn policy_parses_archive_votes() {
+        for value in ["1", "true", "TRUE", " yes ", "On"] {
+            let policy = ArchivePolicy::from_pairs([("ARCHIVE_VOTES", value)]);
+            assert!(policy.include_votes, "{value:?} should enable votes");
+        }
+        for value in ["0", "false", "FALSE", " no ", "Off"] {
+            let policy = ArchivePolicy::from_pairs([("ARCHIVE_VOTES", value)]);
+            assert!(!policy.include_votes, "{value:?} should disable votes");
+        }
+    }
+
+    #[test]
+    fn policy_ignores_other_keys_and_bad_values() {
+        let policy = ArchivePolicy::from_pairs([
+            ("ARCHIVE_VOTES", "true"),
+            ("OTHER", "false"),
+            ("ARCHIVE_VOTES", "maybe"),
+        ]);
+        assert!(!policy.include_votes);
     }
 }

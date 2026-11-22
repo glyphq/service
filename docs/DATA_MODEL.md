@@ -51,9 +51,12 @@ epoch 1---* tick
 | Quorum evidence | `(epoch, tick)` | Summary row in `quorum_evidence`; full vote sets are written to the raw archive when it is enabled | `Tick` vote set |
 | Identity | 60-character identity | Derived, updated as activity arrives | Transfers and burns |
 | Asset | `(issuer, name)` | Derived from `events`; no dedicated table | Asset events |
-| Computor | `(epoch, index)` | Cached in memory, persisted in `computors`, and archived per tick | `Computors` |
+| Computor | `(epoch, index)` | Cached in memory, persisted in `computors`, and archived once per epoch in `raw/epoch=NNN/computors.bin` | `Computors` |
 | Ingest checkpoint | key | Updated per batch | Indexer |
 | Price point | `hour` | Latest row per hour wins | QUBIC/USDT oracle poller |
+| Mempool entry | `hash` | Operational; open until confirmed, expired, failed, or cancelled | API submission |
+| Webhook | `id` | Operational until deactivated | Webhook registration |
+| Webhook delivery | `id` | Retried in place until delivered or dead-lettered | Webhook dispatcher |
 
 ## `glyph.ticks`
 
@@ -333,7 +336,30 @@ row. Evidence is inserted before the tick row, so a visible tick never has a hal
 audit row. `GET /v1/ticks/{tick}/evidence` returns this row and reports `404 not_found`
 when no evidence is stored.
 
-## `glyph.computors` and epoch summaries
+## `glyph.epochs`, `glyph.computors`, and epoch summaries
+
+Epoch boundaries are observed from peer `Head` values and persisted. The indexer does not
+assume a fixed number of ticks per epoch.
+
+```sql
+CREATE TABLE IF NOT EXISTS glyph.epochs
+(
+    epoch UInt16,
+    initial_tick UInt32,
+    first_tick UInt32,
+    last_tick UInt32,
+    closed UInt8,
+    updated_at DateTime64(3, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY epoch
+```
+
+The indexer upserts a boundary on startup and on every head refresh, and closes the
+previous epoch at `new_initial_tick - 1` on rollover. `GET /v1/epochs` reads the persisted
+row and includes `initial_tick`; when no row exists for an epoch, the API falls back to
+values derived from `glyph.ticks` so older databases still work.
 
 The elected computor set is stored per epoch:
 
@@ -351,10 +377,9 @@ ENGINE = ReplacingMergeTree(version)
 ORDER BY (epoch, computor_index)
 ```
 
-There is no `glyph.epochs` table. `GET /v1/epochs` and `GET /v1/epochs/{epoch}` aggregate
-`glyph.ticks` (tick counts, first/last tick, transaction and event sums) at query time.
-The indexer also caches computor sets in memory for verification.
-`GET /v1/epochs/{epoch}/computors` returns the persisted set ordered by
+The set is written once per epoch. The raw archive also stores one sidecar object per
+epoch at `raw/epoch=NNN/computors.bin` instead of repeating the 21.7 KB set in every tick
+bundle. `GET /v1/epochs/{epoch}/computors` returns the persisted set ordered by
 `computor_index`.
 
 ## Assets (derived)
@@ -397,6 +422,99 @@ ORDER BY hour
 oracle and `29` for the QPayhub fallback. Flag bit 0 marks a filled hour and bit 1 marks a
 stale reading. The API price routes read the newest row per hour. Price ingestion runs in
 the API process, not in the tick indexer.
+
+## Gateway tables (operational)
+
+Mempool and webhook state is operational, not indexed chain data. Its DDL and client code
+live in `crates/store/src/gateway.rs`, separate from the canonical schema module. Every
+table uses `ReplacingMergeTree(version)` with a monotonic millisecond version, and reads
+resolve the newest row per key with `ORDER BY version DESC LIMIT 1 BY key`.
+
+```sql
+CREATE TABLE IF NOT EXISTS glyph.mempool
+(
+    hash String,
+    raw String CODEC(ZSTD(3)),
+    source String,
+    destination String,
+    amount Int64,
+    tick UInt32,
+    peers UInt8,
+    status LowCardinality(String),
+    attempts UInt8,
+    broadcast_peers UInt8,
+    broadcast_at UInt64,
+    confirmed_at UInt64,
+    confirmed_tick UInt32,
+    error String,
+    created_at DateTime64(3, 'UTC'),
+    updated_at DateTime64(3, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY hash
+```
+
+`raw` is retained so a retry can rebroadcast without asking the client again. `tick` is the
+transaction's target tick and `peers` is the requested fan-out. `status` is one of
+`queued`, `broadcast`, `confirmed`, `expired`, `failed`, or `cancelled`. `queued`,
+`broadcast`, and `failed` are open and still tracked; the others are terminal. Optional
+timestamps and counters use `0` as a sentinel rather than ClickHouse `Nullable` columns,
+so `broadcast_at`, `confirmed_at`, and `confirmed_tick` are `0` when unset. An entry
+expires when the indexed head is greater than `tick + MEMPOOL_EXPIRY_TICKS` and the hash is
+still absent from the index.
+
+```sql
+CREATE TABLE IF NOT EXISTS glyph.webhooks
+(
+    id String,
+    url String,
+    secret String,
+    events String,
+    transaction_hashes String,
+    identity String,
+    active UInt8,
+    created_at DateTime64(3, 'UTC'),
+    updated_at DateTime64(3, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY id
+```
+
+`events` and `transaction_hashes` are JSON-encoded arrays in a `String` column. An empty
+`events` array matches every transaction event, an empty `transaction_hashes` array matches
+every hash, and an empty `identity` matches every source identity. `secret` must be at
+least 16 characters and is used to sign deliveries. It is never serialized into API
+responses.
+
+```sql
+CREATE TABLE IF NOT EXISTS glyph.webhook_deliveries
+(
+    id String,
+    webhook_id String,
+    event String,
+    transaction_hash String,
+    status LowCardinality(String),
+    attempt UInt32,
+    next_attempt_at UInt64,
+    response_status UInt16,
+    error String,
+    payload String CODEC(ZSTD(3)),
+    created_at DateTime64(3, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY id
+```
+
+A delivery row is updated in place (with a new version) across retries. `status` is
+`pending`, `delivered`, or `failed`; `next_attempt_at` is `0` once no retry is scheduled;
+`payload` retains the exact JSON body so retries are byte-identical. Retries use a
+1 s, 2 s, 4 s, ... backoff capped at 60 s and stop after `WEBHOOK_MAX_ATTEMPTS`.
+
+These tables are created by `Store::init`/`glyph db-init` alongside the canonical schema,
+not by a separate gateway migration.
 
 ## Invariants
 
@@ -466,11 +584,16 @@ in-flight duplicates omit `FINAL` and deduplicate with `argMax` or a subquery. N
 | `identities` | none | `identity` | `by_activity` | Identity lookup, top identities |
 | `ingest_state` | none | `key` | none | Internal |
 | `quorum_evidence` | `epoch` | `(epoch, tick)` | none | Verification details |
+| `epochs` | none | `epoch` | none | Observed epoch boundaries and lifecycle |
 | `computors` | none | `(epoch, computor_index)` | none | Elected computor set per epoch |
 | `price_points` | none | `hour` | none | Hourly QUBIC/USDT prices |
+| `mempool` | none | `hash` | none | API broadcast tracking (gateway) |
+| `webhooks` | none | `id` | none | Webhook registrations (gateway) |
+| `webhook_deliveries` | none | `(webhook_id, id)` | none | Persisted delivery attempts (gateway) |
 
 `quorum_evidence` is partitioned by epoch, while `price_points` is not partitioned. Both
-are small relative to the tick tables and are read by a single key or by hour.
+are small relative to the tick tables and are read by a single key or by hour. The
+gateway tables hold API operational state, not chain history.
 
 `ticks` has a `by_tick` projection because the order key starts with `epoch`. Without it,
 `WHERE tick = ?` scans every epoch partition. It is created by
@@ -498,12 +621,13 @@ The default policy is deliberately simple and configurable.
 
 Rules:
 
-- The current implementation keeps every indexed epoch in ClickHouse. There is no automatic
-  drop.
+- The current implementation keeps indexed epochs until an operator prunes them. `PRUNE_KEEP_EPOCHS` enables optional retention after a rollover, and `glyph prune --keep N [--dry-run]` drops ClickHouse partitions older than the newest N epochs. Pruning deletes only epoch-partitioned chain tables; it never deletes `glyph.identities` or `glyph.price_points`, and it never deletes archive objects.
 - The raw archive is optional and off by default. When enabled, it preserves the verified
   bundle for each tick before the ClickHouse write, so a dropped partition can be rebuilt.
-  Without it, dropping a partition loses that history unless it can be re-fetched from a
-  peer that still retains it.
+  Full vote headers are omitted by default (`ARCHIVE_VOTES=false`); the epoch computor set
+  is stored once per epoch at `raw/epoch=NNN/computors.bin`. Without the archive, dropping
+  a partition loses that history unless it can be re-fetched from a peer that still
+  retains it.
 - `identities` is derived from indexed QU transfer events and spans epochs. Dropping an
   epoch without rebuilding the aggregate makes the balance partial; the API only labels the
   current limitation in its `meta.notice`.
@@ -515,7 +639,8 @@ Rules:
 Constants:
 
 - 86,400 ticks per day
-- 604,800 ticks per epoch
+- 604,800 ticks per epoch (planning upper bound; the current network epoch is roughly
+  330k ticks, so scale per-epoch totals by about 0.55)
 - `TickData` 139,376 B
 - Tick header 352 B
 - Max transactions 4,096 per tick
@@ -606,10 +731,12 @@ layouts.
 
 ## Migrations
 
-- DDL lives in `crates/store/src/schema.rs` as idempotent statements
+- DDL lives in `crates/store/src/schema.rs` for canonical chain tables and in
+  `crates/store/src/gateway.rs` for operational gateway tables (mempool, webhooks,
+  webhook deliveries). All statements are idempotent
   (`CREATE ... IF NOT EXISTS`, `ADD PROJECTION IF NOT EXISTS`).
-- `glyph db-init` and `Store::init` apply the full statement list. Applying it twice is a
-  no-op.
+- `glyph db-init` and `Store::init` apply the full statement list from both modules.
+  Applying it twice is a no-op.
 - Additive changes (new column with a default, new projection, new table) are safe on a live
   database. Destructive changes require a new table and a backfill. They are never applied
   implicitly.

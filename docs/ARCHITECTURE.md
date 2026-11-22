@@ -146,9 +146,12 @@ Ingestion is a bounded prefetch pipeline, not a serial tick loop.
 
 1. Load the seed peer list and open one TCP connection per peer. Send
    `ExchangePublicPeers` and merge discovered IPv4 addresses into the candidate set.
-2. A coordinator polls `RequestCurrentTickInfo` and keeps the head in shared state. When
-   the epoch changes it fetches and verifies `RequestComputors` for the new epoch and
-   caches the set by epoch.
+2. A coordinator polls `RequestCurrentTickInfo` and keeps the head in shared state. It
+   records the observed `(epoch, initial_tick)` boundary on startup and whenever the head
+   changes. When the epoch changes it closes the previous epoch at
+   `new_initial_tick - 1`, fetches and verifies `RequestComputors` for the new epoch, and
+   caches the set by epoch. Boundaries are persisted in `glyph.epochs`; the indexer does
+   not assume a fixed number of ticks per epoch.
 3. A dispatcher hands tick numbers to workers from a bounded window,
    `[nextWrite, nextWrite + INDEXER_FETCH_WINDOW - 1]`, capped at the coordinator's head.
    The first tick is the epoch `initialTick`; after that it is the last persisted tick plus
@@ -164,10 +167,12 @@ Ingestion is a bounded prefetch pipeline, not a serial tick loop.
    non-zero transaction digest must resolve to a transaction whose K12 hash matches.
    Every log digest must match `K12_8(body)`. When `verify_signatures` is enabled, vote,
    tick data, and transaction signatures are also checked.
-7. If raw archiving is configured, encode the verified tick's header, tick data, votes,
-   transactions, log ranges, logs, and computors into a zstd-compressed QBB1 bundle and
-   write it before the ClickHouse write. An archive failure is logged and indexing
-   continues unless `ARCHIVE_FAIL_CLOSED=true`.
+7. If raw archiving is configured, encode the verified tick's header, tick data,
+   transactions, log ranges, and logs into a zstd-compressed QBB1 bundle and write it
+   before the ClickHouse write. Full vote headers are written only when
+   `ARCHIVE_VOTES=true`. The epoch computor set is written once to
+   `raw/epoch=NNN/computors.bin`, not repeated in every bundle. An archive failure is
+   logged and indexing continues unless `ARCHIVE_FAIL_CLOSED=true`.
 8. Fetch results complete out of order. An ordered buffer keyed by tick, also bounded by
    `INDEXER_FETCH_WINDOW`, holds them until `nextWrite` is present. A failed or missing
    tick blocks the cursor instead of being skipped; failed ticks are retried with
@@ -209,11 +214,11 @@ Default tuning, overridable by environment:
 | --- | --- | --- | --- |
 | [`crates/qubic`](../crates/qubic) | none | Wire framing, message payloads, identity encoding, log decoding, K12, SchnorrQ | No I/O, no storage |
 | [`crates/node`](../crates/node) | none | Direct TCP peer connections, handshake, request and response correlation, peer pool, failover, bundle assembly | Sockets |
-| [`crates/indexer`](../crates/indexer) | none | Sync loop, verification tiers, checkpointing, batching | Ingest policy |
-| [`crates/store`](../crates/store) | none | ClickHouse client, schema SQL, row types, queries | SQL |
-| [`crates/archive`](../crates/archive) | none | QBB1 raw bundle encoding, filesystem and S3 backends | Object storage |
-| [`crates/api`](../crates/api) | `glyph-api` | Axum router, RFC 9457 errors, OpenAPI, cursor pagination, streaming, search | HTTP |
-| [`crates/cli`](../crates/cli) | `glyph` | Operator commands: `head`, `peers`, `tick`, `sync`, `db-init`, `serve` | Process wiring |
+| [`crates/indexer`](../crates/indexer) | none | Sync loop, verification tiers, epoch boundaries, archive policy, checkpointing, batching | Ingest policy |
+| [`crates/store`](../crates/store) | none | ClickHouse client, canonical schema SQL, gateway tables for mempool and webhooks, row types, queries | SQL |
+| [`crates/archive`](../crates/archive) | none | QBB1 raw bundle encoding, per-epoch computor sidecar, filesystem and S3 backends | Object storage |
+| [`crates/api`](../crates/api) | `glyph-api` | Axum router, RFC 9457 errors, OpenAPI, cursor pagination, streaming, search, mempool, webhook delivery | HTTP |
+| [`crates/cli`](../crates/cli) | `glyph` | Operator commands: `head`, `peers`, `tick`, `sync`, `db-init`, `prune`, `serve` | Process wiring |
 
 Dependency direction is acyclic:
 
@@ -249,23 +254,88 @@ tick is not written.
 
 ## Epoch handling
 
-- The current epoch is discovered from `CurrentTickInfo`, not from wall time.
-- The first indexed tick in an epoch is `initialTick`. The last normal tick is
-  `initialTick + 604_800 - 1` at one tick per second for seven days.
+Epoch boundaries are observed, not inferred from a fixed tick count. The network has
+changed tick rate before, so Glyph never assumes 604,800 ticks per epoch.
+
+- The current epoch and `initialTick` are discovered from `CurrentTickInfo`, not from wall
+  time. On startup and on every head refresh the indexer records the observed boundary in
+  `glyph.epochs`.
+- On an epoch change, the previous epoch is closed at `new_initial_tick - 1`. The boundary
+  map is loaded from ClickHouse at startup so restarts keep the same assignment.
 - With no stored cursor, the indexer starts at the current epoch `initialTick`. With a
-  cursor, it resumes at `last_indexed_tick + 1`, clamped to the current epoch range.
+  cursor, it resumes at `last_indexed_tick + 1`. A tick whose epoch cannot be resolved
+  from the persisted boundaries is skipped with a warning rather than guessed.
 - An end-of-epoch virtual tick is described in the protocol document but is not
   implemented. The indexer does not synthesize one.
 - Log IDs are scoped to an epoch. A log ID from one epoch is not comparable to the same
   numeric ID in epoch 241. Events are keyed by `(epoch, log_id)`.
-- The computor set is per epoch. It is cached by epoch and re-fetched on rollover. Votes
-  are never validated against the previous epoch's keys.
-- If the indexer starts mid-epoch, it starts at `initialTick` of the current epoch and
-  catches up by requesting ticks forward. If peers no longer retain the initial tick, the
-  fetch retries with backoff; the indexer does not jump forward and publish a partial
-  epoch as complete.
+- The computor set is per epoch. It is cached by epoch, persisted once, and re-fetched on
+  rollover. Votes are never validated against the previous epoch's keys.
+- If the indexer starts mid-epoch, it starts at the boundary of the current epoch and
+  catches up by requesting ticks forward. Previous-epoch catch-up is attempted only when
+  that epoch's boundary and computor set are known. If peers no longer retain the initial
+  tick, the fetch retries with backoff; the indexer does not jump forward and publish a
+  partial epoch as complete.
+- Optional retention: after a rollover, `PRUNE_KEEP_EPOCHS` drops ClickHouse partitions
+  older than the newest N epochs. `glyph prune --keep N [--dry-run]` runs the same
+  operation on demand. It never deletes archive objects, and never deletes `identities`
+  or `price_points`.
+- Every epoch is a partition in the single `glyph` database. Per-epoch databases are
+  deprecated: they duplicate DDL, split cross-epoch tables such as `identities` and
+  `price_points`, and make the checkpoint and query plans ambiguous. A partition drop
+  gives the same retention behavior without splitting the schema.
 - There is no pre-240 data path. Tick lookups outside the indexed range return
   `404 not_found`.
+
+## Archive policy
+
+The raw archive is an evidence store, not a dump of every wire message.
+
+- Default tick bundles contain the tick header, `TickData`, transactions, log ranges, and
+  logs. They omit the full vote set (`ARCHIVE_VOTES=false`).
+- The elected computor set is identical for every tick in an epoch. It is written once to
+  `raw/epoch=NNN/computors.bin` instead of inside every bundle. At 21.7 KB per tick this
+  removes roughly 7 GB of redundant object data per 330k-tick epoch.
+- `RawBundle` keeps optional `Votes` and `Computors` sections so objects written before
+  this policy remain readable.
+- `GET /v1/ticks/{tick}/raw?section=votes` returns `404` when votes were not archived.
+  `section=computors` falls back to the epoch sidecar when the bundle has none.
+- The indexer writes the sidecar before or with the first bundle of an epoch. A retry is
+  idempotent because the key is fixed per epoch.
+
+Vote headers are useful for forensic audit but are not needed to serve indexed reads or to
+replay transactions and events. An operator who needs them must enable `ARCHIVE_VOTES`
+before the epoch is ingested; the setting does not rewrite existing bundles.
+
+## Mempool and webhook delivery
+
+The API process owns two best-effort background loops: a mempool tracker and a webhook
+dispatcher. They are operational state, not consensus.
+
+1. `POST /v1/transactions` (default) or `POST /v1/mempool` decodes the signed transaction,
+   runs the same local checks as `/v1/transactions/validate`, and persists a `queued`
+   entry. It then performs the first peer broadcast and returns `202` with the resulting
+   `broadcast` or `failed` entry; the request does not wait for confirmation.
+2. The request path performs the first fan-out. At least one socket acceptance moves the
+   entry to `broadcast`; a later tracker pass retries it on schedule. Qubic does not
+   acknowledge broadcasts, so this is not proof of inclusion.
+3. Every `MEMPOOL_POLL_MS` the tracker checks the index for the hash. An indexed hash moves
+   the entry to `confirmed` and records the indexed tick.
+4. Unconfirmed entries are retried no more often than `MEMPOOL_RETRY_MS` until
+   `MEMPOOL_MAX_ATTEMPTS`. Once the indexed head is greater than
+   `tick + MEMPOOL_EXPIRY_TICKS`, the entry becomes `expired`. Explicit cancellation
+   moves an unconfirmed entry to `cancelled`.
+5. Each status transition that matches a registration is written to `webhook_deliveries`
+   and posted with `X-Glyph-Event`, `X-Glyph-Delivery`, `X-Glyph-Timestamp`, and
+   `X-Glyph-Signature: sha256=<hex HMAC-SHA256 of "{timestamp}.{body}">`.
+6. Failed deliveries retry with 1 s, 2 s, 4 s, ... backoff capped at 60 s up to
+   `WEBHOOK_MAX_ATTEMPTS`, then are recorded as `failed` (dead-lettered). Delivery is
+   at-least-once.
+
+The loops run inside every API replica. Sharing ClickHouse keeps status consistent, but
+two replicas can both dispatch the same event. Run one dispatcher or accept duplicate
+deliveries. Losing the gateway tables loses only pending operational state, never chain
+history.
 
 ## Failure modes
 
@@ -282,6 +352,10 @@ tick is not written.
 | Logs not ready | Fewer logs fetched than the ranges declare | Verification completes as `quorum` with a warning | Tick is stored at `quorum` |
 | Log outside declared ranges | The peer's range table does not cover a log that still carries this tick and a valid digest | Keep the log, downgrade to `quorum`, and record a warning. A peer that returns inconsistent ranges is not allowed to stall the pipeline. | Tick is stored at `quorum`; the event has an empty transaction link |
 | Epoch rollover during fetch | `CurrentTickInfo.epoch` changes | Move `next` forward to the new `initialTick` and refresh computors | No cross-epoch write |
+| Epoch boundary unknown for a tick | No persisted boundary covers the tick | Skip the tick with a warning instead of guessing | No misassigned row |
+| Mempool entry never indexed | Indexed head is greater than `tick + MEMPOOL_EXPIRY_TICKS` | Mark `expired`, stop rebroadcasting, deliver the event | No chain write |
+| Mempool full | `MEMPOOL_MAX_ENTRIES` reached | Reject new submissions with `429 mempool_full` | Existing entries keep tracking |
+| Webhook receiver slow or down | Timeout, connection error, or non-2xx | Retry with backoff, persist each attempt, then dead-letter | Registration stays active unless deleted |
 | ClickHouse unavailable | Insert or query error | The indexer exits with an error. The API returns `internal_error` for reads that fail | Head stops advancing. No retry queue |
 | API process down | Load balancer health check | Restart, no ingest impact | None |
 | Duplicate tick delivery | Replayed request or retry | Idempotent insert with the same `version` and `ReplacingMergeTree` | One logical row after merge |
@@ -292,12 +366,14 @@ tick is not written.
 ## Capacity estimates
 
 Constants: one tick per second, 86,400 ticks per day, 604,800 ticks per epoch. `TickData`
-is 139,376 bytes. A tick header is 352 bytes. A full vote set is up to 676 headers.
+is 139,376 bytes. A tick header is 352 bytes. A full vote set is up to 676 headers. The
+current network epoch is roughly 330k ticks, so the per-epoch figures below are an upper
+bound; scale them by about 0.55 for the observed epoch length.
 
 | Item | Size | Per epoch | Note |
 | --- | --- | --- | --- |
 | Tick headers, winning only | 352 B | 203 MiB | Indexed store |
-| Full vote set, if retained | 237,952 B per tick | 134 GiB | Not retained in hot store |
+| Full vote set, if retained | 237,952 B per tick | 134 GiB | Not retained in hot store; opt-in in the raw archive with `ARCHIVE_VOTES=true` |
 | `TickData`, raw | 139,376 B | 78.5 GiB | Not stored in ClickHouse; optional raw archive |
 | Transaction, base plus signature | 144 B plus input | Depends on input | Max input 1,024 B, max 4,096 tx per tick |
 | Max transaction payload per tick | 4,784,128 B | 2.63 TiB | Absolute worst case, not a planning number |
@@ -342,6 +418,11 @@ development values. Production needs separate tuning.
 - One ClickHouse node for development, replicated ClickHouse for production.
 - A raw archive on a dedicated volume or S3 bucket is optional. It is written by the
   indexer and read only by the raw bundle route.
+- The API optionally runs the mempool tracker and webhook dispatcher. Both are best-effort
+  background loops inside each API replica and share the `mempool`, `webhooks`, and
+  `webhook_deliveries` gateway tables. Delivery retries are idempotent per attempt, but
+  running multiple replicas can duplicate a webhook delivery, so use one dispatcher or
+  accept at-least-once delivery.
 - The indexer should not be restarted for API deploys. The API should not be restarted
   for indexer deploys.
 
@@ -390,7 +471,14 @@ prefixes and tick numbers.
 ### Security
 
 - The API is read-only by default. `POST /v1/transactions` requires
-  `ALLOW_BROADCAST=true` and verifies the signed transaction before sending it.
+  `ALLOW_BROADCAST=true` and verifies the signed transaction before queueing or sending it.
+  `POST /v1/mempool` only accepts locally valid transactions and is subject to
+  `MEMPOOL_MAX_ENTRIES`; it still requires `ALLOW_BROADCAST=true` to reach peers.
+- Webhook targets are untrusted URLs. The dispatcher rejects non-HTTP(S) schemes and, by
+  default, localhost and private address ranges. `WEBHOOK_ALLOW_PRIVATE=true` is an
+  explicit opt-in for internal receivers. Requests time out after `WEBHOOK_TIMEOUT_MS`.
+- Webhook secrets are used to sign deliveries. Treat them as credentials and do not log
+  them.
 - ClickHouse and peer ports are not exposed publicly.
 - Rate limiting, API keys, and streaming limits are planned. The current API has
   permissive CORS and no request budget unless `RATE_LIMIT_PER_MINUTE` is set.

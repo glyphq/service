@@ -458,6 +458,7 @@ impl Store for MockStore {
         let rows = vec![
             EpochRow {
                 epoch: 2,
+                initial_tick: 5,
                 first_tick: 5,
                 last_tick: 5,
                 first_timestamp: timestamp(),
@@ -469,6 +470,7 @@ impl Store for MockStore {
             },
             EpochRow {
                 epoch: 1,
+                initial_tick: 1,
                 first_tick: 6,
                 last_tick: 7,
                 first_timestamp: timestamp(),

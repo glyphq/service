@@ -138,6 +138,8 @@ fn tags() -> Value {
         { "name": "Network", "description": "Index-wide counts, ingest progress, and peer-observed network state." },
         { "name": "Stream", "description": "Server-sent and WebSocket event streams." },
         { "name": "Live", "description": "Direct peer calls that are not part of the immutable index. Short-lived cache or no-store, may be unavailable." },
+        { "name": "Mempool", "description": "Best-effort broadcast tracking for signed transactions that are not yet in the index." },
+        { "name": "Webhooks", "description": "Signed push notifications for mempool transaction status changes." },
         { "name": "Archive", "description": "Raw verified tick bundles retained for audit and replay." },
         { "name": "Search", "description": "Resolve hashes, ticks, epochs, assets, and identities in one request." }
     ])
@@ -147,6 +149,7 @@ fn tag_groups() -> Value {
     json!([
         { "name": "Operations", "tags": ["Status", "Network"] },
         { "name": "Chain Data", "tags": ["Epochs", "Ticks", "Transactions", "Events", "Archive"] },
+        { "name": "Broadcast & Delivery", "tags": ["Mempool", "Webhooks"] },
         { "name": "Accounts & Assets", "tags": ["Identities", "Wallets", "Assets"] },
         { "name": "Markets & Analytics", "tags": ["Prices", "Market", "Analytics"] },
         { "name": "Live & Lookup", "tags": ["Live", "Stream", "Search"] }
@@ -349,18 +352,24 @@ fn paths() -> Value {
                 "post": {
                     "operationId": "broadcastTransaction",
                     "tags": ["Transactions"],
-                    "summary": "Broadcast a signed transaction to direct peers",
-                    "description": "Requires ALLOW_BROADCAST=true. The transaction is decoded and locally checked for amount range, input size, byte length, and SchnorrQ signature before any socket is opened. Valid transactions are fanned out concurrently to up to `peers` peers (capped by BROADCAST_PEERS). Set `dry_run` to run the same checks without broadcasting.\n\nQubic does not acknowledge broadcasts. A `sent` peer means the packet reached the peer socket, not that the transaction will be included. Poll `meta.links.transaction`, or stream ticks, to observe inclusion.",
+                    "summary": "Submit a signed transaction",
+                    "description": "Requires ALLOW_BROADCAST=true. The default path queues the transaction in the mempool, returns 202 with a tracked entry, rebroadcasts on a background schedule, and can notify a webhook. Set `direct: true` for the previous behavior: fan out once to up to `peers` peers (capped by BROADCAST_PEERS) and return the per-peer report. In both modes the transaction is decoded and locally checked for amount range, input size, byte length, and SchnorrQ signature before any socket is opened. Set `dry_run` to run the checks without broadcasting or queueing.\n\nQubic does not acknowledge broadcasts. A `sent` peer or a `broadcast` mempool status means the packet reached a peer socket, not that the transaction will be included. Poll `meta.links`, `GET /v1/mempool/{hash}`, or stream ticks to observe inclusion.",
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BroadcastRequest" } } }
                     },
                     "responses": {
                         "200": { "description": "Dry run report; no peer connection was opened", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BroadcastResult" } } } },
-                        "202": { "description": "Transaction written to at least one peer socket", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BroadcastResult" } } } },
+                        "202": { "description": "Transaction queued in the mempool, or written to at least one peer socket with direct: true", "content": { "application/json": { "schema": {
+                            "oneOf": [
+                                { "$ref": "#/components/schemas/BroadcastResult" },
+                                { "type": "object", "required": ["data"], "properties": { "data": { "$ref": "#/components/schemas/MempoolEntry" }, "meta": { "type": "object" } } }
+                            ]
+                        } } } },
                         "400": { "description": "Transaction failed local validation" },
                         "403": { "description": "Broadcast disabled" },
-                        "503": { "description": "No peer accepted the transaction" }
+                        "429": { "description": "Mempool is full; code mempool_full" },
+                        "503": { "description": "Mempool is disabled, or no peer accepted a direct broadcast" }
                     }
                 }
             },
@@ -842,7 +851,7 @@ fn paths() -> Value {
                     "operationId": "downloadTickBundle",
                     "tags": ["Archive"],
                     "summary": "Download the archived raw QBB1 tick bundle",
-                    "description": "Requires S3_BUCKET or ARCHIVE_DIR to be configured for the API. Without section, returns the zstd-compressed QBB1 container.",
+                    "description": "Requires S3_BUCKET or ARCHIVE_DIR to be configured for the API. Without section, returns the zstd-compressed QBB1 container. Votes are archived only when the indexer ran with ARCHIVE_VOTES=true; otherwise `section=votes` returns 404. `section=computors` falls back to the per-epoch sidecar at `raw/epoch=NNN/computors.bin` when the bundle has no computors payload.",
                     "parameters": [
                         tick_param(),
                         { "name": "section", "in": "query", "schema": { "type": "string", "enum": ["tick", "tick_data", "votes", "transactions", "log_ranges", "logs", "computors"] } }
@@ -870,6 +879,160 @@ fn paths() -> Value {
                         "200": { "description": "Hex-encoded contract output", "content": { "application/json": { "schema": data_envelope("ContractQueryResult") } } },
                         "400": { "description": "Invalid hex or input exceeds MAX_INPUT_SIZE" },
                         "503": { "description": "No peer available or contract call failed" }
+                    }
+                }
+            },
+            // Mempool and webhooks
+            "/v1/mempool": {
+                "get": {
+                    "operationId": "listMempoolEntries",
+                    "tags": ["Mempool"],
+                    "summary": "List mempool entries, newest first",
+                    "description": "Open and recently resolved broadcast attempts tracked by this API. Status is best-effort: `broadcast` means at least one peer accepted the packet at the socket, not that the transaction was included. Use `status` to filter and `limit` to bound the list.",
+                    "parameters": [
+                        { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["queued", "broadcast", "confirmed", "expired", "failed", "cancelled"] } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Mempool entries",
+                            "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "required": ["data", "meta"],
+                                "properties": {
+                                    "data": { "type": "array", "items": { "$ref": "#/components/schemas/MempoolEntry" } },
+                                    "meta": { "type": "object" }
+                                }
+                            } } }
+                        },
+                        "400": { "description": "Unknown status filter" },
+                        "503": { "description": "Mempool is disabled or storage is unavailable" }
+                    }
+                },
+                "post": {
+                    "operationId": "submitMempoolEntry",
+                    "tags": ["Mempool"],
+                    "summary": "Submit a signed transaction to the mempool",
+                    "description": "Decodes and locally checks the signed transaction, registers any inline webhook, persists the entry, and performs the first peer broadcast before returning 202. A duplicate hash returns the existing entry unchanged, so the route is idempotent. Requires ALLOW_BROADCAST=true. Background tracking rebroadcasts at `MEMPOOL_RETRY_MS` up to `MEMPOOL_MAX_ATTEMPTS` and expires the entry once the indexed head is greater than `tick + MEMPOOL_EXPIRY_TICKS`. Qubic does not acknowledge broadcasts, so `broadcast` is not a confirmation. Poll `meta.links.status` or register a webhook to observe the final status.",
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MempoolSubmitRequest" } } }
+                    },
+                    "responses": {
+                        "202": { "description": "Entry accepted for broadcast and tracking", "content": { "application/json": { "schema": {
+                            "type": "object",
+                            "required": ["data"],
+                            "properties": {
+                                "data": { "$ref": "#/components/schemas/MempoolEntry" },
+                                "meta": { "type": "object" }
+                            }
+                        } } } },
+                        "400": { "description": "Malformed hex, a transaction that fails local checks, or a webhook_url without a matching webhook_secret" },
+                        "403": { "description": "Broadcast disabled" },
+                        "429": { "description": "MEMPOOL_MAX_ENTRIES is reached; code mempool_full" },
+                        "503": { "description": "Mempool is disabled" }
+                    }
+                }
+            },
+            "/v1/mempool/{hash}": {
+                "get": {
+                    "operationId": "getMempoolEntry",
+                    "tags": ["Mempool"],
+                    "summary": "Get one mempool entry with indexed status",
+                    "description": "Returns the tracked entry. When the transaction has appeared in the index, the response reports `confirmed` and the indexed tick even if the background tracker has not reconciled it yet.",
+                    "parameters": [transaction_hash_param()],
+                    "responses": {
+                        "200": { "description": "Mempool entry", "content": { "application/json": { "schema": data_envelope("MempoolEntry") } } },
+                        "400": { "description": "Invalid hash" },
+                        "404": { "description": "Hash is not tracked" },
+                        "503": { "description": "Mempool is disabled or storage is unavailable" }
+                    }
+                },
+                "delete": {
+                    "operationId": "cancelMempoolEntry",
+                    "tags": ["Mempool"],
+                    "summary": "Cancel a tracked mempool entry",
+                    "description": "Marks an entry `cancelled` and stops further rebroadcasts. Cancelling an already cancelled entry returns it unchanged. Expired, failed, and cancelled entries can be cancelled. A confirmed transaction cannot be cancelled because the chain has already included it; the route returns 409 with code `already_confirmed`. Cancellation does not recall a packet that a peer already accepted.",
+                    "parameters": [transaction_hash_param()],
+                    "responses": {
+                        "200": { "description": "Entry cancelled", "content": { "application/json": { "schema": data_envelope("MempoolEntry") } } },
+                        "400": { "description": "Invalid hash" },
+                        "404": { "description": "Hash is not tracked" },
+                        "409": { "description": "Entry is already confirmed; code already_confirmed" }
+                    }
+                }
+            },
+            "/v1/webhooks": {
+                "get": {
+                    "operationId": "listWebhooks",
+                    "tags": ["Webhooks"],
+                    "summary": "List active webhook registrations",
+                    "description": "Active registrations only. Secrets are never returned. Delivery attempts are available per webhook.",
+                    "responses": {
+                        "200": {
+                            "description": "Webhook registrations",
+                            "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "required": ["data"],
+                                "properties": {
+                                    "data": { "type": "array", "items": { "$ref": "#/components/schemas/Webhook" } },
+                                    "meta": { "type": "object" }
+                                }
+                            } } }
+                        }
+                    }
+                },
+                "post": {
+                    "operationId": "registerWebhook",
+                    "tags": ["Webhooks"],
+                    "summary": "Register a webhook for transaction events",
+                    "description": "Registers an HTTPS or HTTP endpoint for mempool transaction events. `secret` must be at least 16 characters and signs every delivery. An empty `events` list subscribes to every transaction event. Empty `transaction_hashes` matches every tracked hash; empty `identity` matches every source identity. Localhost and private address targets are rejected unless WEBHOOK_ALLOW_PRIVATE=true.",
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookRegistration" } } }
+                    },
+                    "responses": {
+                        "201": { "description": "Webhook registered", "content": { "application/json": { "schema": data_envelope("Webhook") } } },
+                        "400": { "description": "Invalid URL, secret, event, or filter, including a private target without WEBHOOK_ALLOW_PRIVATE" }
+                    }
+                }
+            },
+            "/v1/webhooks/{id}": {
+                "delete": {
+                    "operationId": "deleteWebhook",
+                    "tags": ["Webhooks"],
+                    "summary": "Deactivate a webhook",
+                    "description": "Marks the registration inactive. Pending deliveries are not retried after deactivation. The record and its delivery history remain queryable.",
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "responses": {
+                        "200": { "description": "Webhook deactivated", "content": { "application/json": { "schema": data_envelope("Webhook") } } },
+                        "404": { "description": "Webhook not found" }
+                    }
+                }
+            },
+            "/v1/webhooks/{id}/deliveries": {
+                "get": {
+                    "operationId": "listWebhookDeliveries",
+                    "tags": ["Webhooks"],
+                    "summary": "List recent deliveries for a webhook",
+                    "description": "Newest first. Each row tracks one delivery across retries with an incremented attempt count. Delivery is at-least-once: a 2xx response acknowledges an attempt, but a retry can repeat an event.",
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 } }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "Deliveries",
+                            "content": { "application/json": { "schema": {
+                                "type": "object",
+                                "required": ["data"],
+                                "properties": {
+                                    "data": { "type": "array", "items": { "$ref": "#/components/schemas/WebhookDelivery" } },
+                                    "meta": { "type": "object" }
+                                }
+                            } } }
+                        },
+                        "404": { "description": "Webhook not found" }
                     }
                 }
             },
@@ -949,7 +1112,7 @@ fn schemas() -> Value {
                         "type": { "type": "string", "default": "about:blank" },
                         "title": { "type": "string" },
                         "status": { "type": "integer" },
-                        "code": { "type": "string", "enum": ["bad_request", "invalid_identity", "invalid_transaction_hash", "invalid_cursor", "not_found", "forbidden", "unavailable", "internal_error", "rate_limited"] },
+                        "code": { "type": "string", "enum": ["bad_request", "invalid_identity", "invalid_transaction_hash", "invalid_cursor", "not_found", "conflict", "already_confirmed", "mempool_full", "forbidden", "unavailable", "internal_error", "rate_limited"] },
                         "detail": { "type": "string" }
                     }
                 },
@@ -966,7 +1129,88 @@ fn schemas() -> Value {
                     "properties": {
                         "raw": { "type": "string", "description": "Signed transaction bytes as hex, with or without a 0x prefix. `transaction`, `raw_transaction`, and `signed_transaction` are accepted aliases." },
                         "dry_run": { "type": "boolean", "default": false, "description": "Validate and describe the transaction without opening a peer connection." },
-                        "peers": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Peers to fan out to. Capped by the server's BROADCAST_PEERS setting. `max_peers` is an alias." }
+                        "peers": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Peers to fan out to. Capped by the server's BROADCAST_PEERS setting. `max_peers` is an alias." },
+                        "direct": { "type": "boolean", "default": false, "description": "Bypass the mempool and use the old direct fan-out behavior. The default queues the transaction in the mempool and returns a tracked entry." },
+                        "webhook_url": { "type": "string", "description": "Mempool only: convenience webhook registered for this transaction." },
+                        "webhook_secret": { "type": "string", "description": "Mempool only: signing secret for `webhook_url`, at least 16 characters." }
+                    }
+                },
+                "MempoolSubmitRequest": {
+                    "type": "object",
+                    "required": ["raw"],
+                    "properties": {
+                        "raw": { "type": "string", "description": "Signed transaction bytes as hex, with or without a 0x prefix." },
+                        "peers": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Peers to contact per attempt. Capped by BROADCAST_PEERS." },
+                        "webhook_url": { "type": "string", "description": "Optional webhook target registered for this entry." },
+                        "webhook_secret": { "type": "string", "minLength": 16, "description": "Signing secret used when `webhook_url` is set." }
+                    }
+                },
+                "MempoolEntry": {
+                    "type": "object",
+                    "required": ["hash", "source", "destination", "amount", "tick", "status", "attempts", "created_at", "updated_at"],
+                    "properties": {
+                        "hash": { "type": "string", "description": "Lowercase base-26 transaction hash" },
+                        "raw": { "type": "string", "description": "Signed transaction bytes as lowercase hex" },
+                        "source": { "type": "string", "description": "Canonical source identity" },
+                        "destination": { "type": "string", "description": "Canonical destination identity" },
+                        "amount": { "type": "integer", "format": "int64" },
+                        "tick": { "type": "integer", "description": "Target tick from the transaction header" },
+                        "peers": { "type": "integer", "description": "Peers requested for each broadcast attempt" },
+                        "status": { "type": "string", "enum": ["queued", "broadcast", "confirmed", "expired", "failed", "cancelled"] },
+                        "attempts": { "type": "integer", "description": "Broadcast attempts so far" },
+                        "broadcast_peers": { "type": "integer", "description": "Peers that accepted the packet in the latest attempt" },
+                        "broadcast_at": { "type": ["string", "null"], "format": "date-time" },
+                        "confirmed_at": { "type": ["string", "null"], "format": "date-time" },
+                        "confirmed_tick": { "type": ["integer", "null"], "description": "Indexed tick once the transaction is confirmed" },
+                        "error": { "type": ["string", "null"], "description": "Last broadcast or decode error" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "WebhookRegistration": {
+                    "type": "object",
+                    "required": ["url", "secret"],
+                    "properties": {
+                        "url": { "type": "string", "format": "uri", "description": "HTTP or HTTPS delivery endpoint" },
+                        "secret": { "type": "string", "minLength": 16, "description": "HMAC key for delivery signatures. Never returned." },
+                        "events": {
+                            "type": "array",
+                            "description": "Events to deliver. Empty means every transaction event.",
+                            "items": { "type": "string", "enum": ["transaction.queued", "transaction.broadcast", "transaction.confirmed", "transaction.expired", "transaction.failed", "transaction.cancelled"] }
+                        },
+                        "transaction_hashes": { "type": "array", "description": "Limit delivery to these hashes. Empty means every hash.", "items": { "type": "string" } },
+                        "identity": { "type": "string", "description": "Limit delivery to this source identity. Empty means every identity." }
+                    }
+                },
+                "Webhook": {
+                    "type": "object",
+                    "required": ["id", "url", "active", "created_at"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "url": { "type": "string", "format": "uri" },
+                        "events": { "type": "array", "items": { "type": "string" } },
+                        "transaction_hashes": { "type": "array", "items": { "type": "string" } },
+                        "identity": { "type": "string", "description": "Empty when the webhook matches every source identity" },
+                        "active": { "type": "boolean" },
+                        "created_at": { "type": "string", "format": "date-time" },
+                        "updated_at": { "type": "string", "format": "date-time" }
+                    }
+                },
+                "WebhookDelivery": {
+                    "type": "object",
+                    "required": ["id", "webhook_id", "event", "attempt", "status", "created_at"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "webhook_id": { "type": "string" },
+                        "event": { "type": "string", "enum": ["transaction.queued", "transaction.broadcast", "transaction.confirmed", "transaction.expired", "transaction.failed", "transaction.cancelled"] },
+                        "transaction_hash": { "type": "string" },
+                        "status": { "type": "string", "enum": ["pending", "delivered", "failed"] },
+                        "attempt": { "type": "integer", "description": "Completed delivery attempts" },
+                        "next_attempt_at": { "type": ["string", "null"], "format": "date-time" },
+                        "response_status": { "type": ["integer", "null"], "description": "HTTP status returned by the receiver" },
+                        "error": { "type": ["string", "null"] },
+                        "payload": { "type": "string", "description": "Exact JSON body sent to the receiver" },
+                        "created_at": { "type": "string", "format": "date-time" }
                     }
                 },
                 "BroadcastResult": {
@@ -1380,7 +1624,8 @@ fn schemas() -> Value {
                 "Epoch": {
                     "type": "object",
                     "properties": {
-                        "epoch": { "type": "integer" }, "first_tick": { "type": "integer" },
+                        "epoch": { "type": "integer" }, "initial_tick": { "type": "integer", "description": "Observed first tick of the epoch; falls back to the earliest indexed tick" },
+                        "first_tick": { "type": "integer" },
                         "last_tick": { "type": "integer" },
                         "first_timestamp": { "type": "string", "format": "date-time" },
                         "last_timestamp": { "type": "string", "format": "date-time" },
@@ -1759,6 +2004,11 @@ mod tests {
             "/v1/prices/snapshot",
             "/v1/market",
             "/v1/search",
+            "/v1/mempool",
+            "/v1/mempool/{hash}",
+            "/v1/webhooks",
+            "/v1/webhooks/{id}",
+            "/v1/webhooks/{id}/deliveries",
         ] {
             assert!(paths.contains_key(path), "missing {path}");
         }
@@ -1832,10 +2082,12 @@ mod tests {
                         .is_some_and(|value| !value.is_empty()),
                     "{method} {path} needs a description"
                 );
-                assert!(
-                    operation["responses"].get("200").is_some(),
-                    "{method} {path} needs a 200 response"
-                );
+                let has_success = operation["responses"]
+                    .as_object()
+                    .expect("responses object")
+                    .keys()
+                    .any(|status| status.starts_with('2'));
+                assert!(has_success, "{method} {path} needs a 2xx success response");
             }
         }
         assert_eq!(

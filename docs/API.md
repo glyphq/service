@@ -3,8 +3,10 @@
 Glyph API exposes an HTTP API over the local ClickHouse index. Read routes never
 call a hosted RPC. Peer-backed operations live under `/v1/live` and connect
 directly to a configured Qubic peer per request. Transaction broadcast is
-disabled unless `ALLOW_BROADCAST=true`. If a resource is not indexed, the API
-returns a problem document instead of proxying upstream.
+disabled unless `ALLOW_BROADCAST=true`. Signed transactions are queued in the
+API mempool by default, or fanned out immediately with `direct: true`. If a
+resource is not indexed, the API returns a problem document instead of proxying
+upstream.
 
 - Base URL in development: `http://127.0.0.1:8080`
 - Indexed data routes are under `/v1`. Peer-backed routes are under `/v1/live`.
@@ -27,6 +29,8 @@ Route families:
 | `/v1/identities`, `/v1/wallets`, `/v1/assets` | ClickHouse index plus peer joins | Briefly |
 | `/v1/prices`, `/v1/market`, `/v1/analytics` | Stored prices and aggregates | Briefly |
 | `/v1/stream`, `/v1/ws` | Local index head | No |
+| `/v1/mempool` | Local mempool state plus index status | No |
+| `/v1/webhooks` | Local webhook registrations and deliveries | No |
 | `/v1/live` | Direct peer call | At most 2 s, some no-store |
 
 This page documents the implemented surface. Planned endpoints and tiers are in
@@ -265,14 +269,18 @@ and does not require parsing the free-form `stats` object in `/v1/status`.
 
 ### `GET /v1/epochs`
 
-Epoch summaries derived from indexed ticks, newest first. Uses cursor
-pagination.
+Epoch summaries, newest first. Uses cursor pagination. `initial_tick` is the
+observed first tick of the epoch recorded in `glyph.epochs`; `first_tick` and
+`last_tick` are the indexed range. When the `epochs` table has no row for an
+epoch, the API falls back to values derived from `glyph.ticks`, so databases
+created before the epoch table still work.
 
 ```json
 {
   "data": [
     {
       "epoch": 240,
+      "initial_tick": 91880000,
       "first_tick": 91880000,
       "last_tick": 91916480,
       "first_timestamp": "2026-11-18T02:00:00.000Z",
@@ -294,8 +302,40 @@ pagination.
 }
 ```
 
-`closed` is true when a later epoch is already indexed. The newest epoch can
-still receive ticks.
+`closed` comes from the persisted `glyph.epochs` row when one exists. Without
+one, it falls back to true when a later epoch is already indexed. The newest
+epoch can still receive ticks.
+
+#### Epoch lifecycle and retention
+
+Epoch boundaries are observed from peer `Head` values, not assumed from a fixed
+tick count. The network has used different epoch lengths, so Glyph never
+derives a boundary from 604,800 ticks.
+
+- On startup and on every head refresh the indexer upserts `(epoch,
+  initial_tick)` into the `glyph.epochs` table.
+- On an epoch change the previous epoch is closed at `new_initial_tick - 1`.
+  `closed` is therefore a persisted fact, not a guess from the newest indexed
+  tick.
+- Tick-to-epoch assignment uses the persisted boundary map. A tick whose epoch
+  cannot be resolved is skipped with a warning instead of being guessed.
+- Previous-epoch catch-up runs only when that epoch's boundary and computor set
+  are known.
+- All chain tables remain in one `glyph` ClickHouse database and are partitioned
+  by `epoch`. Per-epoch databases are deprecated: they duplicate DDL, break
+  cross-epoch queries (identities, price points, search), and make checkpoint
+  handling ambiguous. One database with epoch partitions gives the same cheap
+  partition drop without splitting the schema.
+
+Retention is optional and explicit:
+
+- `PRUNE_KEEP_EPOCHS`, when set, drops ClickHouse partitions older than the
+  newest N epochs after a rollover.
+- `glyph prune --keep N [--dry-run]` performs the same operation on demand.
+- Pruning drops chain partitions only. It does not delete raw archive objects,
+  because archive deletion is irreversible. It never deletes `identities` (which
+  span epochs) or `price_points` (which are keyed by hour).
+- Run `glyph prune --keep N --dry-run` first and confirm the reported epochs.
 
 ### `GET /v1/epochs/{epoch}`
 
@@ -1132,14 +1172,19 @@ Responses are `Cache-Control: no-store`.
 
 ### `POST /v1/transactions`
 
-Broadcasts a signed transaction to direct peers. Disabled unless
-`ALLOW_BROADCAST=true`.
+Submits a signed transaction. Disabled unless `ALLOW_BROADCAST=true`. The
+default path queues the transaction in the mempool and returns `202` with a
+tracked entry. Send `"direct": true` to use the previous behavior: one
+concurrent fan-out to direct peers, with the per-peer report.
 
 ```json
 {
   "raw": "0x...",
   "dry_run": false,
-  "peers": 3
+  "peers": 3,
+  "direct": false,
+  "webhook_url": "https://example.com/glyph",
+  "webhook_secret": "at-least-16-characters"
 }
 ```
 
@@ -1150,15 +1195,59 @@ and runs the same checks as `/v1/transactions/validate` before opening any
 socket. A transaction that fails validation is rejected with `400` and does not
 reach a peer.
 
-Valid transactions are sent with `dejavu=0` to up to `peers` peers concurrently.
-The default and ceiling come from `BROADCAST_PEERS` (default `3`, maximum `8`).
-Fan-out avoids a single slow peer dropping the transaction before it
-propagates.
+`webhook_url` and `webhook_secret` apply to the mempool path. They register a
+transaction-scoped webhook without a separate `POST /v1/webhooks` call. The
+secret must be at least 16 characters.
+
+The mempool path validates, persists, and performs the first broadcast attempt
+before returning, so the response usually reports `broadcast` or `failed`, not
+`queued`. The response contains the same `MempoolEntry` shape as
+`GET /v1/mempool/{hash}`:
+
+```json
+{
+  "data": {
+    "hash": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
+    "raw": "00...",
+    "source": "BZBQ...EXK",
+    "destination": "AAAA...AAA",
+    "amount": 1000000,
+    "tick": 91916480,
+    "peers": 3,
+    "status": "broadcast",
+    "attempts": 1,
+    "broadcast_peers": 2,
+    "broadcast_at": "2026-11-18T15:10:00.000Z",
+    "confirmed_at": null,
+    "confirmed_tick": null,
+    "error": null,
+    "created_at": "2026-11-18T15:10:00.000Z",
+    "updated_at": "2026-11-18T15:10:00.050Z"
+  },
+  "meta": {
+    "source": "mempool",
+    "status": "broadcast",
+    "broadcast": true,
+    "broadcast_peers": 2,
+    "confirmed": false,
+    "links": {
+      "status": "/v1/mempool/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
+      "transaction": "/v1/transactions/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh"
+    },
+    "hint": "A broadcast status means at least one peer accepted the packet at the socket. Qubic does not acknowledge broadcasts; poll the status link or the indexed transaction."
+  }
+}
+```
+
+The direct path sends valid transactions with `dejavu=0` to up to `peers` peers
+concurrently. The default and ceiling come from `BROADCAST_PEERS` (default `3`,
+maximum `8`). Fan-out avoids a single slow peer dropping the transaction before
+it propagates.
 
 Set `"dry_run": true` to get the validation report, transaction summary, and
-target peer count without broadcasting. A dry run returns `200` and never opens
-a peer connection. It is also the easiest way for a wallet to show a preview
-before asking the user to sign.
+target peer count without broadcasting or queueing. A dry run returns `200` and
+never opens a peer connection. It is also the easiest way for a wallet to show a
+preview before asking the user to sign.
 
 ```json
 {
@@ -1198,14 +1287,210 @@ before asking the user to sign.
 }
 ```
 
-A successful send returns `202 Accepted`. Qubic does not acknowledge
-broadcasts, so `sent` means the packet reached the peer socket, not that the
-transaction will be included. Use `meta.links.transaction`,
+A direct send returns `202 Accepted`. Qubic does not acknowledge broadcasts, so
+`sent` means the packet reached the peer socket, not that the transaction will
+be included. Use `meta.links.transaction`, `GET /v1/mempool/{hash}`,
 `GET /v1/transactions/{hash}/status`, or the tick stream to observe inclusion.
 
 - `403 forbidden` when `ALLOW_BROADCAST` is not `true`.
-- `400 bad_request` for malformed hex or a transaction that fails local checks.
-- `503 unavailable` when no configured peer accepts the packet.
+- `400 bad_request` for malformed hex, a transaction that fails local checks,
+  or a `webhook_url` without a matching `webhook_secret`.
+- `429 mempool_full` when `MEMPOOL_MAX_ENTRIES` is reached and the mempool path
+  is used. A duplicate hash returns the existing entry with `202` instead.
+- `503 unavailable` when no configured peer accepts a direct packet, or when
+  the mempool service is disabled and the direct path is unavailable.
+
+When `MEMPOOL_ENABLED=false`, or with `direct: true`, the request uses the
+direct fan-out path instead.
+
+### Mempool
+
+The mempool is API-local operational state, not a Qubic protocol mempool. Qubic
+peers do not expose a mempool. Each entry records a broadcast attempt so a
+wallet can poll one resource instead of retrying blindly.
+
+Status lifecycle:
+
+| Status | Meaning |
+| --- | --- |
+| `queued` | Persisted before the first broadcast attempt. It is normally visible only to an in-flight request and to webhook deliveries. |
+| `broadcast` | At least one peer accepted the packet at the socket in a recent attempt. Not a confirmation. |
+| `confirmed` | The transaction hash is present in the local index. `confirmed_tick` and `confirmed_at` are set. |
+| `expired` | The indexed head passed `tick + MEMPOOL_EXPIRY_TICKS` and the hash never appeared. Default expiry is 10 ticks. |
+| `failed` | The most recent attempt reached no peer. Failed entries stay open and are retried until `MEMPOOL_MAX_ATTEMPTS`, then remain failed until they expire. |
+| `cancelled` | An unconfirmed entry was cancelled through the API. A packet a peer already accepted is not recalled. |
+
+A transaction's `tick` field is its target tick. Qubic has no broadcast
+acknowledgement, so the tracker polls the index. Expiry uses the indexed head,
+not wall time. Rebroadcasts are at least `MEMPOOL_RETRY_MS` apart and stop after
+`MEMPOOL_MAX_ATTEMPTS`. `MEMPOOL_POLL_MS` controls how often statuses are
+reconciled.
+
+Every entry retains `raw`, the signed transaction hex, so a retry does not need
+the client to resubmit. `error` carries the last broadcast error when set.
+
+#### `POST /v1/mempool`
+
+```json
+{
+  "raw": "0x...",
+  "peers": 3,
+  "webhook_url": "https://example.com/glyph",
+  "webhook_secret": "at-least-16-characters"
+}
+```
+
+Returns `202` with the entry and `meta.links.status`. Requires
+`ALLOW_BROADCAST=true`. A duplicate tracked hash returns `202` with the existing
+entry, so submissions are idempotent. A full mempool (`MEMPOOL_MAX_ENTRIES`)
+returns `429 mempool_full`. `webhook_url` and `webhook_secret` must be supplied
+together.
+
+#### `GET /v1/mempool`
+
+Lists entries, newest first. Optional `status` filters one lifecycle value;
+an unknown value returns `400 bad_request`. `limit` is clamped to `1..500`
+(default `100`). Returns `data` plus a `meta` object with the effective `limit`
+and `status`.
+
+#### `GET /v1/mempool/{hash}`
+
+One tracked entry, with indexed confirmation merged in before the next
+background poll persists it. A hash that is not tracked returns `404 not_found`
+even when the transaction is already indexed; use
+`GET /v1/transactions/{hash}` for that case. A malformed hash returns
+`400 invalid_transaction_hash`.
+
+#### `DELETE /v1/mempool/{hash}`
+
+Marks an entry `cancelled` and returns it. A confirmed entry returns
+`409 already_confirmed`. `expired`, `failed`, and already `cancelled` entries
+can still be marked cancelled. An unknown hash returns `404 not_found`.
+
+### Webhooks
+
+Webhooks push mempool status changes to an HTTP or HTTPS endpoint. They are
+optional; polling `/v1/mempool/{hash}` is enough for a single client.
+
+#### `POST /v1/webhooks`
+
+```json
+{
+  "url": "https://example.com/glyph",
+  "secret": "at-least-16-characters",
+  "events": ["transaction.confirmed", "transaction.expired"],
+  "transaction_hashes": ["abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh"],
+  "identity": "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK"
+}
+```
+
+`secret` is required and must be at least 16 characters. Events are
+`transaction.queued`, `transaction.broadcast`, `transaction.confirmed`,
+`transaction.expired`, `transaction.failed`, and `transaction.cancelled`. An
+empty or omitted `events` list subscribes to every transaction event. Empty
+`transaction_hashes` means all hashes. Empty `identity` means all source
+identities; a non-empty value matches only the transaction source.
+
+Returns `201` with the registration. The secret is never returned. Localhost and
+private address targets are rejected with `400 bad_request` unless
+`WEBHOOK_ALLOW_PRIVATE=true`.
+
+#### `GET /v1/webhooks`
+
+Active registrations only, without secrets. `meta.count` reports the number
+returned.
+
+#### `DELETE /v1/webhooks/{id}`
+
+Deactivates a registration and returns the updated record without its secret.
+Pending deliveries are not retried. The record and its delivery history remain.
+
+#### `GET /v1/webhooks/{id}/deliveries`
+
+Recent deliveries, newest first. Each row tracks one delivery across retries. Optional
+`limit` is clamped to `1..500` (default `50`).
+
+```json
+{
+  "data": [
+    {
+      "id": "2b6f0b8e-7f4a-4c2e-9f1d-3d5f7a9c1e02",
+      "webhook_id": "9f0e8d7c-6b5a-4321-8fed-cba987654321",
+      "event": "transaction.confirmed",
+      "transaction_hash": "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh",
+      "status": "delivered",
+      "attempt": 1,
+      "next_attempt_at": null,
+      "response_status": 200,
+      "error": null,
+      "payload": "{\"event\":\"transaction.confirmed\",...}",
+      "created_at": "2026-11-18T15:10:02.000Z"
+    }
+  ],
+  "meta": { "limit": 50 }
+}
+```
+
+`status` is `pending`, `delivered`, or `failed`. `attempt` counts completed
+attempts and `next_attempt_at` is set while a retry is scheduled. `payload` is
+the exact JSON body sent to the receiver, retained so retries are
+byte-identical. Delivery is at-least-once: retries use a 1 s, 2 s, 4 s, ...
+backoff capped at 60 s and stop after `WEBHOOK_MAX_ATTEMPTS`, at which point the
+row becomes `failed`. A non-2xx response or a timeout counts as a failed
+attempt. `WEBHOOK_TIMEOUT_MS` bounds each request.
+
+Delivery headers:
+
+| Header | Meaning |
+| --- | --- |
+| `X-Glyph-Event` | Event name, for example `transaction.confirmed`. |
+| `X-Glyph-Delivery` | Unique delivery id, stable across retries. Use it for receiver-side deduplication. |
+| `X-Glyph-Timestamp` | Unix seconds when the request was signed. |
+| `X-Glyph-Signature` | `sha256=<hex HMAC-SHA256 of "{timestamp}.{body}">`. |
+
+The body is a JSON object with `event` and a `transaction` object carrying the
+mempool entry fields. It is stored on the delivery row and replayed
+byte-for-byte on retries.
+
+Verify the signature over the exact bytes received, compare in constant time,
+and reject stale timestamps. Example in Node:
+
+```js
+import crypto from "node:crypto";
+
+export function verifyGlyphWebhook(rawBody, headers, secret) {
+  const timestamp = headers["x-glyph-timestamp"];
+  const received = headers["x-glyph-signature"] ?? "";
+  const expected =
+    "sha256=" +
+    crypto
+      .createHmac("sha256", secret)
+      .update(`${timestamp}.${rawBody}`)
+      .digest("hex");
+
+  const age = Math.abs(Date.now() / 1000 - Number(timestamp));
+  if (!Number.isFinite(age) || age > 300) return false;
+  if (received.length !== expected.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(received), Buffer.from(expected));
+}
+```
+
+Security caveats:
+
+- The URL is supplied by an API client. The dispatcher rejects non-HTTP(S)
+  schemes and private or loopback addresses by default, but
+  `WEBHOOK_ALLOW_PRIVATE=true` removes that protection. Do not enable it on a
+  public deployment unless clients are trusted.
+- The secret is a credential. Never log it, return it, or reuse it across
+  receivers. It is stored in ClickHouse so the dispatcher can sign retries;
+  protect database credentials and backups accordingly.
+- Delivery is at-least-once and retries can repeat an event. Deduplicate with
+  `X-Glyph-Delivery` or by `(transaction_hash, event)`.
+- Reject timestamps outside a short window to limit replay of a captured
+  request.
+- Running more than one API replica with webhooks enabled can duplicate
+  deliveries because each replica runs its own dispatcher. Use one dispatcher
+  or accept at-least-once delivery.
 
 ### `GET /v1/ticks/{tick}/raw`
 
@@ -1220,16 +1505,38 @@ Without `section`, the response is the zstd-compressed QBB1 container. With
 | --- | --- |
 | `tick` | Tick header record. |
 | `tick_data` | Tick data record. |
-| `votes` | Concatenated 352-byte computor votes. |
+| `votes` | Concatenated 352-byte computor votes. Only present when the indexer ran with `ARCHIVE_VOTES=true`; otherwise `404 not_found` with a message explaining that votes were not archived. |
 | `transactions` | Concatenated 144-byte transaction records. |
 | `log_ranges` | Log range record. |
 | `logs` | Concatenated encoded log events. |
-| `computors` | Computor list for the tick's epoch. |
+| `computors` | Computor list for the tick's epoch. Read from the bundle when present, otherwise from the per-epoch sidecar at `raw/epoch=NNN/computors.bin`. |
 
 Responses are `application/octet-stream` with an immutable cache policy and a
 filename such as `tick-91916480-transactions.bin`. An unindexed tick or a
 missing bundle returns `404 not_found`. A missing archive configuration returns
 `503 unavailable`.
+
+#### Archive policy
+
+The default archive is smaller than the wire data:
+
+- `ARCHIVE_VOTES=false` is the default. Full 352-byte vote headers are not part
+  of the long-term archive. Operators who need forensic vote sets can set
+  `ARCHIVE_VOTES=true`.
+- The computor set is identical for every tick in an epoch. It is written once
+  per epoch to `raw/epoch=NNN/computors.bin` instead of being repeated in every
+  tick bundle. The set is about 21.7 KB, so repeating it 330k times per epoch
+  costs roughly 7 GB of redundant object data.
+- Tick bundles still contain the tick header, `TickData`, transactions, log
+  ranges, and logs.
+- Existing objects that already contain `Votes` or `Computors` sections remain
+  readable. The bundle decoder treats both as optional.
+
+This policy keeps the evidence needed to verify and replay indexed state while
+removing two large redundant sections. A vote set that is not archived can be
+re-fetched from a peer only while that peer retains the tick. If votes are
+required for audit, enable `ARCHIVE_VOTES=true` before the epoch is ingested;
+the setting does not backfill existing bundles.
 
 ### `GET /openapi.json`
 
@@ -1269,6 +1576,9 @@ Errors are problem documents with exactly these fields:
 | `invalid_transaction_hash` | 400 | Hash is not a valid base-26 transaction hash. |
 | `invalid_cursor` | 400 | Cursor is malformed or belongs to another route/filter set. |
 | `not_found` | 404 | The resource is valid but absent from the index. |
+| `conflict` | 409 | A generic state conflict. |
+| `already_confirmed` | 409 | A confirmed mempool entry cannot be cancelled. |
+| `mempool_full` | 429 | `MEMPOOL_MAX_ENTRIES` is reached. |
 | `rate_limited` | 429 | `RATE_LIMIT_PER_MINUTE` was exceeded. Includes `Retry-After`. |
 | `forbidden` | 403 | The operation is disabled, for example broadcast without `ALLOW_BROADCAST=true`. |
 | `unavailable` | 503 | A peer, the stream hub, or the raw archive is not available. |
@@ -1325,14 +1635,28 @@ current surface.
 | `RATE_LIMIT_PER_MINUTE` | unset (disabled) | Per-client-IP request budget. |
 | `QUBIC_PEERS` | unset | Comma-separated `host:port` peers for live routes and broadcast. |
 | `QUBIC_PEER` | unset | Single fallback peer when `QUBIC_PEERS` is unset. |
-| `ALLOW_BROADCAST` | `false` | Enable `POST /v1/transactions`. |
+| `ALLOW_BROADCAST` | `false` | Enable `POST /v1/transactions` and `POST /v1/mempool`. |
+| `BROADCAST_PEERS` | `3` | Default and maximum peer fan-out per broadcast attempt (maximum `8`). |
+| `MEMPOOL_ENABLED` | `true` | Enable mempool persistence and background tracking. |
+| `MEMPOOL_POLL_MS` | `1000` | Mempool status reconciliation interval. |
+| `MEMPOOL_RETRY_MS` | `5000` | Minimum delay between rebroadcasts. |
+| `MEMPOOL_MAX_ATTEMPTS` | `5` | Maximum broadcast attempts per entry. |
+| `MEMPOOL_EXPIRY_TICKS` | `10` | Expiry window after the target tick. |
+| `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open mempool entries. |
+| `WEBHOOK_TIMEOUT_MS` | `5000` | Webhook delivery timeout. |
+| `WEBHOOK_MAX_ATTEMPTS` | `6` | Delivery attempts before dead-lettering. |
+| `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private webhook targets. |
 | `STREAM_POLL_MS` | `1000` | Index-head poll interval for the stream hub. |
-| `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_REGION` | unset | Raw archive object storage. Presence of `S3_BUCKET` enables it. |
+| `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PREFIX` | unset | Raw archive object storage. Presence of `S3_BUCKET` enables it; the `_ID`/`_SECRET_ACCESS_KEY` aliases are also accepted. |
 | `ARCHIVE_DIR` | unset | Filesystem raw archive used when S3 is not configured. |
+| `ARCHIVE_VOTES` | `false` | Include full vote headers in raw tick bundles. |
 | `RUST_LOG` | `info,tower_http=info` | Tracing filter. |
 
 The API never writes ticks. It applies schema initialization on startup and can
 run as multiple replicas against the same database.
+
+The indexer reads `PRUNE_KEEP_EPOCHS` for optional epoch retention. It is not an
+API process variable.
 
 ## Examples
 
@@ -1365,5 +1689,16 @@ curl -sS 'localhost:8080/v1/live/transactions/<hash>/status' | jq .
 curl -sS -X POST localhost:8080/v1/transactions/validate \
   -H 'content-type: application/json' \
   -d '{"raw":"0x..."}' | jq .
+curl -sS -X POST localhost:8080/v1/transactions \
+  -H 'content-type: application/json' -d '{"raw":"0x..."}' | jq .
+curl -sS -X POST localhost:8080/v1/transactions \
+  -H 'content-type: application/json' -d '{"raw":"0x...","direct":true}' | jq .
+curl -sS -X POST localhost:8080/v1/mempool \
+  -H 'content-type: application/json' -d '{"raw":"0x..."}' | jq .
+curl -sS 'localhost:8080/v1/mempool?status=broadcast&limit=20' | jq .
+curl -sS localhost:8080/v1/mempool/abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh | jq .
+curl -sS -X POST localhost:8080/v1/webhooks \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com/glyph","secret":"at-least-16-characters","events":["transaction.confirmed"]}' | jq .
 curl -sS -o tick.bin 'localhost:8080/v1/ticks/91916480/raw?section=transactions'
 ```

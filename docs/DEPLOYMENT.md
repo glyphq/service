@@ -100,7 +100,7 @@ and the stack is reachable only from the same machine.
 | `API_HOST` | `127.0.0.1` | Host interface for the published API port. Set `0.0.0.0` to expose it. |
 | `API_PORT` | `8080` | Host port for the API. |
 | `QUBIC_PEERS` | `peer.example:21841` | Comma-separated peer addresses used by the indexer and by live API routes. |
-| `ALLOW_BROADCAST` | `false` | Set `true` to enable `POST /v1/transactions`. Keep disabled unless the API is trusted. |
+| `ALLOW_BROADCAST` | `false` | Set `true` to enable `POST /v1/transactions` and `POST /v1/mempool`. Keep disabled unless the API is trusted. |
 | `BROADCAST_PEERS` | `3` | Peers contacted concurrently per broadcast. Capped at `8`; each connection is a direct peer socket. |
 | `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval. |
 | `PRICE_POLL_MS` | `60000` | Live QUBIC/USDT oracle price refresh interval in the API. |
@@ -125,6 +125,17 @@ and the stack is reachable only from the same machine.
 | `CLICKHOUSE_USER` | `glyph` | ClickHouse user created by the image entrypoint. |
 | `CLICKHOUSE_PASSWORD` | `glyph-dev-secret` | ClickHouse password. `CLICKHOUSE_URL` must embed the same credentials. |
 | `ARCHIVE_FAIL_CLOSED` | `false` | Set `true` to stop ingestion when a bundle cannot be archived. |
+| `ARCHIVE_VOTES` | `false` | Store full vote headers in every tick bundle. Off by default; the computor set is always written once per epoch at `raw/epoch=NNN/computors.bin`. |
+| `MEMPOOL_ENABLED` | `true` | Enable mempool persistence and background tracking in the API. Requires `ALLOW_BROADCAST=true` to reach peers. |
+| `MEMPOOL_POLL_MS` | `1000` | Mempool status poll interval. |
+| `MEMPOOL_RETRY_MS` | `5000` | Minimum delay between rebroadcasts of an unconfirmed transaction. |
+| `MEMPOOL_MAX_ATTEMPTS` | `5` | Maximum broadcast attempts before an entry is marked `failed`. |
+| `MEMPOOL_EXPIRY_TICKS` | `10` | Ticks after the target tick before an unindexed transaction expires. |
+| `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open mempool entries. New submissions are rejected when full. |
+| `WEBHOOK_TIMEOUT_MS` | `5000` | Webhook delivery timeout. |
+| `WEBHOOK_MAX_ATTEMPTS` | `6` | Delivery attempts before an attempt is dead-lettered. |
+| `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private-range webhook targets. Keep `false` unless the receiver is internal and trusted. |
+| `PRUNE_KEEP_EPOCHS` | unset | Optional retention after an epoch rollover. Drops ClickHouse partitions older than the newest N epochs. |
 | `GLYPH_IMAGE` | `glyph:local` | Image tag built and used by all glyph services. |
 | `GLYPH_API_LOG` | `info,tower_http=info` | `RUST_LOG` for the API. |
 | `GLYPH_INDEXER_LOG` | `info` | `RUST_LOG` for the indexer. |
@@ -148,8 +159,37 @@ stored, the cursor takes over and `GLYPH_FROM_TICK` is ignored.
 
 `s3-init` creates the archive bucket. It is idempotent. The indexer writes one
 zstd-compressed QBB1 bundle per verified tick before persisting that tick, using
-the S3 variables from the shared application environment. The API exposes the
-same objects through `GET /v1/ticks/{tick}/raw`.
+the S3 variables from the shared application environment. By default a bundle
+contains the tick header, tick data, transactions, log ranges, and logs. Full
+vote headers are opt-in with `ARCHIVE_VOTES=true`, and the epoch computor set is
+written once to `raw/epoch=NNN/computors.bin` rather than repeated in every
+bundle. The API exposes the same objects through `GET /v1/ticks/{tick}/raw`.
+
+The API owns the mempool and webhook loop. `POST /v1/transactions` submits to the
+mempool by default when `MEMPOOL_ENABLED=true`; add `"direct": true` to use the
+old synchronous peer fan-out. Mempool and webhook state lives in the `mempool`,
+`webhooks`, and `webhook_deliveries` ClickHouse tables, so a restart does not
+lose queued entries. Keep `ALLOW_BROADCAST=false` unless the deployment is
+trusted: without it, queued entries never reach a peer and expire.
+
+### Epoch lifecycle and retention
+
+Epoch boundaries are observed from peer `Head` values and stored in
+`glyph.epochs`. Do not size or configure around a fixed 604,800-tick epoch; the
+current network uses roughly 330k ticks and the rate can change.
+
+- All chain tables live in the single `CLICKHOUSE_DB` database and are
+  partitioned by `epoch`. Per-epoch databases are deprecated. They duplicate
+  DDL, break cross-epoch tables (`identities`, `price_points`), and complicate
+  the checkpoint.
+- `PRUNE_KEEP_EPOCHS` drops chain partitions older than the newest N epochs
+  after a rollover. Leave it unset to retain everything.
+- `docker compose run --rm indexer prune --keep N --dry-run` lists what would be
+  dropped. Without `--dry-run` it drops ClickHouse partitions only. Archive
+  objects are never deleted, and `identities` and `price_points` are never
+  pruned by this command.
+- Pruning is irreversible for the hot store. Confirm that the affected epochs
+  are backed up or that the raw archive is sufficient before running it.
 
 ### Script variables
 
@@ -282,6 +322,10 @@ docker compose restart api
 # Re-run the idempotent schema migration.
 docker compose run --rm migrate
 
+# Drop ClickHouse partitions older than the newest 54 epochs. Archive objects
+# are never deleted by this command. Add --dry-run to list what would be dropped.
+docker compose run --rm indexer prune --keep 54
+
 # Stop. --wipe deletes volumes; --images removes the local image.
 scripts/docker-down.sh
 scripts/docker-down.sh --wipe
@@ -387,10 +431,16 @@ checkpoint and duplicate writes, though writes are idempotent.
 This Compose file is a single-host deployment, not a hardened multi-tenant
 platform.
 
-- The API is read-only by default. `POST /v1/transactions` is disabled unless
-  `ALLOW_BROADCAST=true`; live routes only read peer state. It has
-  permissive CORS, no API keys, and no rate limit by default. Put it behind an
-  authenticating reverse proxy if it is not on a trusted network.
+- The API is read-only by default. `POST /v1/transactions` and
+  `POST /v1/mempool` are disabled unless `ALLOW_BROADCAST=true`; live routes
+  only read peer state. It has permissive CORS, no API keys, and no rate limit
+  by default. Put it behind an authenticating reverse proxy if it is not on a
+  trusted network.
+- Webhook targets are client-supplied URLs. The dispatcher rejects non-HTTP(S)
+  schemes and private or loopback addresses unless `WEBHOOK_ALLOW_PRIVATE=true`.
+  Leave that setting `false` on any public deployment. Webhook secrets sign
+  deliveries and must be treated as credentials; they are never returned by the
+  API.
 - ClickHouse is published only on `127.0.0.1` and uses the credentials embedded
   in `CLICKHOUSE_URL`. The HTTP connection is not TLS inside the Docker network.
   Never expose port `8123` publicly.

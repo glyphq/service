@@ -1,11 +1,13 @@
 //! Verification and sync pipeline for the Glyph Qubic index.
 
+pub mod archive_policy;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use archive::{RawBundle, Section, SharedArchive};
+use archive::{ArchivePolicy, SharedArchive};
 use chrono::{DateTime, Utc};
 use node::{Head, NodePool, Peer, PeerConfig, TickBundle};
 use qubic::crypto::k12::k12_32;
@@ -299,23 +301,84 @@ fn next_after_flush(current: u32, persisted: Option<u32>) -> u32 {
     }
 }
 
-/// Ticks per Qubic epoch. Kept here because the indexer already owns the
-/// previous-epoch catch-up logic and the qubic crate is outside this lane.
-const TICKS_PER_EPOCH: u32 = 604_800;
+/// Epoch start ticks keyed by epoch, ordered by epoch.
+///
+type EpochBoundaries = BTreeMap<u16, u32>;
 
-fn epoch_for_tick(head: &Head, tick: u32) -> u16 {
-    if tick >= head.initial_tick {
-        return head.epoch;
+/// Resolve the epoch that owns `tick` from observed boundaries.
+///
+/// Returns `None` when the tick predates every observed epoch start. Callers
+/// must skip such ticks instead of guessing an epoch from a fixed tick count.
+fn epoch_for_tick(boundaries: &EpochBoundaries, tick: u32) -> Option<u16> {
+    let mut entries = boundaries
+        .iter()
+        .map(|(epoch, initial_tick)| (*epoch, *initial_tick))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(_, initial_tick)| *initial_tick);
+    let index = entries
+        .iter()
+        .rposition(|(_, initial_tick)| *initial_tick <= tick)?;
+    let (epoch, initial_tick) = entries[index];
+    // A gap between observed boundaries means ticks in between could belong to
+    // an epoch we never observed. Refuse to guess instead of assigning them to
+    // the preceding epoch. The boundary tick itself is unambiguous.
+    if let Some((next_epoch, _)) = entries.get(index + 1) {
+        if *next_epoch != epoch.saturating_add(1) && tick != initial_tick {
+            return None;
+        }
     }
-    let epochs_back = 1 + (head.initial_tick - tick) / TICKS_PER_EPOCH;
-    head.epoch
-        .saturating_sub(u16::try_from(epochs_back).unwrap_or(u16::MAX))
+    Some(epoch)
+}
+
+fn boundary_map(boundaries: Vec<store::EpochBoundary>) -> EpochBoundaries {
+    boundaries
+        .into_iter()
+        .map(|boundary| (boundary.epoch, boundary.initial_tick))
+        .collect()
+}
+
+/// Close open epochs below `head` whose successor boundary is known.
+///
+async fn close_stale_epochs<S: Store>(store: &S, boundaries: &EpochBoundaries, head: &Head) {
+    let Ok(metadata) = store.epoch_metadata().await else {
+        return;
+    };
+    let mut starts = boundaries
+        .iter()
+        .map(|(epoch, initial_tick)| (*epoch, *initial_tick))
+        .collect::<Vec<_>>();
+    starts.sort_by_key(|(_, initial_tick)| *initial_tick);
+    let mut open = metadata
+        .into_iter()
+        .filter(|row| !row.closed && row.epoch < head.epoch)
+        .collect::<Vec<_>>();
+    open.sort_by_key(|row| row.epoch);
+    for row in open {
+        let successor = starts
+            .iter()
+            .find(|(epoch, _)| *epoch == row.epoch.saturating_add(1))
+            .map(|(_, initial_tick)| *initial_tick);
+        let Some(successor) = successor else {
+            continue;
+        };
+        let last_tick = successor.saturating_sub(1);
+        if last_tick < row.initial_tick {
+            continue;
+        }
+        if let Err(error) = store
+            .close_epoch(row.epoch, row.initial_tick, last_tick)
+            .await
+        {
+            tracing::warn!(epoch = row.epoch, %error, "stale epoch was not closed");
+        }
+    }
 }
 
 pub struct Indexer<S: Store + 'static> {
     store: Arc<S>,
     pool: NodePool,
     config: IndexerConfig,
+    archive_policy: ArchivePolicy,
     /// Absolute identity snapshots as of the last persisted tick.
     identities: HashMap<[u8; 32], IdentityRow>,
 }
@@ -330,6 +393,7 @@ impl<S: Store + 'static> Indexer<S> {
             store,
             pool,
             config,
+            archive_policy: ArchivePolicy::from_env(),
             identities: HashMap::new(),
         })
     }
@@ -341,6 +405,26 @@ impl<S: Store + 'static> Indexer<S> {
         let head = peer.head().await?;
         let next = self.next_tick(&head).await?;
         let tuning = PipelineTuning::from_env();
+
+        // Load observed boundaries and record this head before any worker can
+        // see it. A tick is only assigned to an epoch whose boundary is known.
+        let mut boundaries = match self.store.epoch_boundaries().await {
+            Ok(rows) => boundary_map(rows),
+            Err(error) => {
+                tracing::warn!(%error, "epoch boundaries could not be loaded");
+                EpochBoundaries::new()
+            }
+        };
+        boundaries.insert(head.epoch, head.initial_tick);
+        if let Err(error) = self
+            .store
+            .write_epoch_start(head.epoch, head.initial_tick)
+            .await
+        {
+            tracing::warn!(epoch = head.epoch, %error, "epoch start was not persisted");
+        }
+        close_stale_epochs(self.store.as_ref(), &boundaries, &head).await;
+        let shared_boundaries = Arc::new(AsyncRwLock::new(boundaries));
 
         tracing::info!(
             epoch = head.epoch,
@@ -415,11 +499,18 @@ impl<S: Store + 'static> Indexer<S> {
         }
 
         let head_poll = Duration::from_millis(100).min(self.config.poll_interval);
+        let prune_keep = std::env::var("PRUNE_KEEP_EPOCHS")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|keep| *keep > 0);
         let coordinator = tokio::spawn(coordinate(
             peer,
             peer_configs.to_vec(),
             shared_head.clone(),
             shared_computors.clone(),
+            shared_boundaries.clone(),
+            self.store.clone(),
+            prune_keep,
             pipeline_cancel.clone(),
             head_poll,
         ));
@@ -444,6 +535,7 @@ impl<S: Store + 'static> Indexer<S> {
                 result_tx.clone(),
                 shared_head.clone(),
                 shared_computors.clone(),
+                shared_boundaries.clone(),
                 pipeline_cancel.clone(),
             )));
         }
@@ -594,7 +686,7 @@ impl<S: Store + 'static> Indexer<S> {
                     {
                         let tick = verified.tick.tick;
                         let epoch = verified.tick.epoch;
-                        let raw = raw_bundle(&verified);
+                        let raw = archive_policy::raw_bundle(&verified, &self.archive_policy);
                         archives.push(tokio::spawn(async move {
                             let _permit = semaphore
                                 .acquire_owned()
@@ -628,13 +720,46 @@ impl<S: Store + 'static> Indexer<S> {
                     );
                     let epoch = verified.tick.epoch;
                     if stored_epochs.insert(epoch) {
-                        if let Err(error) = self
+                        match self
                             .store
                             .write_computors(epoch, &verified.computors, Utc::now())
                             .await
                         {
-                            stored_epochs.remove(&epoch);
-                            tracing::warn!(epoch, %error, "computor set was not persisted");
+                            Ok(()) => {
+                                // The sidecar is written once per epoch and is
+                                // idempotent. Await it so failures are retried
+                                // on the next tick, or stop the writer when the
+                                // archive is configured to fail closed.
+                                if let (Some(archive), Some(semaphore)) =
+                                    (self.config.archive.clone(), archive_semaphore.clone())
+                                {
+                                    let bytes = verified.computors.encode();
+                                    let permit = semaphore
+                                        .acquire_owned()
+                                        .await
+                                        .expect("archive semaphore is never closed");
+                                    let result =
+                                        archive::put_computors(archive.as_ref(), epoch, &bytes)
+                                            .await;
+                                    drop(permit);
+                                    if let Err(error) = result {
+                                        if self.config.archive_fail_closed {
+                                            run_result = Err(Error::Archive(error));
+                                            break 'writer;
+                                        }
+                                        stored_epochs.remove(&epoch);
+                                        tracing::warn!(
+                                            epoch,
+                                            %error,
+                                            "computor sidecar was not archived; retrying on the next tick"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                stored_epochs.remove(&epoch);
+                                tracing::warn!(epoch, %error, "computor set was not persisted");
+                            }
                         }
                     }
                     for event in &verified.logs {
@@ -870,6 +995,14 @@ impl<S: Store + 'static> Indexer<S> {
                 .await
                 .ok();
             return false;
+        }
+
+        if let node::Error::Verification(message) = &error {
+            if message.starts_with("unknown epoch boundary") {
+                tracing::warn!(tick = next, %message, "skipping a tick with no known epoch");
+                *consecutive_failures = 0;
+                return true;
+            }
         }
 
         tracing::warn!(tick = next, %error, "tick fetch failed, retrying");
@@ -1408,11 +1541,15 @@ async fn connect_any(configs: &[PeerConfig]) -> Option<Peer> {
     connect_from(configs, 0).await.map(|(peer, _)| peer)
 }
 
-async fn coordinate(
+#[allow(clippy::too_many_arguments)]
+async fn coordinate<S: Store + 'static>(
     mut peer: Peer,
     configs: Vec<PeerConfig>,
     head: Arc<AsyncRwLock<Head>>,
     computors: Arc<AsyncRwLock<HashMap<u16, Computors>>>,
+    boundaries: Arc<AsyncRwLock<EpochBoundaries>>,
+    store: Arc<S>,
+    prune_keep: Option<u16>,
     cancel: CancellationToken,
     poll: Duration,
 ) {
@@ -1459,14 +1596,74 @@ async fn coordinate(
                         }
                     }
                 }
+                // Persist and publish the boundary before the head so a
+                // worker never sees a head whose epoch has no boundary.
+                let boundary_changed = {
+                    let mut known = boundaries.write().await;
+                    let previous = known.insert(updated.epoch, updated.initial_tick);
+                    previous != Some(updated.initial_tick)
+                };
+                if boundary_changed {
+                    if let Err(error) = store
+                        .write_epoch_start(updated.epoch, updated.initial_tick)
+                        .await
+                    {
+                        tracing::warn!(
+                            epoch = updated.epoch,
+                            %error,
+                            "epoch start was not persisted"
+                        );
+                    }
+                }
                 *head.write().await = updated.clone();
                 if epoch_changed {
+                    if updated.epoch != old_head.epoch.saturating_add(1) {
+                        tracing::warn!(
+                            old_epoch = old_head.epoch,
+                            new_epoch = updated.epoch,
+                            "epoch gap observed; leaving the previous epoch open instead of guessing its last tick"
+                        );
+                    } else if let Some(last_tick) = updated.initial_tick.checked_sub(1) {
+                        let previous_first = if old_head.initial_tick <= last_tick {
+                            old_head.initial_tick
+                        } else {
+                            last_tick
+                        };
+                        if let Err(error) = store
+                            .close_epoch(old_head.epoch, previous_first, last_tick)
+                            .await
+                        {
+                            tracing::warn!(
+                                epoch = old_head.epoch,
+                                %error,
+                                "previous epoch was not closed"
+                            );
+                        }
+                    }
                     tracing::info!(
                         old_epoch = old_head.epoch,
                         new_epoch = updated.epoch,
                         initial_tick = updated.initial_tick,
                         "epoch changed"
                     );
+                    if let Some(keep) = prune_keep {
+                        let store = store.clone();
+                        tokio::spawn(async move {
+                            match store.prune_epochs(keep).await {
+                                Ok(pruned) if !pruned.is_empty() => tracing::info!(
+                                    keep,
+                                    pruned = pruned.len(),
+                                    oldest = pruned.first().copied(),
+                                    newest = pruned.last().copied(),
+                                    "pruned old epochs"
+                                ),
+                                Ok(_) => {}
+                                Err(error) => {
+                                    tracing::warn!(keep, %error, "epoch pruning failed")
+                                }
+                            }
+                        });
+                    }
                 }
             }
             Err(error) => {
@@ -1576,6 +1773,7 @@ async fn fetch_worker(
     results: mpsc::Sender<FetchResult>,
     head: Arc<AsyncRwLock<Head>>,
     computors: Arc<AsyncRwLock<HashMap<u16, Computors>>>,
+    boundaries: Arc<AsyncRwLock<EpochBoundaries>>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -1608,7 +1806,31 @@ async fn fetch_worker(
         }
         let started = Instant::now();
         let head_snapshot = head.read().await.clone();
-        let epoch = epoch_for_tick(&head_snapshot, item.tick);
+        let epoch = {
+            let known = boundaries.read().await;
+            epoch_for_tick(&known, item.tick)
+        };
+        let Some(epoch) = epoch else {
+            tracing::warn!(
+                tick = item.tick,
+                "epoch boundary for tick is unknown; skipping instead of guessing"
+            );
+            if results
+                .send(FetchResult {
+                    tick: item.tick,
+                    attempt: item.attempt,
+                    outcome: Err(node::Error::Verification(format!(
+                        "unknown epoch boundary for tick {}",
+                        item.tick
+                    ))),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
+            continue;
+        };
         let cached = computors.read().await.get(&epoch).cloned();
         let outcome = if let Some(computors) = cached {
             tokio::select! {
@@ -1661,30 +1883,6 @@ async fn fetch_worker(
             return;
         }
     }
-}
-
-fn raw_bundle(verified: &VerifiedTick) -> RawBundle {
-    let mut bundle = RawBundle::new(verified.tick.epoch, verified.tick.tick);
-    bundle.set_section(Section::TickHeader, verified.tick.encode().to_vec());
-    bundle.set_section(Section::TickData, verified.tick_data.encode());
-    let mut votes = Vec::with_capacity(verified.votes.len() * 352);
-    for vote in &verified.votes {
-        votes.extend_from_slice(&vote.encode());
-    }
-    bundle.set_section(Section::Votes, votes);
-    let mut transactions = Vec::new();
-    for transaction in &verified.transactions {
-        transactions.extend_from_slice(&transaction.encode());
-    }
-    bundle.set_section(Section::Transactions, transactions);
-    bundle.set_section(Section::LogRanges, verified.log_ranges.encode());
-    let mut logs = Vec::new();
-    for event in &verified.logs {
-        logs.extend_from_slice(&event.encode());
-    }
-    bundle.set_section(Section::Logs, logs);
-    bundle.set_section(Section::Computors, verified.computors.encode());
-    bundle
 }
 
 fn required_quorum(digest: &[u8; 32]) -> usize {
@@ -2218,24 +2416,51 @@ mod tests {
     }
 
     #[test]
-    fn epoch_mapping_handles_multi_epoch_catch_up() {
-        let head = Head {
-            epoch: 240,
-            tick: 91_920_000,
-            initial_tick: 91_910_000,
-            tick_duration: 1_000,
-        };
-        assert_eq!(epoch_for_tick(&head, head.initial_tick), 240);
-        assert_eq!(epoch_for_tick(&head, head.initial_tick - 1), 239);
-        assert_eq!(
-            epoch_for_tick(&head, head.initial_tick - TICKS_PER_EPOCH),
-            238
-        );
-        assert_eq!(
-            epoch_for_tick(&head, head.initial_tick - 2 * TICKS_PER_EPOCH),
-            237
-        );
-        assert_eq!(epoch_for_tick(&head, head.tick), 240);
+    fn epoch_mapping_uses_observed_boundaries() {
+        // The current network runs roughly 330k ticks per epoch, not the
+        // historical 604_800. Boundaries are learned per epoch.
+        let mut boundaries = EpochBoundaries::new();
+        boundaries.insert(237, 100_000_000);
+        boundaries.insert(238, 100_330_000);
+        boundaries.insert(239, 100_661_000);
+        boundaries.insert(240, 100_991_500);
+
+        assert_eq!(epoch_for_tick(&boundaries, 100_991_500), Some(240));
+        assert_eq!(epoch_for_tick(&boundaries, 100_991_499), Some(239));
+        assert_eq!(epoch_for_tick(&boundaries, 100_661_000), Some(239));
+        assert_eq!(epoch_for_tick(&boundaries, 100_330_000), Some(238));
+        assert_eq!(epoch_for_tick(&boundaries, 100_000_000), Some(237));
+        // The tick predates every observed boundary. Guessing a fixed-size
+        // epoch would silently assign it to the wrong epoch.
+        assert_eq!(epoch_for_tick(&boundaries, 99_999_999), None);
+    }
+
+    #[test]
+    fn epoch_mapping_refuses_unobserved_gaps() {
+        let mut boundaries = EpochBoundaries::new();
+        boundaries.insert(238, 100_000_000);
+        boundaries.insert(240, 100_660_000);
+        assert_eq!(epoch_for_tick(&boundaries, 100_000_000), Some(238));
+        assert_eq!(epoch_for_tick(&boundaries, 100_659_999), None);
+        assert_eq!(epoch_for_tick(&boundaries, 100_660_000), Some(240));
+    }
+
+    #[test]
+    fn boundary_map_keeps_epoch_order() {
+        let boundaries = boundary_map(vec![
+            store::EpochBoundary {
+                epoch: 2,
+                initial_tick: 220,
+            },
+            store::EpochBoundary {
+                epoch: 1,
+                initial_tick: 110,
+            },
+        ]);
+        assert_eq!(boundaries.get(&1), Some(&110));
+        assert_eq!(boundaries.get(&2), Some(&220));
+        assert_eq!(epoch_for_tick(&boundaries, 219), Some(1));
+        assert_eq!(epoch_for_tick(&boundaries, 220), Some(2));
     }
 
     #[tokio::test]

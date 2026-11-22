@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub mod gateway;
 pub mod rows;
 pub mod schema;
 pub mod writer;
@@ -200,12 +201,16 @@ pub struct IdentityActivityRow {
 
 /// Aggregated view of one epoch derived from the `ticks` table.
 ///
-/// Epochs are not stored separately yet, so the summary is computed on read.
-/// `closed` is true when a later epoch exists in the index; the last indexed
-/// epoch may still be receiving ticks.
+/// `initial_tick` and `closed` come from the observed epoch lifecycle when the
+/// `epochs` table has a row, and otherwise fall back to values derived from the
+/// stored ticks. `closed` is true when a later epoch exists in the index; the
+/// last indexed epoch may still be receiving ticks.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EpochRow {
     pub epoch: u16,
+    /// First tick the network reported for the epoch when known, otherwise the
+    /// earliest stored tick.
+    pub initial_tick: u32,
     pub first_tick: u32,
     pub last_tick: u32,
     pub first_timestamp: DateTime<Utc>,
@@ -213,6 +218,31 @@ pub struct EpochRow {
     pub tick_count: u64,
     pub transaction_count: u64,
     pub event_count: u64,
+    pub closed: bool,
+}
+
+/// Observed start of one epoch.
+///
+/// The pair is the persisted replacement for a fixed `TICKS_PER_EPOCH`
+/// assumption: callers find a tick's epoch by choosing the greatest boundary
+/// whose `initial_tick` is not greater than the tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochBoundary {
+    pub epoch: u16,
+    pub initial_tick: u32,
+}
+
+/// Observed lifecycle metadata for one epoch.
+///
+/// `first_tick` and `last_tick` are the observed tick range. A row that is open
+/// (`closed == false`) may still receive ticks. An epoch with no observed range
+/// uses zero for both tick fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EpochMetadata {
+    pub epoch: u16,
+    pub initial_tick: u32,
+    pub first_tick: u32,
+    pub last_tick: u32,
     pub closed: bool,
 }
 
@@ -590,6 +620,44 @@ pub trait Store: Send + Sync {
     /// Epoch summaries newest first, derived from `ticks`.
     async fn epochs(&self, limit: u32, offset: u64) -> Result<Vec<EpochRow>>;
     async fn epoch(&self, epoch: u16) -> Result<Option<EpochRow>>;
+    /// Record the observed start tick of an epoch. Repeated calls are
+    /// idempotent; a changed `initial_tick` replaces the earlier boundary.
+    async fn write_epoch_start(&self, epoch: u16, initial_tick: u32) -> Result<()> {
+        let _ = (epoch, initial_tick);
+        Err(Error::Config("epoch lifecycle storage unsupported".into()))
+    }
+    /// Mark an epoch closed with its observed tick range.
+    async fn close_epoch(&self, epoch: u16, first_tick: u32, last_tick: u32) -> Result<()> {
+        let _ = (epoch, first_tick, last_tick);
+        Err(Error::Config("epoch lifecycle storage unsupported".into()))
+    }
+    /// Persisted epoch start ticks, ordered by epoch.
+    async fn epoch_boundaries(&self) -> Result<Vec<EpochBoundary>> {
+        Err(Error::Config("epoch lifecycle storage unsupported".into()))
+    }
+    /// All persisted epoch lifecycle rows, ordered by epoch.
+    async fn epoch_metadata(&self) -> Result<Vec<EpochMetadata>> {
+        Err(Error::Config("epoch lifecycle storage unsupported".into()))
+    }
+    /// One persisted epoch lifecycle row.
+    async fn epoch_metadata_for(&self, epoch: u16) -> Result<Option<EpochMetadata>> {
+        let _ = epoch;
+        Err(Error::Config("epoch lifecycle storage unsupported".into()))
+    }
+    /// Epochs that [`Store::prune_epochs`] would drop for `keep`, newest
+    /// excluded, ordered oldest first. Used by the CLI dry run.
+    async fn prunable_epochs(&self, keep: u16) -> Result<Vec<u16>> {
+        let _ = keep;
+        Err(Error::Config("epoch pruning unsupported".into()))
+    }
+    /// Drop ClickHouse partitions and lifecycle metadata for every epoch older
+    /// than the newest `keep` epochs. Returns the pruned epochs oldest first.
+    ///
+    /// Global tables such as `identities` and `price_points` are never touched.
+    async fn prune_epochs(&self, keep: u16) -> Result<Vec<u16>> {
+        let _ = keep;
+        Err(Error::Config("epoch pruning unsupported".into()))
+    }
     /// Identities ordered by most recent activity, then canonical identity.
     async fn identities(&self, limit: u32, offset: u64) -> Result<Vec<IdentityRow>>;
     /// Assets ordered by `(issuer, name)`, optionally filtered by issuer.
@@ -786,6 +854,84 @@ impl ClickHouseStore {
     fn timestamp_version(timestamp: DateTime<Utc>) -> u64 {
         u64::try_from(timestamp.timestamp_micros()).unwrap_or(0)
     }
+
+    async fn upsert_epoch(&self, row: &EpochMetadata) -> Result<()> {
+        let now = Utc::now();
+        let mut insert = self.client.insert::<rows::EpochInsert>("epochs")?;
+        insert
+            .write(&rows::EpochInsert {
+                epoch: row.epoch,
+                initial_tick: row.initial_tick,
+                first_tick: row.first_tick,
+                last_tick: row.last_tick,
+                closed: u8::from(row.closed),
+                updated_at: now,
+                version: rows::next_cursor_version(now),
+            })
+            .await?;
+        insert.end().await?;
+        Ok(())
+    }
+
+    /// Epochs that have at least one stored tick, oldest first.
+    pub async fn indexed_epochs(&self) -> Result<Vec<u16>> {
+        let rows = self
+            .client
+            .query("SELECT DISTINCT epoch FROM ticks ORDER BY epoch")
+            .fetch_all::<rows::EpochNumberRow>()
+            .await?;
+        Ok(rows.into_iter().map(|row| row.epoch).collect())
+    }
+
+    /// Whether `table` currently has an active part for `epoch`.
+    ///
+    /// `DROP PARTITION` is not idempotent on its own: ClickHouse has no
+    /// `IF EXISTS` clause for it. Retention checks `system.parts` first so a
+    /// repeated prune is a no-op instead of an error.
+    async fn epoch_partition_exists(&self, table: &str, epoch: u16) -> Result<bool> {
+        let row = self
+            .client
+            .query(
+                "SELECT count() AS n FROM system.parts \
+                 WHERE database = ? AND table = ? AND active AND partition = ?",
+            )
+            .bind(self.database.as_str())
+            .bind(table)
+            .bind(epoch.to_string())
+            .fetch_one::<rows::CountRow>()
+            .await?;
+        Ok(row.n > 0)
+    }
+
+    /// Plan retention without mutating ClickHouse. Epochs are the union of
+    /// indexed partitions and lifecycle rows so metadata for an empty epoch is
+    /// not left behind. The newest `keep` epochs are retained.
+    pub async fn prunable_epochs(&self, keep: u16) -> Result<Vec<u16>> {
+        if keep == 0 {
+            return Err(Error::Config("keep must retain at least one epoch".into()));
+        }
+        let mut epochs = self.indexed_epochs().await?;
+        for metadata in self.epoch_metadata().await? {
+            if !epochs.contains(&metadata.epoch) {
+                epochs.push(metadata.epoch);
+            }
+        }
+        Ok(plan_prune(&epochs, keep))
+    }
+}
+
+/// Oldest epochs that retention should drop, leaving the newest `keep`.
+///
+/// Duplicate and unordered input is normalized. A `keep` larger than the set
+/// drops nothing.
+pub fn plan_prune(epochs: &[u16], keep: u16) -> Vec<u16> {
+    let mut epochs = epochs.to_vec();
+    epochs.sort_unstable();
+    epochs.dedup();
+    let keep = usize::from(keep);
+    let drop = epochs.len().saturating_sub(keep);
+    epochs.truncate(drop);
+    epochs
 }
 
 /// Splits `http://user:password@host:port` into the bare URL and credentials.
@@ -1541,6 +1687,12 @@ LIMIT ? OFFSET ?
 
     async fn epochs(&self, limit: u32, offset: u64) -> Result<Vec<EpochRow>> {
         let head_epoch = self.head().await?.map(|row| row.epoch);
+        let metadata = self
+            .epoch_metadata()
+            .await?
+            .into_iter()
+            .map(|row| (row.epoch, row))
+            .collect::<HashMap<_, _>>();
         let rows = self
             .client
             .query(
@@ -1559,12 +1711,16 @@ LIMIT ? OFFSET ?
             .await?;
         Ok(rows
             .into_iter()
-            .map(|row| row.into_row(head_epoch))
+            .map(|row| {
+                let epoch = row.epoch;
+                row.into_row(head_epoch, metadata.get(&epoch))
+            })
             .collect())
     }
 
     async fn epoch(&self, epoch: u16) -> Result<Option<EpochRow>> {
         let head_epoch = self.head().await?.map(|row| row.epoch);
+        let metadata = self.epoch_metadata_for(epoch).await?;
         let row = self
             .client
             .query(
@@ -1580,7 +1736,126 @@ LIMIT ? OFFSET ?
             .bind(epoch)
             .fetch_optional::<rows::EpochSelect>()
             .await?;
-        Ok(row.map(|row| row.into_row(head_epoch)))
+        Ok(row.map(|row| row.into_row(head_epoch, metadata.as_ref())))
+    }
+
+    async fn write_epoch_start(&self, epoch: u16, initial_tick: u32) -> Result<()> {
+        let existing = self.epoch_metadata_for(epoch).await?;
+        let first_tick = existing
+            .as_ref()
+            .map(|row| row.first_tick)
+            .filter(|tick| *tick != 0)
+            .unwrap_or(initial_tick);
+        let last_tick = existing
+            .as_ref()
+            .map(|row| row.last_tick)
+            .unwrap_or(initial_tick)
+            .max(initial_tick);
+        self.upsert_epoch(&EpochMetadata {
+            epoch,
+            initial_tick,
+            first_tick,
+            last_tick,
+            closed: existing.is_some_and(|row| row.closed),
+        })
+        .await
+    }
+
+    async fn close_epoch(&self, epoch: u16, first_tick: u32, last_tick: u32) -> Result<()> {
+        let existing = self.epoch_metadata_for(epoch).await?;
+        let initial_tick = existing
+            .as_ref()
+            .map(|row| row.initial_tick)
+            .unwrap_or(first_tick);
+        let first_tick = if first_tick == 0 {
+            existing.as_ref().map(|row| row.first_tick).unwrap_or(0)
+        } else {
+            first_tick
+        };
+        self.upsert_epoch(&EpochMetadata {
+            epoch,
+            initial_tick,
+            first_tick,
+            last_tick: last_tick.max(first_tick),
+            closed: true,
+        })
+        .await
+    }
+
+    async fn epoch_boundaries(&self) -> Result<Vec<EpochBoundary>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT epoch, initial_tick FROM (\
+                     SELECT * FROM epochs ORDER BY version DESC LIMIT 1 BY epoch\
+                 ) ORDER BY epoch ASC",
+            )
+            .fetch_all::<rows::EpochBoundarySelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn epoch_metadata(&self) -> Result<Vec<EpochMetadata>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT epoch, initial_tick, first_tick, last_tick, closed FROM (\
+                     SELECT * FROM epochs ORDER BY version DESC LIMIT 1 BY epoch\
+                 ) ORDER BY epoch ASC",
+            )
+            .fetch_all::<rows::EpochMetadataSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn epoch_metadata_for(&self, epoch: u16) -> Result<Option<EpochMetadata>> {
+        let row = self
+            .client
+            .query(
+                "SELECT epoch, initial_tick, first_tick, last_tick, closed FROM epochs \
+                 WHERE epoch = ? ORDER BY version DESC LIMIT 1",
+            )
+            .bind(epoch)
+            .fetch_optional::<rows::EpochMetadataSelect>()
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn prunable_epochs(&self, keep: u16) -> Result<Vec<u16>> {
+        ClickHouseStore::prunable_epochs(self, keep).await
+    }
+
+    async fn prune_epochs(&self, keep: u16) -> Result<Vec<u16>> {
+        let prunable = self.prunable_epochs(keep).await?;
+        if prunable.is_empty() {
+            return Ok(prunable);
+        }
+        for epoch in &prunable {
+            for table in schema::EPOCH_PARTITIONED_TABLES {
+                if !self.epoch_partition_exists(table, *epoch).await? {
+                    continue;
+                }
+                let statement = schema::drop_epoch_partition(&self.database, table, *epoch);
+                self.client.query(&statement).execute().await?;
+            }
+        }
+        // Metadata rows live in unpartitioned tables; delete the pruned epochs
+        // after their partitions are gone. `computors` is epoch-keyed and is
+        // removed with the epoch that produced it. Global tables
+        // (`identities`, `price_points`) are never touched.
+        let epochs = prunable
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        for table in schema::EPOCH_METADATA_TABLES {
+            let statement = format!(
+                "ALTER TABLE {}.{} DELETE WHERE epoch IN ({epochs})",
+                self.database, table
+            );
+            self.client.query(&statement).execute().await?;
+        }
+        Ok(prunable)
     }
 
     async fn identities(&self, limit: u32, offset: u64) -> Result<Vec<IdentityRow>> {
@@ -2195,6 +2470,75 @@ mod tests {
     fn version_tracks_tick() {
         let batch = TickBatch::new(1, 42, Utc::now(), 3, "quorum");
         assert_eq!(batch.version, 42);
+    }
+
+    #[test]
+    fn prune_plan_keeps_only_the_newest_epochs() {
+        assert_eq!(plan_prune(&[1, 2, 3, 4, 5], 2), vec![1, 2, 3]);
+        assert_eq!(plan_prune(&[5, 1, 3, 3, 2], 2), vec![1, 2]);
+        assert_eq!(plan_prune(&[1, 2, 3], 3), Vec::<u16>::new());
+        assert_eq!(plan_prune(&[1, 2, 3], 99), Vec::<u16>::new());
+        assert_eq!(plan_prune(&[1, 2, 3], 0), vec![1, 2, 3]);
+        assert_eq!(plan_prune(&[], 5), Vec::<u16>::new());
+    }
+
+    #[test]
+    fn epoch_row_prefers_observed_metadata() {
+        let now = Utc::now();
+        let select = rows::EpochSelect {
+            epoch: 7,
+            first_tick: 100,
+            last_tick: 199,
+            first_timestamp: now,
+            last_timestamp: now,
+            tick_count: 100,
+            transaction_count: 0,
+            event_count: 0,
+        };
+        let metadata = EpochMetadata {
+            epoch: 7,
+            initial_tick: 95,
+            first_tick: 100,
+            last_tick: 199,
+            closed: true,
+        };
+
+        let row = select.into_row(Some(8), Some(&metadata));
+        assert_eq!(row.initial_tick, 95);
+        assert!(row.closed);
+
+        let select = rows::EpochSelect {
+            epoch: 7,
+            first_tick: 100,
+            last_tick: 199,
+            first_timestamp: now,
+            last_timestamp: now,
+            tick_count: 100,
+            transaction_count: 0,
+            event_count: 0,
+        };
+        let fallback = select.into_row(Some(8), None);
+        assert_eq!(fallback.initial_tick, 100);
+        assert!(fallback.closed);
+
+        let select = rows::EpochSelect {
+            epoch: 7,
+            first_tick: 100,
+            last_tick: 199,
+            first_timestamp: now,
+            last_timestamp: now,
+            tick_count: 100,
+            transaction_count: 0,
+            event_count: 0,
+        };
+        let open_metadata = EpochMetadata {
+            epoch: 7,
+            initial_tick: 95,
+            first_tick: 100,
+            last_tick: 199,
+            closed: false,
+        };
+        assert!(select.into_row(Some(8), Some(&open_metadata)).closed);
     }
 
     #[test]

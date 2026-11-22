@@ -21,6 +21,7 @@ pub mod dto;
 pub mod error;
 pub mod identity;
 pub mod market;
+pub mod mempool;
 pub mod openapi;
 pub mod prices;
 pub mod routes;
@@ -28,6 +29,7 @@ pub mod status_page;
 pub mod stream;
 pub mod transactions_ext;
 pub mod wallet;
+pub mod webhook;
 
 pub use error::ApiError;
 
@@ -50,6 +52,12 @@ pub struct AppState {
     pub market: Arc<market::MarketCache>,
     /// Exchange endpoints and timeouts used by market reads.
     pub market_config: Arc<market::MarketConfig>,
+    /// Operational mempool and webhook storage. `None` disables both.
+    pub gateway: Option<Arc<store::gateway::GatewayStore>>,
+    /// Background mempool tracker. `None` disables mempool routes.
+    pub mempool: Option<Arc<mempool::Mempool>>,
+    /// Signed webhook registration and delivery. `None` disables webhook routes.
+    pub webhooks: Option<Arc<webhook::Webhooks>>,
 }
 
 impl AppState {
@@ -66,6 +74,9 @@ impl AppState {
             progress: Arc::new(ProgressSampler::default()),
             market: Arc::new(market::MarketCache::default()),
             market_config: Arc::new(market::MarketConfig::from_env()),
+            gateway: None,
+            mempool: None,
+            webhooks: None,
         }
     }
 
@@ -147,6 +158,8 @@ pub fn router(state: AppState) -> Router {
         .merge(status_page::router())
         .merge(transactions_ext::router())
         .merge(wallet::router())
+        .merge(mempool::router())
+        .merge(webhook::router())
         .route(
             "/openapi.json",
             axum::routing::get(|| async { axum::Json(openapi::spec()) }),
@@ -331,6 +344,53 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
             cancel.clone(),
         )))
     };
+    let mempool_config = mempool::MempoolConfig::from_env();
+    let webhook_config = webhook::WebhookConfig::from_env();
+    // Operational state is optional: a deployment without ClickHouse gateway
+    // storage still serves the indexed read API. `MEMPOOL_ENABLED=false`
+    // skips construction entirely.
+    let (gateway, mempool, webhooks, mempool_tasks) = if mempool_config.enabled {
+        match store::gateway::GatewayStore::from_env() {
+            Ok(gateway) => {
+                let gateway = Arc::new(gateway);
+                match gateway.init().await {
+                    Ok(()) => {
+                        let webhooks = Arc::new(webhook::Webhooks::new(
+                            gateway.clone(),
+                            webhook_config,
+                            cancel.clone(),
+                        ));
+                        let mempool = Arc::new(mempool::Mempool::new(
+                            store.clone(),
+                            pool.clone(),
+                            gateway.clone(),
+                            webhooks.clone(),
+                            mempool_config,
+                            cancel.clone(),
+                        ));
+                        let webhook_task = tokio::spawn(webhooks.clone().run());
+                        let mempool_task = tokio::spawn(mempool.clone().run());
+                        (
+                            Some(gateway),
+                            Some(mempool),
+                            Some(webhooks),
+                            vec![webhook_task, mempool_task],
+                        )
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "mempool and webhook storage is unavailable");
+                        (None, None, None, Vec::new())
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "mempool and webhook storage is unavailable");
+                (None, None, None, Vec::new())
+            }
+        }
+    } else {
+        (None, None, None, Vec::new())
+    };
     let app = router(AppState {
         store,
         hub: Some(hub),
@@ -343,6 +403,9 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         progress: Arc::new(ProgressSampler::default()),
         market: market_cache,
         market_config: Arc::new(market_config),
+        gateway,
+        mempool,
+        webhooks,
     });
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "glyph api listening");
@@ -355,6 +418,9 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         let _ = task.await;
     }
     if let Some(task) = market_task {
+        let _ = task.await;
+    }
+    for task in mempool_tasks {
         let _ = task.await;
     }
     Ok(())

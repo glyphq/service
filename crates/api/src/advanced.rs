@@ -58,7 +58,7 @@ fn parse_tick(raw: &str) -> Result<u32, ApiError> {
 
 /// Maps axum body rejections onto the problem+json error envelope so a
 /// malformed request body never falls back to axum's plain-text rejection.
-fn json_body<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
+pub(crate) fn json_body<T>(payload: Result<Json<T>, JsonRejection>) -> Result<T, ApiError> {
     payload.map(|Json(value)| value).map_err(|rejection| {
         let status = rejection.status();
         let (status, code) = if status == StatusCode::UNSUPPORTED_MEDIA_TYPE {
@@ -90,12 +90,26 @@ async fn raw_bundle(
         .tick(tick)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("tick {tick} is not indexed")))?;
-    let bundle = archive::get_bundle(archive.as_ref(), row.epoch, tick)
+    let mut bundle = archive::get_bundle(archive.as_ref(), row.epoch, tick)
         .await
         .map_err(|error| ApiError::unavailable(format!("raw archive read failed: {error}")))?
         .ok_or_else(|| {
             ApiError::not_found(format!("raw bundle for tick {tick} is not archived"))
         })?;
+    // New bundles omit the computor set because it is identical for every tick
+    // in an epoch. Older bundles still carry it inline, so only read the epoch
+    // sidecar when the bundle itself has nothing.
+    if bundle.computors.is_empty() {
+        match archive::get_computors(archive.as_ref(), row.epoch).await {
+            Ok(Some(bytes)) => bundle.set_section(archive::Section::Computors, bytes.to_vec()),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(ApiError::unavailable(format!(
+                    "raw archive computor read failed: {error}"
+                )));
+            }
+        }
+    }
     let section = match params.section.as_deref() {
         None => None,
         Some("tick") | Some("header") => Some(archive::Section::TickHeader),
@@ -112,6 +126,17 @@ async fn raw_bundle(
         }
     };
     let (payload, name) = match section {
+        Some(archive::Section::Votes) if bundle.votes.is_empty() => {
+            return Err(ApiError::not_found(format!(
+                "votes for tick {tick} are not archived; set ARCHIVE_VOTES=true to store votes for new ticks"
+            )));
+        }
+        Some(archive::Section::Computors) if bundle.computors.is_empty() => {
+            return Err(ApiError::not_found(format!(
+                "computor set for epoch {} is not archived",
+                row.epoch
+            )));
+        }
         Some(section) => (bundle.section(section).to_vec(), section.name()),
         None => (
             bundle
@@ -298,11 +323,11 @@ pub struct ValidateBody {
 }
 
 #[derive(Debug, Serialize)]
-struct ValidationCheck {
-    name: &'static str,
-    passed: bool,
+pub(crate) struct ValidationCheck {
+    pub(crate) name: &'static str,
+    pub(crate) passed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
+    pub(crate) detail: Option<String>,
 }
 
 impl ValidationCheck {
@@ -313,6 +338,58 @@ impl ValidationCheck {
             detail: detail.into(),
         }
     }
+}
+
+/// A signed transaction decoded from a request body, together with the local
+/// preflight checks. Broadcast and mempool submission share this path so both
+/// reject the same inputs before opening a peer socket.
+pub(crate) struct DecodedTransaction {
+    pub transaction: Transaction,
+    pub bytes: Vec<u8>,
+    pub checks: Vec<ValidationCheck>,
+    pub hash: String,
+    pub valid: bool,
+}
+
+impl DecodedTransaction {
+    /// Human-readable list of the checks that failed. Broadcast and mempool
+    /// submission share this so both report the same reason.
+    pub(crate) fn failure_detail(&self) -> String {
+        let detail = self
+            .checks
+            .iter()
+            .filter(|check| !check.passed)
+            .filter_map(|check| check.detail.as_deref())
+            .collect::<Vec<_>>()
+            .join("; ");
+        if detail.is_empty() {
+            "one or more local checks failed".to_owned()
+        } else {
+            detail
+        }
+    }
+}
+
+pub(crate) fn decode_transaction(raw: &str) -> Result<DecodedTransaction, ApiError> {
+    let raw = raw.trim();
+    let hex_body = raw
+        .strip_prefix("0x")
+        .or_else(|| raw.strip_prefix("0X"))
+        .unwrap_or(raw);
+    let bytes = hex::decode(hex_body)
+        .map_err(|error| ApiError::bad_request(format!("raw is not hex: {error}")))?;
+    let transaction = Transaction::decode(&bytes)
+        .map_err(|error| ApiError::bad_request(format!("invalid transaction: {error}")))?;
+    let checks = transaction_checks(&transaction, &bytes);
+    let valid = checks.iter().all(|check| check.passed);
+    let hash = qubic::encode_tx_hash(&transaction.hash());
+    Ok(DecodedTransaction {
+        transaction,
+        bytes,
+        checks,
+        hash,
+        valid,
+    })
 }
 
 /// Local preflight checks for a signed transaction. This never opens a peer
@@ -469,6 +546,14 @@ pub struct BroadcastBody {
     /// Number of peers to fan out to. Capped by BROADCAST_PEERS and 8.
     #[serde(default, alias = "max_peers")]
     pub peers: Option<usize>,
+    /// Skip the mempool and fan out directly to peers.
+    #[serde(default)]
+    pub direct: bool,
+    /// Optional webhook registered for this transaction's mempool changes.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
 }
 
 pub async fn broadcast_transaction(
@@ -480,19 +565,14 @@ pub async fn broadcast_transaction(
             "transaction broadcast is disabled; set ALLOW_BROADCAST=true",
         ));
     }
-    let raw = body.raw.trim();
-    let hex_body = raw
-        .strip_prefix("0x")
-        .or_else(|| raw.strip_prefix("0X"))
-        .unwrap_or(raw);
-    let bytes = hex::decode(hex_body)
-        .map_err(|error| ApiError::bad_request(format!("raw is not hex: {error}")))?;
-    let transaction = Transaction::decode(&bytes)
-        .map_err(|error| ApiError::bad_request(format!("invalid transaction: {error}")))?;
-
-    let checks = transaction_checks(&transaction, &bytes);
-    let valid = checks.iter().all(|check| check.passed);
-    let hash = qubic::encode_tx_hash(&transaction.hash());
+    let decoded = decode_transaction(&body.raw)?;
+    let DecodedTransaction {
+        transaction,
+        bytes: _,
+        checks,
+        hash,
+        valid,
+    } = decoded;
     let peers_requested = body
         .peers
         .unwrap_or(state.broadcast_peers)
@@ -529,6 +609,24 @@ pub async fn broadcast_transaction(
             })),
         )
             .into_response());
+    }
+
+    // Submit to the mempool by default when it is enabled. `direct: true`
+    // keeps the original fan-out-and-return behavior.
+    if !body.direct {
+        if let Some(mempool) = state.mempool.clone() {
+            let inline = match (body.webhook_url.clone(), body.webhook_secret.clone()) {
+                (None, None) => None,
+                (Some(url), Some(secret)) => Some(crate::mempool::InlineWebhook { url, secret }),
+                _ => {
+                    return Err(ApiError::bad_request(
+                        "webhook_url and webhook_secret must be provided together",
+                    ));
+                }
+            };
+            let entry = mempool.submit(&body.raw, peers_requested, inline).await?;
+            return Ok(crate::mempool::accepted(entry));
+        }
     }
 
     if !valid {

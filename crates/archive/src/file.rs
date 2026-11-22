@@ -152,6 +152,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn computor_sidecar_round_trip() {
+        use crate::{computor_key, get_computors, put_computors};
+
+        let root = tempfile::tempdir().unwrap();
+        let archive = FileArchive::new(root.path());
+        let payload = vec![0x2a; 21_700];
+
+        assert_eq!(
+            get_computors(&archive, 42).await.unwrap(),
+            None,
+            "a missing sidecar must be Ok(None)"
+        );
+
+        let key = put_computors(&archive, 42, &payload).await.unwrap();
+        assert_eq!(key, computor_key(42));
+        assert_eq!(key, "raw/epoch=042/computors.bin");
+        assert!(root.path().join(&key).is_file());
+        assert_eq!(
+            get_computors(&archive, 42).await.unwrap().as_deref(),
+            Some(&payload[..])
+        );
+
+        // A different epoch does not alias the sidecar.
+        assert_eq!(get_computors(&archive, 43).await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn rejects_path_traversal() {
         let root = tempfile::tempdir().unwrap();
         let archive = FileArchive::new(root.path());

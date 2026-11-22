@@ -10,6 +10,8 @@ use crate::{Error, Result};
 pub const RAW_PREFIX: &str = "raw";
 /// Bundle object suffix.
 pub const BUNDLE_SUFFIX: &str = ".qbb.zst";
+/// Suffix of the per-epoch computor set sidecar.
+pub const COMPUTORS_SUFFIX: &str = "computors.bin";
 
 /// Builds the canonical object key for a tick bundle.
 ///
@@ -23,6 +25,23 @@ pub const BUNDLE_SUFFIX: &str = ".qbb.zst";
 /// ```
 pub fn object_key(epoch: u16, tick: u32) -> String {
     format!("{RAW_PREFIX}/epoch={epoch:03}/tick={tick:08}{BUNDLE_SUFFIX}")
+}
+
+/// Builds the canonical object key for an epoch's computor set sidecar.
+///
+/// The computor set changes once per epoch, so it is stored once at
+/// `raw/epoch=NNN/computors.bin` instead of in every tick bundle.
+///
+/// # Example
+///
+/// ```
+/// assert_eq!(
+///     archive::computor_key(42),
+///     "raw/epoch=042/computors.bin"
+/// );
+/// ```
+pub fn computor_key(epoch: u16) -> String {
+    format!("{RAW_PREFIX}/epoch={epoch:03}/{COMPUTORS_SUFFIX}")
 }
 
 /// Rejects unsafe or non-canonical archive keys.
@@ -96,8 +115,16 @@ mod tests {
     }
 
     #[test]
+    fn computor_key_format_is_stable() {
+        assert_eq!(computor_key(0), "raw/epoch=000/computors.bin");
+        assert_eq!(computor_key(42), "raw/epoch=042/computors.bin");
+        assert_eq!(computor_key(u16::MAX), "raw/epoch=65535/computors.bin");
+    }
+
+    #[test]
     fn generated_keys_validate() {
         validate_key(&object_key(1, 2)).unwrap();
+        validate_key(&computor_key(1)).unwrap();
     }
 
     #[test]

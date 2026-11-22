@@ -838,6 +838,7 @@ async fn initializes_the_real_glyph_database() {
         vec![
             "btc_price_points",
             "computors",
+            "epochs",
             "event_participants",
             "events",
             "identities",

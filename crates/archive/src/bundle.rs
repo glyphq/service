@@ -216,6 +216,19 @@ impl RawBundle {
             .all(|section| self.section(*section).is_empty())
     }
 
+    /// Removes the optional vote headers and per-tick computor set.
+    ///
+    /// A default tick bundle contains the tick header, `TickData`,
+    /// transactions, log ranges, and logs. Votes are archived only when
+    /// explicitly enabled, and the computor set is stored once per epoch in a
+    /// sidecar object instead of in every bundle. This helper produces that
+    /// default shape while keeping [`Section::Votes`] and
+    /// [`Section::Computors`] available for callers that opt in.
+    pub fn strip_optional_sections(&mut self) {
+        self.votes.clear();
+        self.computors.clear();
+    }
+
     /// Encodes the bundle as a compressed container.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let body = self.encode_body()?;
@@ -473,6 +486,22 @@ mod tests {
         assert_eq!(decoded, bundle);
         assert!(decoded.votes.is_empty());
         assert!(decoded.computors.is_empty());
+    }
+
+    #[test]
+    fn strip_optional_sections_keeps_core_payloads() {
+        let mut bundle = sample_bundle();
+        bundle.strip_optional_sections();
+        assert!(bundle.votes.is_empty());
+        assert!(bundle.computors.is_empty());
+        assert!(!bundle.tick_header.is_empty());
+        assert!(!bundle.tick_data.is_empty());
+        assert!(!bundle.transactions.is_empty());
+        assert!(!bundle.log_ranges.is_empty());
+        assert!(!bundle.logs.is_empty());
+
+        let decoded = RawBundle::decode(&bundle.encode().unwrap()).unwrap();
+        assert_eq!(decoded, bundle);
     }
 
     #[test]

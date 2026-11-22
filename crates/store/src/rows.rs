@@ -9,9 +9,9 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActivityBucket, AssetRow, AssetTransferRow, ComputorRow, CounterpartyRow, EpochRow,
-    EventParticipantRow, EventRow, EventTypeCount, FlowBucket, IdentityActivityRow, IdentityRow,
-    PricePointRow, QuorumEvidenceRow, Result, TickRow, TransactionRow,
+    ActivityBucket, AssetRow, AssetTransferRow, ComputorRow, CounterpartyRow, EpochMetadata,
+    EpochRow, EventParticipantRow, EventRow, EventTypeCount, FlowBucket, IdentityActivityRow,
+    IdentityRow, PricePointRow, QuorumEvidenceRow, Result, TickRow, TransactionRow,
 };
 
 /// RowBinary encodes `FixedString(N)` as N raw bytes. Serde's array impl only
@@ -493,9 +493,19 @@ pub(crate) struct EpochSelect {
 }
 
 impl EpochSelect {
-    pub(crate) fn into_row(self, head_epoch: Option<u16>) -> EpochRow {
+    pub(crate) fn into_row(
+        self,
+        head_epoch: Option<u16>,
+        metadata: Option<&EpochMetadata>,
+    ) -> EpochRow {
         EpochRow {
-            closed: head_epoch.is_some_and(|head| self.epoch < head),
+            // A later indexed epoch proves this one ended, even when metadata
+            // was left open because the boundary successor was never observed.
+            closed: metadata.is_some_and(|metadata| metadata.closed)
+                || head_epoch.is_some_and(|head| self.epoch < head),
+            initial_tick: metadata
+                .map(|metadata| metadata.initial_tick)
+                .unwrap_or(self.first_tick),
             epoch: self.epoch,
             first_tick: self.first_tick,
             last_tick: self.last_tick,
@@ -504,6 +514,54 @@ impl EpochSelect {
             tick_count: self.tick_count,
             transaction_count: self.transaction_count,
             event_count: self.event_count,
+        }
+    }
+}
+
+#[derive(Debug, Row, Serialize)]
+pub(crate) struct EpochInsert {
+    pub epoch: u16,
+    pub initial_tick: u32,
+    pub first_tick: u32,
+    pub last_tick: u32,
+    pub closed: u8,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub updated_at: DateTime<Utc>,
+    pub version: u64,
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct EpochBoundarySelect {
+    pub epoch: u16,
+    pub initial_tick: u32,
+}
+
+impl From<EpochBoundarySelect> for crate::EpochBoundary {
+    fn from(row: EpochBoundarySelect) -> Self {
+        Self {
+            epoch: row.epoch,
+            initial_tick: row.initial_tick,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct EpochMetadataSelect {
+    pub epoch: u16,
+    pub initial_tick: u32,
+    pub first_tick: u32,
+    pub last_tick: u32,
+    pub closed: u8,
+}
+
+impl From<EpochMetadataSelect> for EpochMetadata {
+    fn from(row: EpochMetadataSelect) -> Self {
+        Self {
+            epoch: row.epoch,
+            initial_tick: row.initial_tick,
+            first_tick: row.first_tick,
+            last_tick: row.last_tick,
+            closed: row.closed != 0,
         }
     }
 }
@@ -737,6 +795,11 @@ pub(crate) struct CountRow {
 }
 
 #[derive(Debug, Row, Deserialize)]
+pub(crate) struct EpochNumberRow {
+    pub epoch: u16,
+}
+
+#[derive(Debug, Row, Deserialize)]
 pub(crate) struct EarliestTickRow {
     pub tick: u32,
     pub n: u64,
@@ -763,7 +826,7 @@ pub(crate) async fn insert_cursor(
 
 /// Cursors use `ReplacingMergeTree(version)`. A process-local monotonic
 /// counter keeps writes ordered even when they land in the same millisecond.
-fn next_cursor_version(now: DateTime<Utc>) -> u64 {
+pub(crate) fn next_cursor_version(now: DateTime<Utc>) -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static LAST: AtomicU64 = AtomicU64::new(0);

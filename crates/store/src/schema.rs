@@ -274,6 +274,45 @@ ENGINE = ReplacingMergeTree(version)
 ORDER BY (epoch, computor_index)
 "#;
 
+/// Observed epoch lifecycle. Rows are keyed by `epoch`; a later `version`
+/// replaces the earlier observation, so recording a start and closing an epoch
+/// are both idempotent upserts.
+///
+/// Boundaries are observed from peer heads rather than assumed. `initial_tick`
+/// is the first tick the network reported for the epoch, `first_tick` and
+/// `last_tick` are the tick range the indexer actually persisted, and `closed`
+/// flips once a later epoch has been observed.
+pub const CREATE_EPOCHS: &str = r#"
+CREATE TABLE IF NOT EXISTS {database}.epochs
+(
+    epoch UInt16,
+    initial_tick UInt32,
+    first_tick UInt32,
+    last_tick UInt32,
+    closed UInt8,
+    updated_at DateTime64(3, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY epoch
+"#;
+
+/// Tables partitioned by `epoch`. Retention drops whole partitions for these.
+///
+/// `identities` and `price_points` are deliberately absent: the first is
+/// global state and the second is keyed by hour.
+pub const EPOCH_PARTITIONED_TABLES: &[&str] = &[
+    "ticks",
+    "transactions",
+    "events",
+    "event_participants",
+    "quorum_evidence",
+];
+
+/// Epoch-keyed metadata tables that are not partitioned. Retention deletes
+/// their rows instead of dropping a partition.
+pub const EPOCH_METADATA_TABLES: &[&str] = &["computors", "epochs"];
+
 /// Vote evidence behind a stored tick. The digests are raw K12 values; vote
 /// counts describe how the winning quorum was assembled. `warnings` is the
 /// producer's serialized warning list, kept as one string so the row stays
@@ -348,6 +387,7 @@ pub const ALL: &[&str] = &[
     CREATE_IDENTITIES_BY_ACTIVITY,
     CREATE_INGEST_STATE,
     CREATE_COMPUTORS,
+    CREATE_EPOCHS,
     CREATE_QUORUM_EVIDENCE,
     CREATE_PRICE_POINTS,
 ];
@@ -392,6 +432,21 @@ pub fn drop_database(database: &str) -> String {
     format!("DROP DATABASE IF EXISTS {database}")
 }
 
+/// `ALTER TABLE ... DROP PARTITION` for one epoch.
+///
+/// ClickHouse does not accept `IF EXISTS` on `DROP PARTITION`, so callers must
+/// check [`crate::schema::EPOCH_PARTITIONED_TABLES`] partitions with
+/// `system.parts` first. That check is what keeps retention idempotent when an
+/// epoch had no rows in a table.
+pub fn drop_epoch_partition(database: &str, table: &str, epoch: u16) -> String {
+    format!("ALTER TABLE {database}.{table} DROP PARTITION {epoch}")
+}
+
+/// Removes the rows for one epoch from a non-partitioned metadata table.
+pub fn delete_epoch_rows(database: &str, table: &str, epoch: u16) -> String {
+    format!("ALTER TABLE {database}.{table} DELETE WHERE epoch = {epoch}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +465,28 @@ mod tests {
         assert!(validate_database("1glyph").is_err());
         assert!(validate_database("").is_err());
         assert!(validate_database("glyph_2").is_ok());
+    }
+
+    #[test]
+    fn epochs_table_is_created_once() {
+        assert_eq!(ALL.iter().filter(|sql| sql.contains(".epochs")).count(), 1);
+        assert!(CREATE_EPOCHS.contains("initial_tick UInt32"));
+        assert!(CREATE_EPOCHS.contains("ReplacingMergeTree(version)"));
+    }
+
+    #[test]
+    fn retention_helpers_target_only_epoch_data() {
+        assert_eq!(
+            drop_epoch_partition("glyph", "ticks", 7),
+            "ALTER TABLE glyph.ticks DROP PARTITION 7"
+        );
+        assert_eq!(
+            delete_epoch_rows("glyph", "computors", 7),
+            "ALTER TABLE glyph.computors DELETE WHERE epoch = 7"
+        );
+        assert!(!EPOCH_PARTITIONED_TABLES.contains(&"identities"));
+        assert!(!EPOCH_PARTITIONED_TABLES.contains(&"price_points"));
+        assert!(!EPOCH_METADATA_TABLES.contains(&"identities"));
+        assert!(!EPOCH_METADATA_TABLES.contains(&"price_points"));
     }
 }

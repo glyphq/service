@@ -70,6 +70,15 @@ enum Command {
     },
     /// Initialize ClickHouse tables.
     DbInit,
+    /// Drop partitions and metadata for old epochs.
+    Prune {
+        /// Number of newest epochs to retain.
+        #[arg(long, default_value_t = 54)]
+        keep: u16,
+        /// Print the epochs that would be dropped without modifying ClickHouse.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Serve the HTTP API.
     Serve {
         /// Bind address. Defaults to BIND, then 127.0.0.1:8080.
@@ -264,6 +273,33 @@ async fn main() -> anyhow::Result<()> {
             store.init().await.context("initialize ClickHouse")?;
             println!("initialized {db}");
         }
+        Command::Prune { keep, dry_run } => {
+            let url =
+                std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
+            let db = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "glyph".into());
+            let store = ClickHouseStore::new(&url, &db)?;
+            if dry_run {
+                let epochs = store.prunable_epochs(keep).await.context("plan prune")?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "keep": keep,
+                        "dry_run": true,
+                        "epochs": epochs,
+                    }))?
+                );
+            } else {
+                let epochs = store.prune_epochs(keep).await.context("prune epochs")?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "keep": keep,
+                        "dry_run": false,
+                        "epochs": epochs,
+                    }))?
+                );
+            }
+        }
         Command::Serve { bind } => {
             let url =
                 std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
@@ -368,6 +404,30 @@ mod tests {
                 assert!(!no_verify_signatures);
             }
             _ => panic!("expected tick command"),
+        }
+    }
+
+    #[test]
+    fn prune_parses_keep_and_dry_run() {
+        let cli = Cli::try_parse_from(["glyph", "prune", "--keep", "12", "--dry-run"]).unwrap();
+        match cli.command {
+            Command::Prune { keep, dry_run } => {
+                assert_eq!(keep, 12);
+                assert!(dry_run);
+            }
+            _ => panic!("expected prune command"),
+        }
+    }
+
+    #[test]
+    fn prune_defaults_keep_54_without_dry_run() {
+        let cli = Cli::try_parse_from(["glyph", "prune"]).unwrap();
+        match cli.command {
+            Command::Prune { keep, dry_run } => {
+                assert_eq!(keep, 54);
+                assert!(!dry_run);
+            }
+            _ => panic!("expected prune command"),
         }
     }
 

@@ -40,6 +40,7 @@ pub struct StatusView {
     pub peers_configured: usize,
     pub streaming_enabled: bool,
     pub broadcast_enabled: bool,
+    pub mempool_enabled: bool,
     pub archive_enabled: bool,
     pub storage_error: Option<String>,
 }
@@ -81,6 +82,7 @@ impl Default for StatusView {
             peers_configured: 0,
             streaming_enabled: false,
             broadcast_enabled: false,
+            mempool_enabled: false,
             archive_enabled: false,
             storage_error: None,
         }
@@ -100,6 +102,7 @@ impl StatusView {
             peers_configured: state.peers.len(),
             streaming_enabled: state.hub.is_some(),
             broadcast_enabled: state.allow_broadcast,
+            mempool_enabled: state.mempool.is_some(),
             archive_enabled: state.archive.is_some(),
             ..Self::default()
         };
@@ -377,6 +380,7 @@ fn render(view: &StatusView) -> String {
     );
     push_row(&mut html, "Streaming", &badge(view.streaming_enabled));
     push_row(&mut html, "Broadcast", &badge(view.broadcast_enabled));
+    push_row(&mut html, "Mempool", &badge(view.mempool_enabled));
     push_row(&mut html, "Archive", &badge(view.archive_enabled));
     html.push_str("</tbody></table></section>");
 
