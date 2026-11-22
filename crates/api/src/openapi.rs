@@ -5,7 +5,7 @@ fn limit_param() -> Value {
         "name": "limit",
         "in": "query",
         "required": false,
-        "description": "Maximum rows to return. Values above the route maximum are clamped.",
+        "description": "Page size.",
         "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
     })
 }
@@ -15,7 +15,7 @@ fn cursor_param() -> Value {
         "name": "cursor",
         "in": "query",
         "required": false,
-        "description": "Opaque cursor from meta.next_cursor. Bound to the route and filters.",
+        "description": "Cursor from `meta.next_cursor`.",
         "schema": { "type": "string" }
     })
 }
@@ -26,7 +26,7 @@ fn offset_param() -> Value {
         "in": "query",
         "required": false,
         "deprecated": true,
-        "description": "Legacy offset pagination. Prefer cursor.",
+        "description": "Legacy offset.",
         "schema": { "type": "integer", "minimum": 0, "default": 0 }
     })
 }
@@ -36,7 +36,7 @@ fn tick_param() -> Value {
         "name": "tick",
         "in": "path",
         "required": true,
-        "description": "Global tick number.",
+        "description": "Tick number.",
         "schema": { "type": "integer", "minimum": 0 }
     })
 }
@@ -56,7 +56,7 @@ fn identity_param() -> Value {
         "name": "identity",
         "in": "path",
         "required": true,
-        "description": "Canonical uppercase base-26 identity, 60 characters.",
+        "description": "Uppercase base-26 identity.",
         "schema": { "type": "string" }
     })
 }
@@ -66,7 +66,7 @@ fn transaction_hash_param() -> Value {
         "name": "hash",
         "in": "path",
         "required": true,
-        "description": "Lowercase base-26 transaction hash, 60 characters.",
+        "description": "Lowercase base-26 transaction hash.",
         "schema": { "type": "string" }
     })
 }
@@ -76,7 +76,7 @@ fn issuer_param() -> Value {
         "name": "issuer",
         "in": "path",
         "required": true,
-        "description": "Issuer identity in canonical uppercase base-26 form.",
+        "description": "Issuer identity.",
         "schema": { "type": "string" }
     })
 }
@@ -86,7 +86,7 @@ fn asset_name_param() -> Value {
         "name": "name",
         "in": "path",
         "required": true,
-        "description": "Asset name, 1 to 7 uppercase ASCII letters or digits.",
+        "description": "Asset name, 1-7 uppercase alphanumeric characters.",
         "schema": { "type": "string", "minLength": 1, "maxLength": 7, "pattern": "^[A-Z0-9]+$" }
     })
 }
@@ -116,32 +116,32 @@ fn info() -> Value {
     json!({
         "title": "Glyph API",
         "version": "0.2.0",
-        "summary": "A direct-peer read API for the Qubic network.",
+        "summary": "Verified Qubic chain data.",
         "x-logo": { "url": "/logo.png", "altText": "Glyph" },
-        "description": "# Glyph API\n\nGlyph indexes Qubic by connecting straight to peers and verifying quorum evidence. There is no hosted RPC in the path: every tick, transaction, and event served here came from peer messages that Glyph fetched, aligned, and persisted itself.\n\n## Response shape\n\nEvery JSON response wraps its payload in `data`. Collections also return `meta` with pagination fields. Errors use RFC 9457 problem documents and a stable `code`.\n\n## Two read paths\n\n- Indexed routes under `/v1` read ClickHouse and return only quorum-verified, persisted history.\n- Live routes under `/v1/live` make a direct peer call per request. They may use a short 2-second cache and return `503 unavailable` when no peer answers.\n\n## Conventions\n\n- Amounts are integer QU in the network's base unit. 1 QU is 1 base unit and is never rescaled.\n- Identities are uppercase base-26. Transaction hashes are lowercase base-26. Tick and epoch numbers are JSON integers.\n- Newest-first collections accept `limit` and an opaque `cursor` from `meta.next_cursor`.\n- `/v1/status` reports ingest and network progress. `/status` renders the same state as HTML."
+        "description": "Glyph indexes Qubic directly from peers and verifies quorum evidence.\n\n- `/v1` reads persisted, verified history.\n- `/v1/live` makes a direct peer call.\n- JSON responses use `data` and `meta`; errors use RFC 9457 problem documents.\n\nAmounts are integer QU. Identities are uppercase base-26; hashes are lowercase base-26."
     })
 }
 
 fn tags() -> Value {
     json!([
-        { "name": "Status", "description": "Liveness, indexer progress, and the HTML operations dashboard." },
-        { "name": "Epochs", "description": "Epoch summaries and elected computor sets." },
-        { "name": "Ticks", "description": "Tick headers and their verified transaction and event contents." },
-        { "name": "Transactions", "description": "Transactions by hash, source, destination, input type, and tick." },
-        { "name": "Events", "description": "Contract event logs decoded into typed bodies and participants." },
-        { "name": "Identities", "description": "Identity history, balances, transfers, and contract interactions." },
-        { "name": "Wallets", "description": "Wallet-centric balances and issued or held assets." },
-        { "name": "Assets", "description": "Asset issuances, metadata, and holder sets." },
-        { "name": "Prices", "description": "Oracle price samples and hourly QUBIC/USDT history." },
-        { "name": "Market", "description": "External exchange consensus and market reference data." },
-        { "name": "Analytics", "description": "Aggregated activity, volume, and network-level counts." },
-        { "name": "Network", "description": "Index-wide counts, ingest progress, and peer-observed network state." },
-        { "name": "Stream", "description": "Server-sent and WebSocket event streams." },
-        { "name": "Live", "description": "Direct peer calls that are not part of the immutable index. Short-lived cache or no-store, may be unavailable." },
-        { "name": "Mempool", "description": "Best-effort broadcast tracking for signed transactions that are not yet in the index." },
-        { "name": "Webhooks", "description": "Signed push notifications for mempool transaction status changes." },
-        { "name": "Archive", "description": "Raw verified tick bundles retained for audit and replay." },
-        { "name": "Search", "description": "Resolve hashes, ticks, epochs, assets, and identities in one request." }
+        { "name": "Status", "description": "Health and ingest progress." },
+        { "name": "Epochs", "description": "Epochs and computors." },
+        { "name": "Ticks", "description": "Tick data." },
+        { "name": "Transactions", "description": "Lookup, validation, broadcast." },
+        { "name": "Events", "description": "Decoded contract logs." },
+        { "name": "Identities", "description": "History, flow, counterparties." },
+        { "name": "Wallets", "description": "Balances and asset holdings." },
+        { "name": "Assets", "description": "Issuances, transfers, holders." },
+        { "name": "Prices", "description": "QUBIC/USDT series." },
+        { "name": "Market", "description": "External market reference." },
+        { "name": "Analytics", "description": "Network aggregates." },
+        { "name": "Network", "description": "Index counts and coverage." },
+        { "name": "Stream", "description": "SSE and WebSocket feeds." },
+        { "name": "Live", "description": "Direct peer reads." },
+        { "name": "Mempool", "description": "Broadcast tracking." },
+        { "name": "Webhooks", "description": "Signed delivery." },
+        { "name": "Archive", "description": "Raw tick bundles." },
+        { "name": "Search", "description": "Cross-entity lookup." }
     ])
 }
 
@@ -175,8 +175,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getHealth",
                     "tags": ["Status"],
-                    "summary": "Check process health",
-                    "description": "Returns 200 as soon as the process is accepting requests. It does not touch storage or peers, so it is safe for load balancers and container health checks. For index and network state, use `/v1/status`.",
+                    "summary": "Health check",
+                    "description": "Process liveness.",
                     "responses": { "200": { "description": "Process is alive" } }
                 }
             },
@@ -184,8 +184,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getStatus",
                     "tags": ["Status"],
-                    "summary": "Get live indexer and network progress",
-                    "description": "Returns the persisted index head, ingest cursor, sampled peer head, indexer throughput, lag and ETA, and current-epoch backfill coverage. Never cached. Throughput is measured between status requests at least one second apart, so the first request after startup may omit rates.",
+                    "summary": "Get indexer status",
+                    "description": "Head, ingest cursor, throughput, lag, and backfill coverage.",
                     "responses": {
                         "200": {
                             "description": "Current status",
@@ -204,8 +204,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getStatusPage",
                     "tags": ["Status"],
-                    "summary": "Open the server-rendered operations dashboard",
-                    "description": "Uptime, head, ingest cursor, counts, and runtime feature flags. Refreshes every 5 seconds and does not require JavaScript.",
+                    "summary": "Operations dashboard",
+                    "description": "HTML status page.",
                     "responses": { "200": { "description": "HTML dashboard", "content": { "text/html": { "schema": { "type": "string" } } } } }
                 }
             },
@@ -213,8 +213,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getNetwork",
                     "tags": ["Network"],
-                    "summary": "Get index-wide counts and coverage",
-                    "description": "Entity counts and the indexed tick range. Local-only and stable for dashboards. Use `/v1/status` for live peer throughput and backfill progress.",
+                    "summary": "Get network counts",
+                    "description": "Entity counts and indexed tick range.",
                     "responses": {
                         "200": { "description": "Network stats", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/NetworkStats" } } } } } },
                         "500": { "description": "Storage failure" }
@@ -226,8 +226,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listEpochs",
                     "tags": ["Epochs"],
-                    "summary": "List epoch summaries, newest first",
-                    "description": "One row per indexed epoch with its tick range, transaction and event counts, and observed timestamps. Walk backwards through history with cursor pagination.",
+                    "summary": "List epochs",
+                    "description": "Newest first.",
                     "parameters": [limit_param(), cursor_param(), offset_param()],
                     "responses": { "200": { "description": "Paginated epochs, newest first", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EpochPage" } } } } }
                 }
@@ -236,8 +236,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getEpoch",
                     "tags": ["Epochs"],
-                    "summary": "Get one epoch summary",
-                    "description": "Returns the summary row for one indexed epoch. Returns 404 when the epoch has no indexed ticks.",
+                    "summary": "Get epoch",
+                    "description": "One epoch.",
                     "parameters": [epoch_param()],
                     "responses": { "200": { "description": "Epoch summary", "content": { "application/json": { "schema": data_envelope("Epoch") } } }, "404": { "description": "Epoch not indexed" } }
                 }
@@ -246,8 +246,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listEpochComputors",
                     "tags": ["Epochs"],
-                    "summary": "List the elected computor set for an epoch",
-                    "description": "Ordered by computor_index. public_key is 0x-prefixed hex and identity is the canonical uppercase base-26 form.",
+                    "summary": "List computors",
+                    "description": "Computor set ordered by index.",
                     "parameters": [epoch_param()],
                     "responses": {
                         "200": {
@@ -268,8 +268,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listTicks",
                     "tags": ["Ticks"],
-                    "summary": "List ticks, newest first",
-                    "description": "Tick headers with timestamp, computor index, transaction and event counts, and verification tier. Filter by epoch and page with cursors.",
+                    "summary": "List ticks",
+                    "description": "Newest first, filterable by epoch.",
                     "parameters": [
                         { "name": "epoch", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
                         limit_param(), cursor_param(), offset_param()
@@ -281,8 +281,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getTick",
                     "tags": ["Ticks"],
-                    "summary": "Get a tick by number",
-                    "description": "A single tick header. Tick numbers are global across epochs and increase monotonically. Returns 404 when the tick is not indexed.",
+                    "summary": "Get tick",
+                    "description": "One tick header.",
                     "parameters": [tick_param()],
                     "responses": {
                         "200": { "description": "Tick header", "content": { "application/json": { "schema": data_envelope("Tick") } } },
@@ -294,8 +294,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getTickQuorumEvidence",
                     "tags": ["Ticks"],
-                    "summary": "Get the quorum evidence behind a stored tick",
-                    "description": "Digests are lowercase hex. Vote counts describe how the winning quorum was assembled.",
+                    "summary": "Get quorum evidence",
+                    "description": "Digests and vote counts behind the stored tick.",
                     "parameters": [tick_param()],
                     "responses": {
                         "200": {
@@ -313,8 +313,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listTickTransactions",
                     "tags": ["Ticks"],
-                    "summary": "List transactions in a tick, in slot order",
-                    "description": "Transactions in execution-slot order with hash, source, destination, amount, input type, input data, and status.",
+                    "summary": "List tick transactions",
+                    "description": "Execution-slot order.",
                     "parameters": [tick_param(), limit_param(), cursor_param(), offset_param()],
                     "responses": {
                         "200": { "description": "Paginated transactions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransactionPage" } } } },
@@ -326,8 +326,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listTickEvents",
                     "tags": ["Ticks"],
-                    "summary": "List events in a tick, in log-id order",
-                    "description": "Decoded contract events in log-id order with type name, typed body, participant identities, and the transaction that produced them.",
+                    "summary": "List tick events",
+                    "description": "Log-id order.",
                     "parameters": [tick_param(), limit_param(), cursor_param(), offset_param()],
                     "responses": {
                         "200": { "description": "Paginated events", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EventPage" } } } },
@@ -339,8 +339,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listTransactions",
                     "tags": ["Transactions"],
-                    "summary": "List transactions, newest tick first",
-                    "description": "Transactions filtered by epoch, tick, or identity. Newest tick and slot first. Use the dedicated identity or tick routes for larger histories.",
+                    "summary": "List transactions",
+                    "description": "Newest first, filterable.",
                     "parameters": [
                         { "name": "epoch", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
                         { "name": "tick", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
@@ -352,8 +352,8 @@ fn paths() -> Value {
                 "post": {
                     "operationId": "broadcastTransaction",
                     "tags": ["Transactions"],
-                    "summary": "Submit a signed transaction",
-                    "description": "Requires ALLOW_BROADCAST=true. The default path queues the transaction in the mempool, returns 202 with a tracked entry, rebroadcasts on a background schedule, and can notify a webhook. Set `direct: true` for the previous behavior: fan out once to up to `peers` peers (capped by BROADCAST_PEERS) and return the per-peer report. In both modes the transaction is decoded and locally checked for amount range, input size, byte length, and SchnorrQ signature before any socket is opened. Set `dry_run` to run the checks without broadcasting or queueing.\n\nQubic does not acknowledge broadcasts. A `sent` peer or a `broadcast` mempool status means the packet reached a peer socket, not that the transaction will be included. Poll `meta.links`, `GET /v1/mempool/{hash}`, or stream ticks to observe inclusion.",
+                    "summary": "Broadcast transaction",
+                    "description": "Queues in the mempool by default; set `direct: true` for one peer fan-out. Requires `ALLOW_BROADCAST=true`. A broadcast is not confirmation.",
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BroadcastRequest" } } }
@@ -377,8 +377,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getTransaction",
                     "tags": ["Transactions"],
-                    "summary": "Get a transaction by hash",
-                    "description": "Look up one transaction by its 60-character lowercase base-26 hash.",
+                    "summary": "Get transaction",
+                    "description": "By hash.",
                     "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Transaction", "content": { "application/json": { "schema": data_envelope("Transaction") } } },
@@ -391,8 +391,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getTransactionEffects",
                     "tags": ["Transactions"],
-                    "summary": "Get the full explorer view for a transaction",
-                    "description": "One request for an explorer transaction page. Returns the indexed transaction, its tick header, every decoded event, a typed effect list for transfers, asset movements, burns, contract messages, and custom messages, plus an aggregate summary. This route is local-only and never opens a peer connection.",
+                    "summary": "Get transaction effects",
+                    "description": "Transaction, tick, events, typed effects, and summary.",
                     "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Transaction effects", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/TransactionEffects" } } } } } },
@@ -405,8 +405,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listEvents",
                     "tags": ["Events"],
-                    "summary": "List typed events, newest tick first",
-                    "description": "Decoded logs with type name, body, participants, and transaction linkage. Filter by epoch, tick, or event type.",
+                    "summary": "List events",
+                    "description": "Newest first, filterable by type.",
                     "parameters": [
                         { "name": "epoch", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
                         { "name": "tick", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
@@ -421,8 +421,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listIdentities",
                     "tags": ["Identities"],
-                    "summary": "List identities by most recent activity",
-                    "description": "Ranked by latest activity. Each row carries observed QU balance, incoming and outgoing totals, transfer count, and first and last seen ticks.",
+                    "summary": "List identities",
+                    "description": "Most recently active first.",
                     "parameters": [limit_param(), cursor_param(), offset_param()],
                     "responses": { "200": { "description": "Paginated identities, most recently active first", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IdentityPage" } } } } }
                 }
@@ -431,8 +431,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getIdentity",
                     "tags": ["Identities"],
-                    "summary": "Get an identity summary and observed QU flow",
-                    "description": "Indexed QU flow, transfer count, and first and last activity for one identity. This is observed history, not a live spectrum lookup.",
+                    "summary": "Get identity",
+                    "description": "Observed QU flow.",
                     "parameters": [identity_param()],
                     "responses": {
                         "200": { "description": "Identity summary", "content": { "application/json": { "schema": data_envelope("Identity") } } },
@@ -445,8 +445,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listIdentityTransactions",
                     "tags": ["Identities"],
-                    "summary": "List transactions sent or received by an identity",
-                    "description": "Both outgoing transactions and transfers where the identity is the destination, newest first.",
+                    "summary": "List identity transactions",
+                    "description": "Newest first.",
                     "parameters": [identity_param(), limit_param(), cursor_param(), offset_param()],
                     "responses": {
                         "200": { "description": "Paginated transactions", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/TransactionPage" } } } },
@@ -458,8 +458,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getIdentityActivity",
                     "tags": ["Identities"],
-                    "summary": "Get the linear activity timeline for an identity",
-                    "description": "Merges direct transactions with decoded events where the identity participates, including contract payouts and asset movements.",
+                    "summary": "Get identity activity",
+                    "description": "Transactions and events merged newest first.",
                     "parameters": [identity_param(), limit_param(), cursor_param(), offset_param()],
                     "responses": {
                         "200": { "description": "Paginated activity rows with kind transaction or event", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IdentityActivityPage" } } } },
@@ -471,8 +471,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listIdentityCounterparties",
                     "tags": ["Identities"],
-                    "summary": "List top counterparties by transfer volume",
-                    "description": "Aggregates indexed transfers where the identity is the source or destination. Each row reports incoming and outgoing amounts, net flow, transaction count, and first and last tick. Self-transfers are excluded. This route is local-only.",
+                    "summary": "List counterparties",
+                    "description": "Top transfers by volume, excluding self-transfers.",
                     "parameters": [
                         identity_param(),
                         { "name": "direction", "in": "query", "schema": { "type": "string", "enum": ["all", "incoming", "outgoing"], "default": "all" } },
@@ -488,8 +488,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getIdentityFlow",
                     "tags": ["Identities"],
-                    "summary": "Get bucketed incoming and outgoing QU flow",
-                    "description": "Returns a fixed window of buckets ending at the indexed head. Empty buckets are zero-filled so charts do not need to resample. Amounts are in the network's base unit and are not rescaled.",
+                    "summary": "Get identity flow",
+                    "description": "Zero-filled incoming and outgoing QU buckets.",
                     "parameters": [
                         identity_param(),
                         { "name": "interval", "in": "query", "schema": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 3600 }, "description": "Bucket width in seconds" },
@@ -506,8 +506,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listIdentityEvents",
                     "tags": ["Identities"],
-                    "summary": "List events where the identity participates",
-                    "description": "Contract events where the identity appears as a sender, receiver, or other participant, newest first.",
+                    "summary": "List identity events",
+                    "description": "Newest first.",
                     "parameters": [identity_param(), limit_param(), cursor_param(), offset_param()],
                     "responses": {
                         "200": { "description": "Paginated event rows", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EventPage" } } } },
@@ -519,8 +519,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listAssets",
                     "tags": ["Assets"],
-                    "summary": "List assets derived from issuance events",
-                    "description": "Assets discovered from issuance events in the indexed range. Filter by issuer and page newest first. Returns an empty page when the indexed epochs contain no issuance events.",
+                    "summary": "List assets",
+                    "description": "Newest issuance first.",
                     "parameters": [
                         { "name": "issuer", "in": "query", "schema": { "type": "string" } },
                         limit_param(), cursor_param(), offset_param()
@@ -532,8 +532,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getAsset",
                     "tags": ["Assets"],
-                    "summary": "Get one asset by issuer and name",
-                    "description": "Asset metadata and issuance details for one issuer and asset name.",
+                    "summary": "Get asset",
+                    "description": "By issuer and name.",
                     "parameters": [issuer_param(), asset_name_param()],
                     "responses": {
                         "200": { "description": "Asset metadata", "content": { "application/json": { "schema": data_envelope("Asset") } } },
@@ -546,8 +546,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listAssetTransfers",
                     "tags": ["Assets"],
-                    "summary": "List ownership and possession transfers for one asset",
-                    "description": "Local indexed history of decoded asset_ownership_change and asset_possession_change events, newest first. Works without a peer and does not rebuild the holder set.",
+                    "summary": "List asset transfers",
+                    "description": "Ownership and possession changes.",
                     "parameters": [
                         issuer_param(),
                         asset_name_param(),
@@ -564,8 +564,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getWallet",
                     "tags": ["Wallets"],
-                    "summary": "Get the wallet overview from index plus peer",
-                    "description": "Combines the indexed identity and its ten newest transactions with the peer spectrum entity and the issued, owned, and possessed asset lists. One peer connection serves the request.",
+                    "summary": "Get wallet",
+                    "description": "Indexed identity, recent transactions, and peer asset lists.",
                     "parameters": [identity_param()],
                     "responses": {
                         "200": { "description": "Wallet overview", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/WalletOverview" }, "meta": { "type": "object" } } } } } },
@@ -579,8 +579,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listWalletAssets",
                     "tags": ["Wallets"],
-                    "summary": "List issued, owned, and possessed assets for a wallet",
-                    "description": "Asset lists from one peer connection, filtered by kind. Use kind=all for a single round trip.",
+                    "summary": "List wallet assets",
+                    "description": "Issued, owned, and possessed.",
                     "parameters": [
                         identity_param(),
                         { "name": "kind", "in": "query", "required": false, "schema": { "type": "string", "enum": ["issued", "owned", "possessed", "all"], "default": "all" } }
@@ -596,8 +596,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getLiveWallet",
                     "tags": ["Live"],
-                    "summary": "Get a point-in-time peer snapshot for a wallet",
-                    "description": "Entity, asset lists, counts, and peer head from a single peer connection. Never cached.",
+                    "summary": "Get live wallet",
+                    "description": "Point-in-time peer snapshot; not cached.",
                     "parameters": [identity_param()],
                     "responses": {
                         "200": { "description": "Wallet snapshot", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/WalletSnapshot" }, "meta": { "type": "object" } } } } } },
@@ -610,8 +610,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listAssetHolders",
                     "tags": ["Assets"],
-                    "summary": "List ownership holders for an asset",
-                    "description": "Queries the peer asset tree for ownership records of one issuer and asset name. Holders are deduplicated by identity, sorted by shares descending then identity, and truncated to limit.",
+                    "summary": "List asset holders",
+                    "description": "Peer ownership snapshot, sorted by shares.",
                     "parameters": [
                         issuer_param(),
                         asset_name_param(),
@@ -629,8 +629,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "search",
                     "tags": ["Search"],
-                    "summary": "Search ticks, transactions, identities, and assets",
-                    "description": "One query parameter, typed results. Ticks resolve as integers, transaction hashes by base-26 digest, and identities in either canonical or hex form.",
+                    "summary": "Search",
+                    "description": "Resolve ticks, hashes, identities, and assets.",
                     "parameters": [{ "name": "q", "in": "query", "required": true, "schema": { "type": "string" } }],
                     "responses": { "200": { "description": "Typed matches", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SearchResults" } } } }, "400": { "description": "Missing query" } }
                 }
@@ -639,8 +639,8 @@ fn paths() -> Value {
                 "post": {
                     "operationId": "batchTransactions",
                     "tags": ["Transactions"],
-                    "summary": "Look up many transaction hashes in one request",
-                    "description": "At most 100 unique hashes. Unknown hashes are reported in meta.missing instead of failing the request.",
+                    "summary": "Batch transaction lookup",
+                    "description": "Up to 100 hashes.",
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BatchRequest" } } }
@@ -655,8 +655,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getActivity",
                     "tags": ["Analytics"],
-                    "summary": "Get transaction and event counts per time bucket",
-                    "description": "Bucketed activity with deduplicated counts across replayed ticks and summed QU volume. Choose the interval and window with query parameters.",
+                    "summary": "Get activity",
+                    "description": "Bucketed counts.",
                     "parameters": [
                         { "name": "interval", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 86400, "default": 3600 }, "description": "Bucket width in seconds" },
                         { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 24 } }
@@ -668,8 +668,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listTopIdentities",
                     "tags": ["Analytics"],
-                    "summary": "List identities with the most observed activity",
-                    "description": "Ranked by transfer count, with balance and first and last seen ticks for each identity.",
+                    "summary": "List top identities",
+                    "description": "By transfer count.",
                     "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 25 } }],
                     "responses": { "200": { "description": "Ranked identities", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/IdentityPage" } } } } }
                 }
@@ -678,8 +678,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listEventTypes",
                     "tags": ["Analytics"],
-                    "summary": "Get event counts grouped by decoded type",
-                    "description": "Total occurrences for each decoded event type, highest first.",
+                    "summary": "Get event types",
+                    "description": "Counts by type.",
                     "parameters": [{ "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } }],
                     "responses": { "200": { "description": "Event type counts, highest first", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EventTypePage" } } } } }
                 }
@@ -689,8 +689,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "streamAll",
                     "tags": ["Stream"],
-                    "summary": "Subscribe to ticks, transactions, events, prices, and market",
-                    "description": "Polls the local index head only; never opens a peer connection. Sends keep-alive comments every 15 seconds and lag events when a subscriber falls behind.",
+                    "summary": "Stream all events",
+                    "description": "SSE feed for ticks, transactions, events, prices, and market.",
                     "parameters": [
                         { "name": "types", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated subset of tick,transaction,event,price,market. The poll interval is set on the server with STREAM_POLL_MS." },
                         { "name": "identity", "in": "query", "schema": { "type": "string" }, "description": "Only emit transactions and events that mention this identity. Tick, price, and market events are suppressed while this filter is set." },
@@ -706,8 +706,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "streamTicks",
                     "tags": ["Stream"],
-                    "summary": "Subscribe to tick headers only",
-                    "description": "Server-sent tick headers as new ticks are indexed.",
+                    "summary": "Stream ticks",
+                    "description": "Tick headers as indexed.",
                     "responses": { "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "503": { "description": "Streaming is not enabled" } }
                 }
             },
@@ -715,8 +715,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "streamTransactions",
                     "tags": ["Stream"],
-                    "summary": "Subscribe to transaction rows only",
-                    "description": "Server-sent transaction rows as new ticks are indexed.",
+                    "summary": "Stream transactions",
+                    "description": "Transaction rows as indexed.",
                     "responses": { "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "503": { "description": "Streaming is not enabled" } }
                 }
             },
@@ -724,8 +724,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "streamEvents",
                     "tags": ["Stream"],
-                    "summary": "Subscribe to decoded contract events only",
-                    "description": "Server-sent decoded contract events as new ticks are indexed.",
+                    "summary": "Stream events",
+                    "description": "Decoded events as indexed.",
                     "responses": { "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } }, "503": { "description": "Streaming is not enabled" } }
                 }
             },
@@ -733,8 +733,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "streamPrices",
                     "tags": ["Stream"],
-                    "summary": "Subscribe to price-point updates only",
-                    "description": "Server-sent price points as new hours are stored. Same payload as GET /v1/prices, pushed when the stored hour changes.",
+                    "summary": "Stream prices",
+                    "description": "Price points as stored.",
                     "responses": { "200": { "description": "text/event-stream" }, "503": { "description": "Streaming is not enabled" } }
                 }
             },
@@ -742,8 +742,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "streamMarket",
                     "tags": ["Stream"],
-                    "summary": "Subscribe to market-snapshot updates only",
-                    "description": "Server-sent market snapshots as the external reference refreshes. Same payload as GET /v1/market.",
+                    "summary": "Stream market",
+                    "description": "Market snapshots as refreshed.",
                     "responses": { "200": { "description": "text/event-stream" }, "503": { "description": "Streaming is not enabled" } }
                 }
             },
@@ -751,8 +751,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "streamWebSocket",
                     "tags": ["Stream"],
-                    "summary": "Subscribe over WebSocket with the same event stream",
-                    "description": "Upgrade to a WebSocket and receive the same JSON events as the SSE stream on one connection.",
+                    "summary": "WebSocket stream",
+                    "description": "Same events over WebSocket.",
                     "responses": { "200": { "description": "WebSocket upgrade" }, "503": { "description": "Streaming is not enabled" } }
                 }
             },
@@ -761,8 +761,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getLiveIdentity",
                     "tags": ["Live"],
-                    "summary": "Get the live identity record from a direct peer",
-                    "description": "Reads the peer spectrum entity for an identity. This is live peer state with a two-second cache.",
+                    "summary": "Get live identity",
+                    "description": "Peer spectrum record, cached for up to two seconds.",
                     "parameters": [identity_param()],
                     "responses": {
                         "200": { "description": "Live identity record from the peer", "content": { "application/json": { "schema": data_envelope("LiveIdentity") } } },
@@ -776,8 +776,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getLiveTransaction",
                     "tags": ["Live"],
-                    "summary": "Get a transaction as reported by a direct peer",
-                    "description": "Reads a transaction from a peer by hash. Useful for transactions newer than the local index.",
+                    "summary": "Get live transaction",
+                    "description": "Peer transaction lookup by hash.",
                     "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Transaction as reported by the peer", "content": { "application/json": { "schema": data_envelope("Transaction") } } },
@@ -791,8 +791,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getLiveTransactionStatus",
                     "tags": ["Live"],
-                    "summary": "Get peer confirmation and money-flow for a transaction",
-                    "description": "Looks up the confirmed transaction by hash, then asks the same peer for the tick tx-status add-on. When the peer does not run the add-on, the response is still 200 with money_flew null and meta.status_source unavailable.",
+                    "summary": "Get live transaction status",
+                    "description": "Peer confirmation and money flow. `money_flew` may be null.",
                     "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Peer transaction status", "content": { "application/json": { "schema": data_envelope("TransactionNetworkStatus") } } },
@@ -806,8 +806,8 @@ fn paths() -> Value {
                 "post": {
                     "operationId": "validateTransaction",
                     "tags": ["Transactions"],
-                    "summary": "Validate a signed transaction without broadcasting",
-                    "description": "Decodes the signed transaction and reports amount-range, input-size, and SchnorrQ signature checks. No peer connection is opened and ALLOW_BROADCAST is not required.",
+                    "summary": "Validate transaction",
+                    "description": "Local decode, size, amount, and signature checks.",
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ValidateRequest" } } }
@@ -822,8 +822,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getTransactionStatus",
                     "tags": ["Transactions"],
-                    "summary": "Get indexed plus live confirmation for a transaction",
-                    "description": "Returns the indexed row when present and best-effort peer confirmation data. An indexed transaction still returns 200 when peers are unavailable; meta.peer_error explains the degradation.",
+                    "summary": "Get transaction status",
+                    "description": "Indexed row plus best-effort peer confirmation.",
                     "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Indexed and/or peer transaction status" },
@@ -837,8 +837,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listLiveTickTransactions",
                     "tags": ["Live"],
-                    "summary": "Get live confirmation status for every transaction in a tick",
-                    "description": "Peer-side status for every transaction in a tick, including whether money moved for each hash.",
+                    "summary": "List live tick transactions",
+                    "description": "Peer-side status for one tick.",
                     "parameters": [tick_param()],
                     "responses": {
                         "200": { "description": "Peer transaction status", "content": { "application/json": { "schema": data_envelope("TickTransactionStatus") } } },
@@ -850,8 +850,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "downloadTickBundle",
                     "tags": ["Archive"],
-                    "summary": "Download the archived raw QBB1 tick bundle",
-                    "description": "Requires S3_BUCKET or ARCHIVE_DIR to be configured for the API. Without section, returns the zstd-compressed QBB1 container. Votes are archived only when the indexer ran with ARCHIVE_VOTES=true; otherwise `section=votes` returns 404. `section=computors` falls back to the per-epoch sidecar at `raw/epoch=NNN/computors.bin` when the bundle has no computors payload.",
+                    "summary": "Download raw bundle",
+                    "description": "Zstd QBB1 bundle or one section. Votes require `ARCHIVE_VOTES=true`; computors use the epoch sidecar.",
                     "parameters": [
                         tick_param(),
                         { "name": "section", "in": "query", "schema": { "type": "string", "enum": ["tick", "tick_data", "votes", "transactions", "log_ranges", "logs", "computors"] } }
@@ -868,8 +868,8 @@ fn paths() -> Value {
                 "post": {
                     "operationId": "queryContract",
                     "tags": ["Live"],
-                    "summary": "Call a read-only contract function on a direct peer",
-                    "description": "Queries a contract index with a raw input type and hex payload against a direct peer. No ABI or contract name is assumed; the caller supplies encoded input and receives raw output bytes. Cached for up to two seconds. Returns 503 when no peer answers.",
+                    "summary": "Query contract",
+                    "description": "Raw contract function call against a peer.",
                     "parameters": [contract_index_param()],
                     "requestBody": {
                         "required": false,
@@ -887,8 +887,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listMempoolEntries",
                     "tags": ["Mempool"],
-                    "summary": "List mempool entries, newest first",
-                    "description": "Open and recently resolved broadcast attempts tracked by this API. Status is best-effort: `broadcast` means at least one peer accepted the packet at the socket, not that the transaction was included. Use `status` to filter and `limit` to bound the list.",
+                    "summary": "List mempool",
+                    "description": "Tracked entries, newest first. Status is best-effort.",
                     "parameters": [
                         { "name": "status", "in": "query", "schema": { "type": "string", "enum": ["queued", "broadcast", "confirmed", "expired", "failed", "cancelled"] } },
                         { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 } }
@@ -912,8 +912,8 @@ fn paths() -> Value {
                 "post": {
                     "operationId": "submitMempoolEntry",
                     "tags": ["Mempool"],
-                    "summary": "Submit a signed transaction to the mempool",
-                    "description": "Decodes and locally checks the signed transaction, registers any inline webhook, persists the entry, and performs the first peer broadcast before returning 202. A duplicate hash returns the existing entry unchanged, so the route is idempotent. Requires ALLOW_BROADCAST=true. Background tracking rebroadcasts at `MEMPOOL_RETRY_MS` up to `MEMPOOL_MAX_ATTEMPTS` and expires the entry once the indexed head is greater than `tick + MEMPOOL_EXPIRY_TICKS`. Qubic does not acknowledge broadcasts, so `broadcast` is not a confirmation. Poll `meta.links.status` or register a webhook to observe the final status.",
+                    "summary": "Submit to mempool",
+                    "description": "Validate, persist, and broadcast. Requires `ALLOW_BROADCAST=true`; duplicate hashes are idempotent.",
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MempoolSubmitRequest" } } }
@@ -938,8 +938,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getMempoolEntry",
                     "tags": ["Mempool"],
-                    "summary": "Get one mempool entry with indexed status",
-                    "description": "Returns the tracked entry. When the transaction has appeared in the index, the response reports `confirmed` and the indexed tick even if the background tracker has not reconciled it yet.",
+                    "summary": "Get mempool entry",
+                    "description": "Tracked state with indexed confirmation merged in.",
                     "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Mempool entry", "content": { "application/json": { "schema": data_envelope("MempoolEntry") } } },
@@ -951,8 +951,8 @@ fn paths() -> Value {
                 "delete": {
                     "operationId": "cancelMempoolEntry",
                     "tags": ["Mempool"],
-                    "summary": "Cancel a tracked mempool entry",
-                    "description": "Marks an entry `cancelled` and stops further rebroadcasts. Cancelling an already cancelled entry returns it unchanged. Expired, failed, and cancelled entries can be cancelled. A confirmed transaction cannot be cancelled because the chain has already included it; the route returns 409 with code `already_confirmed`. Cancellation does not recall a packet that a peer already accepted.",
+                    "summary": "Cancel mempool entry",
+                    "description": "Stops rebroadcasts. Confirmed entries return 409.",
                     "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Entry cancelled", "content": { "application/json": { "schema": data_envelope("MempoolEntry") } } },
@@ -966,8 +966,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listWebhooks",
                     "tags": ["Webhooks"],
-                    "summary": "List active webhook registrations",
-                    "description": "Active registrations only. Secrets are never returned. Delivery attempts are available per webhook.",
+                    "summary": "List webhooks",
+                    "description": "Active registrations.",
                     "responses": {
                         "200": {
                             "description": "Webhook registrations",
@@ -985,8 +985,8 @@ fn paths() -> Value {
                 "post": {
                     "operationId": "registerWebhook",
                     "tags": ["Webhooks"],
-                    "summary": "Register a webhook for transaction events",
-                    "description": "Registers an HTTPS or HTTP endpoint for mempool transaction events. `secret` must be at least 16 characters and signs every delivery. An empty `events` list subscribes to every transaction event. Empty `transaction_hashes` matches every tracked hash; empty `identity` matches every source identity. Localhost and private address targets are rejected unless WEBHOOK_ALLOW_PRIVATE=true.",
+                    "summary": "Register webhook",
+                    "description": "Signed at-least-once delivery for mempool events. Secrets are never returned.",
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookRegistration" } } }
@@ -1001,8 +1001,8 @@ fn paths() -> Value {
                 "delete": {
                     "operationId": "deleteWebhook",
                     "tags": ["Webhooks"],
-                    "summary": "Deactivate a webhook",
-                    "description": "Marks the registration inactive. Pending deliveries are not retried after deactivation. The record and its delivery history remain queryable.",
+                    "summary": "Deactivate webhook",
+                    "description": "Stops further deliveries.",
                     "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
                     "responses": {
                         "200": { "description": "Webhook deactivated", "content": { "application/json": { "schema": data_envelope("Webhook") } } },
@@ -1014,8 +1014,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listWebhookDeliveries",
                     "tags": ["Webhooks"],
-                    "summary": "List recent deliveries for a webhook",
-                    "description": "Newest first. Each row tracks one delivery across retries with an incremented attempt count. Delivery is at-least-once: a 2xx response acknowledges an attempt, but a retry can repeat an event.",
+                    "summary": "List deliveries",
+                    "description": "Delivery attempts, newest first.",
                     "parameters": [
                         { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
                         { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 } }
@@ -1041,8 +1041,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "listPrices",
                     "tags": ["Prices"],
-                    "summary": "List hourly QUBIC/USDT points, ascending",
-                    "description": "Points recorded from the latest verified QUBIC/USDT Price oracle reply or the QPayhub GetQuUsdPrice fallback. When neither on-chain source exists, rows come from the external exchange consensus and set `onchain: false` while omitting on-chain-only fields.",
+                    "summary": "List prices",
+                    "description": "Hourly QUBIC/USDT points, oldest first.",
                     "parameters": [
                         { "name": "from_hour", "in": "query", "schema": { "type": "integer", "minimum": 0 }, "description": "First core price hour, inclusive" },
                         { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 168 } }
@@ -1057,8 +1057,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getPriceHistory",
                     "tags": ["Prices"],
-                    "summary": "Get the trailing QUBIC/USDT price window",
-                    "description": "The most recent stored points for a requested number of hours, ascending. Missing hours are omitted rather than zero-filled.",
+                    "summary": "Get price history",
+                    "description": "Trailing window.",
                     "parameters": [{ "name": "hours", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 24 } }],
                     "responses": { "200": { "description": "Ascending price window", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PricePointPage" } } } } }
                 }
@@ -1067,8 +1067,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getLatestPrice",
                     "tags": ["Prices"],
-                    "summary": "Get the latest stored QUBIC/USDT price point",
-                    "description": "The newest stored point. Returns 404 before the first successful poll. Check `onchain` before treating a point as an oracle sample.",
+                    "summary": "Get latest price",
+                    "description": "Newest stored point.",
                     "responses": {
                         "200": { "description": "Latest price", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/PricePoint" } } } } } },
                         "404": { "description": "No price data yet" }
@@ -1079,8 +1079,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getPriceSnapshot",
                     "tags": ["Prices"],
-                    "summary": "Get QUBIC/USDT price metadata and latest point",
-                    "description": "Source, staleness, series digest, and the latest point in one response. Use this to render a price header without a second request.",
+                    "summary": "Get price snapshot",
+                    "description": "Metadata and latest point.",
                     "responses": {
                         "200": { "description": "Price snapshot; data is null before the first poll", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "oneOf": [{ "$ref": "#/components/schemas/PriceSnapshot" }, { "type": "null" }] }, "meta": { "type": "object" } } } } } },
                         "500": { "description": "Storage failure" }
@@ -1091,8 +1091,8 @@ fn paths() -> Value {
                 "get": {
                     "operationId": "getMarket",
                     "tags": ["Market"],
-                    "summary": "Get the current QUBIC/USDT market snapshot",
-                    "description": "Cached external exchange consensus plus CoinGecko reference data. MEXC and Gate.io spot tickers provide the price; CoinGecko supplies market cap, 24-hour volume, and 24-hour change. The endpoint never fans out to an exchange per request.",
+                    "summary": "Get market snapshot",
+                    "description": "Cached external reference.",
                     "responses": {
                         "200": { "description": "Market snapshot", "content": { "application/json": { "schema": data_envelope("MarketSnapshot") } } },
                         "503": { "description": "No market snapshot has been fetched yet" }
@@ -1127,42 +1127,42 @@ fn schemas() -> Value {
                     "type": "object",
                     "required": ["raw"],
                     "properties": {
-                        "raw": { "type": "string", "description": "Signed transaction bytes as hex, with or without a 0x prefix. `transaction`, `raw_transaction`, and `signed_transaction` are accepted aliases." },
-                        "dry_run": { "type": "boolean", "default": false, "description": "Validate and describe the transaction without opening a peer connection." },
-                        "peers": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Peers to fan out to. Capped by the server's BROADCAST_PEERS setting. `max_peers` is an alias." },
-                        "direct": { "type": "boolean", "default": false, "description": "Bypass the mempool and use the old direct fan-out behavior. The default queues the transaction in the mempool and returns a tracked entry." },
-                        "webhook_url": { "type": "string", "description": "Mempool only: convenience webhook registered for this transaction." },
-                        "webhook_secret": { "type": "string", "description": "Mempool only: signing secret for `webhook_url`, at least 16 characters." }
+                        "raw": { "type": "string", "description": "Signed transaction hex." },
+                        "dry_run": { "type": "boolean", "default": false, "description": "Check without broadcasting." },
+                        "peers": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Peer fan-out." },
+                        "direct": { "type": "boolean", "default": false, "description": "Bypass the mempool." },
+                        "webhook_url": { "type": "string", "description": "Optional webhook for this transaction." },
+                        "webhook_secret": { "type": "string", "description": "Webhook signing secret." }
                     }
                 },
                 "MempoolSubmitRequest": {
                     "type": "object",
                     "required": ["raw"],
                     "properties": {
-                        "raw": { "type": "string", "description": "Signed transaction bytes as hex, with or without a 0x prefix." },
-                        "peers": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Peers to contact per attempt. Capped by BROADCAST_PEERS." },
-                        "webhook_url": { "type": "string", "description": "Optional webhook target registered for this entry." },
-                        "webhook_secret": { "type": "string", "minLength": 16, "description": "Signing secret used when `webhook_url` is set." }
+                        "raw": { "type": "string", "description": "Signed transaction hex." },
+                        "peers": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Peer fan-out." },
+                        "webhook_url": { "type": "string", "description": "Optional webhook target." },
+                        "webhook_secret": { "type": "string", "minLength": 16, "description": "Webhook signing secret." }
                     }
                 },
                 "MempoolEntry": {
                     "type": "object",
                     "required": ["hash", "source", "destination", "amount", "tick", "status", "attempts", "created_at", "updated_at"],
                     "properties": {
-                        "hash": { "type": "string", "description": "Lowercase base-26 transaction hash" },
-                        "raw": { "type": "string", "description": "Signed transaction bytes as lowercase hex" },
-                        "source": { "type": "string", "description": "Canonical source identity" },
-                        "destination": { "type": "string", "description": "Canonical destination identity" },
+                        "hash": { "type": "string", "description": "Transaction hash." },
+                        "raw": { "type": "string", "description": "Signed transaction hex." },
+                        "source": { "type": "string", "description": "Source identity." },
+                        "destination": { "type": "string", "description": "Destination identity." },
                         "amount": { "type": "integer", "format": "int64" },
-                        "tick": { "type": "integer", "description": "Target tick from the transaction header" },
-                        "peers": { "type": "integer", "description": "Peers requested for each broadcast attempt" },
+                        "tick": { "type": "integer", "description": "Target tick." },
+                        "peers": { "type": "integer", "description": "Requested peers." },
                         "status": { "type": "string", "enum": ["queued", "broadcast", "confirmed", "expired", "failed", "cancelled"] },
-                        "attempts": { "type": "integer", "description": "Broadcast attempts so far" },
-                        "broadcast_peers": { "type": "integer", "description": "Peers that accepted the packet in the latest attempt" },
+                        "attempts": { "type": "integer", "description": "Attempts so far." },
+                        "broadcast_peers": { "type": "integer", "description": "Peers that accepted the packet." },
                         "broadcast_at": { "type": ["string", "null"], "format": "date-time" },
                         "confirmed_at": { "type": ["string", "null"], "format": "date-time" },
-                        "confirmed_tick": { "type": ["integer", "null"], "description": "Indexed tick once the transaction is confirmed" },
-                        "error": { "type": ["string", "null"], "description": "Last broadcast or decode error" },
+                        "confirmed_tick": { "type": ["integer", "null"], "description": "Indexed confirmation tick." },
+                        "error": { "type": ["string", "null"], "description": "Last error." },
                         "created_at": { "type": "string", "format": "date-time" },
                         "updated_at": { "type": "string", "format": "date-time" }
                     }
@@ -1171,15 +1171,15 @@ fn schemas() -> Value {
                     "type": "object",
                     "required": ["url", "secret"],
                     "properties": {
-                        "url": { "type": "string", "format": "uri", "description": "HTTP or HTTPS delivery endpoint" },
-                        "secret": { "type": "string", "minLength": 16, "description": "HMAC key for delivery signatures. Never returned." },
+                        "url": { "type": "string", "format": "uri", "description": "Delivery URL." },
+                        "secret": { "type": "string", "minLength": 16, "description": "HMAC signing key." },
                         "events": {
                             "type": "array",
-                            "description": "Events to deliver. Empty means every transaction event.",
+                            "description": "Events to deliver. Empty means all.",
                             "items": { "type": "string", "enum": ["transaction.queued", "transaction.broadcast", "transaction.confirmed", "transaction.expired", "transaction.failed", "transaction.cancelled"] }
                         },
-                        "transaction_hashes": { "type": "array", "description": "Limit delivery to these hashes. Empty means every hash.", "items": { "type": "string" } },
-                        "identity": { "type": "string", "description": "Limit delivery to this source identity. Empty means every identity." }
+                        "transaction_hashes": { "type": "array", "description": "Hashes to match. Empty means all.", "items": { "type": "string" } },
+                        "identity": { "type": "string", "description": "Source identity to match. Empty means all." }
                     }
                 },
                 "Webhook": {
@@ -1190,7 +1190,7 @@ fn schemas() -> Value {
                         "url": { "type": "string", "format": "uri" },
                         "events": { "type": "array", "items": { "type": "string" } },
                         "transaction_hashes": { "type": "array", "items": { "type": "string" } },
-                        "identity": { "type": "string", "description": "Empty when the webhook matches every source identity" },
+                        "identity": { "type": "string", "description": "Empty matches all identities." },
                         "active": { "type": "boolean" },
                         "created_at": { "type": "string", "format": "date-time" },
                         "updated_at": { "type": "string", "format": "date-time" }
@@ -1205,11 +1205,11 @@ fn schemas() -> Value {
                         "event": { "type": "string", "enum": ["transaction.queued", "transaction.broadcast", "transaction.confirmed", "transaction.expired", "transaction.failed", "transaction.cancelled"] },
                         "transaction_hash": { "type": "string" },
                         "status": { "type": "string", "enum": ["pending", "delivered", "failed"] },
-                        "attempt": { "type": "integer", "description": "Completed delivery attempts" },
+                        "attempt": { "type": "integer", "description": "Completed attempts." },
                         "next_attempt_at": { "type": ["string", "null"], "format": "date-time" },
-                        "response_status": { "type": ["integer", "null"], "description": "HTTP status returned by the receiver" },
+                        "response_status": { "type": ["integer", "null"], "description": "Receiver HTTP status." },
                         "error": { "type": ["string", "null"] },
-                        "payload": { "type": "string", "description": "Exact JSON body sent to the receiver" },
+                        "payload": { "type": "string", "description": "Exact JSON body." },
                         "created_at": { "type": "string", "format": "date-time" }
                     }
                 },
@@ -1222,9 +1222,9 @@ fn schemas() -> Value {
                             "properties": {
                                 "valid": { "type": "boolean", "description": "Dry run only." },
                                 "dry_run": { "type": "boolean", "description": "Dry run only." },
-                                "target_peers": { "type": "integer", "description": "Dry run only: peers that would be contacted." },
-                                "sent": { "type": "integer", "description": "Broadcast only: peers whose socket accepted the packet." },
-                                "targeted": { "type": "integer", "description": "Broadcast only: peers attempted." },
+                                "target_peers": { "type": "integer", "description": "Dry run only." },
+                                "sent": { "type": "integer", "description": "Peers that accepted the packet." },
+                                "targeted": { "type": "integer", "description": "Peers attempted." },
                                 "transaction": {
                                     "type": "object",
                                     "properties": {
@@ -1242,7 +1242,7 @@ fn schemas() -> Value {
                                 "checks": { "type": "array", "items": { "$ref": "#/components/schemas/TransactionValidationCheck" } },
                                 "peers": {
                                     "type": "array",
-                                    "description": "Broadcast only: one entry per attempted peer.",
+                                    "description": "One entry per peer.",
                                     "items": {
                                         "type": "object",
                                         "properties": {
@@ -1263,7 +1263,7 @@ fn schemas() -> Value {
                     "type": "object",
                     "required": ["raw"],
                     "properties": {
-                        "raw": { "type": "string", "description": "Signed transaction bytes as hex, with or without a 0x prefix" }
+                        "raw": { "type": "string", "description": "Signed transaction hex." }
                     }
                 },
                 "TransactionValidationCheck": {
