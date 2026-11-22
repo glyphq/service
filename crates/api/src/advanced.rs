@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use node::Peer;
 use qubic::messages::{
     PENDING_TXS_POOL_TICKS, RECOMMENDED_TARGET_TICK_LEAD, TICK_TRANSACTIONS_PUBLICATION_OFFSET,
-    Transaction,
+    TX_PER_TICK, Transaction,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,6 +27,7 @@ use crate::{ApiError, AppState};
 /// run it silently drop the request, so cap how long an optional status probe
 /// can hold a request open instead of paying the full peer retry budget.
 const TX_STATUS_TIMEOUT: Duration = Duration::from_secs(3);
+const TICK_TRANSACTIONS_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -516,41 +517,99 @@ async fn tx_status(
 ) -> Result<impl IntoResponse, ApiError> {
     let tick = parse_tick(&tick)?;
     let mut peer = connect(&state).await?;
-    let status = match tokio::time::timeout(TX_STATUS_TIMEOUT, peer.tx_status(tick)).await {
-        Ok(result) => result
-            .map_err(|error| ApiError::unavailable(format!("tx status unavailable: {error}")))?,
-        Err(_) => {
-            return Err(ApiError::unavailable(format!(
-                "peer did not answer tx status for tick {tick} within {}s; \
-                 the peer may not run the tx-status add-on or may have pruned the tick",
-                TX_STATUS_TIMEOUT.as_secs()
-            )));
+    match tokio::time::timeout(TX_STATUS_TIMEOUT, peer.tx_status(tick)).await {
+        Ok(Ok(status)) => {
+            let transactions: Vec<Value> = status
+                .transactions
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    json!({
+                        "hash": qubic::encode_tx_hash(&entry.digest),
+                        "tx_index": index,
+                        "money_flew": entry.money_flew,
+                    })
+                })
+                .collect();
+            Ok((
+                [(
+                    axum::http::header::CACHE_CONTROL,
+                    "public, max-age=2, stale-while-revalidate=5",
+                )],
+                Json(json!({
+                    "data": {
+                        "tick": status.tick,
+                        "current_tick": status.current_tick,
+                        "transactions": transactions,
+                    },
+                    "meta": { "source": "peer", "tx_status": "available" }
+                })),
+            ))
         }
-    };
-    let transactions: Vec<Value> = status
-        .transactions
-        .iter()
-        .map(|entry| {
-            json!({
-                "hash": qubic::encode_tx_hash(&entry.digest),
-                "money_flew": entry.money_flew,
-            })
-        })
-        .collect();
-    Ok((
-        [(
-            axum::http::header::CACHE_CONTROL,
-            "public, max-age=2, stale-while-revalidate=5",
-        )],
-        Json(json!({
-            "data": {
-                "tick": status.tick,
-                "current_tick": status.current_tick,
-                "transactions": transactions,
-            },
-            "meta": { "source": "peer" }
-        })),
-    ))
+        other => {
+            let reason = match other {
+                Ok(Err(error)) => error.to_string(),
+                _ => format!(
+                    "peer did not answer tx status for tick {tick} within {}s",
+                    TX_STATUS_TIMEOUT.as_secs()
+                ),
+            };
+            // The tx-status message is an optional peer add-on. Fall back to
+            // the standard tick transaction request so the route still works.
+            let mut peer = connect(&state).await?;
+            let transactions = tokio::time::timeout(
+                TICK_TRANSACTIONS_TIMEOUT,
+                peer.transactions(tick, &[false; TX_PER_TICK]),
+            )
+            .await
+            .map_err(|_| {
+                ApiError::unavailable(format!(
+                    "tx status unavailable ({reason}); peer did not answer standard tick transactions within {}s",
+                    TICK_TRANSACTIONS_TIMEOUT.as_secs()
+                ))
+            })?
+            .map_err(|error| {
+                ApiError::unavailable(format!(
+                    "tx status unavailable ({reason}); standard tick transactions failed: {error}"
+                ))
+            })?;
+            let transactions: Vec<Value> = transactions
+                .iter()
+                .enumerate()
+                .map(|(index, transaction)| {
+                    json!({
+                        "hash": qubic::encode_tx_hash(&transaction.hash()),
+                        "tx_index": index,
+                        "source": qubic::PublicKey(transaction.source).to_identity(),
+                        "destination": qubic::PublicKey(transaction.destination).to_identity(),
+                        "amount": transaction.amount,
+                        "tick": transaction.tick,
+                        "input_type": transaction.input_type,
+                        "input_bytes": transaction.input.len(),
+                        "money_flew": null,
+                    })
+                })
+                .collect();
+            Ok((
+                [(
+                    axum::http::header::CACHE_CONTROL,
+                    "public, max-age=2, stale-while-revalidate=5",
+                )],
+                Json(json!({
+                    "data": {
+                        "tick": tick,
+                        "current_tick": null,
+                        "transactions": transactions,
+                    },
+                    "meta": {
+                        "source": "peer-tick-transactions",
+                        "tx_status": "unavailable",
+                        "note": "money_flew is null because the peer does not run the tx-status add-on."
+                    }
+                })),
+            ))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

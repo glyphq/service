@@ -1026,7 +1026,7 @@ fn paths() -> Value {
                     "operationId": "listLiveTickTransactions",
                     "tags": ["Live"],
                     "summary": "List live tick transactions",
-                    "description": "Peer-side status for one tick.",
+                    "description": "Peer-side transactions for one tick. Falls back to the standard tick transaction request when the optional tx-status add-on is unavailable; money_flew is null in that case.",
                     "parameters": [tick_param()],
                     "responses": {
                         "200": { "description": "Peer transaction status", "content": { "application/json": { "schema": data_envelope("TickTransactionStatus") } } },

@@ -1110,8 +1110,14 @@ Configure peers with `QUBIC_PEERS` (comma-separated `host:port`) or
 | `GET /v1/wallets/{identity}/assets?kind=` | Issued, owned, and possessed assets for a wallet from the peer asset tree. |
 | `GET /v1/live/wallets/{identity}` | Point-in-time peer entity, assets, counts, and head for a wallet. |
 | `GET /v1/assets/{issuer}/{name}/holders?limit=` | Ownership holders for an asset, ranked by shares. |
-| `GET /v1/live/ticks/{tick}/transactions` | Peer transaction confirmation status with money-flew flags. |
+| `GET /v1/live/ticks/{tick}/transactions` | Peer tick transactions with money-flew flags when the tx-status add-on is available. |
 | `POST /v1/live/contracts/{contract_index}/query` | Read-only contract function call. Body is `{"input_type": 0, "input": "hex"}`. Output is hex. |
+
+The live tick transactions route first tries the optional tx-status add-on. If
+the peer does not run it, the route falls back to the standard
+`RequestTickTransactions` message and still returns `200`, with
+`meta.tx_status = "unavailable"` and `money_flew = null` on each row. It returns
+`503 unavailable` only when both peer requests fail.
 
 An unavailable peer returns `503 unavailable`. Invalid input returns
 `400 bad_request`. Peer responses are not persisted or merged into the index.
