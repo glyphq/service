@@ -16,7 +16,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use node::NodePool;
 use serde_json::json;
 use store::gateway::{GatewayStore, MempoolEntry, MempoolStatus};
@@ -25,6 +25,10 @@ use tokio_util::sync::CancellationToken;
 use crate::ApiError;
 use crate::advanced::decode_transaction;
 use crate::webhook::Webhooks;
+
+/// The request path performs the first broadcast after inserting the entry.
+/// Give it time to finish before the tracker can rebroadcast the same entry.
+const SUBMIT_GRACE: TimeDelta = TimeDelta::seconds(30);
 
 /// Runtime limits for the mempool. All values are configurable by environment.
 #[derive(Debug, Clone)]
@@ -266,6 +270,9 @@ impl Mempool {
         let now = Utc::now();
 
         for mut entry in entries {
+            if submission_in_progress(entry.attempts, entry.created_at, now) {
+                continue;
+            }
             if let Some(tick) = indexed.get(entry.hash.as_str()) {
                 entry.status = MempoolStatus::Confirmed;
                 entry.confirmed_tick = Some(*tick);
@@ -399,6 +406,14 @@ fn retry_event(
     }
 }
 
+fn submission_in_progress(
+    attempts: u8,
+    created_at: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    attempts == 0 && now.signed_duration_since(created_at) < SUBMIT_GRACE
+}
+
 /// `202 Accepted` body for `/v1/transactions`.
 pub fn accepted(entry: MempoolEntry, expiry_ticks: u32) -> Response {
     let hash = entry.hash.clone();
@@ -502,6 +517,18 @@ mod tests {
         assert_eq!(retry_event(true, 3, 2, 10), None);
         assert_eq!(retry_event(false, 0, 9, 10), None);
         assert_eq!(retry_event(false, 0, 10, 10), Some("transaction.failed"));
+    }
+
+    #[test]
+    fn tracker_waits_for_the_initial_broadcast() {
+        let created = Utc::now();
+        assert!(submission_in_progress(0, created, created));
+        assert!(!submission_in_progress(0, created, created + SUBMIT_GRACE));
+        assert!(!submission_in_progress(
+            1,
+            created,
+            created + TimeDelta::seconds(1)
+        ));
     }
 
     #[test]
