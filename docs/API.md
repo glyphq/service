@@ -1391,7 +1391,10 @@ API decodes it and returns a report:
 
 `valid` is `true` only when every check passes. Failed checks carry a `detail`
 string; passing checks omit it. The `target_tick` check compares the signed tick
-with the indexed head. Qubic needs at least two ticks of lead, and the node
+with the peer head when one answers, otherwise the indexed head plus a
+three-tick safety margin. `head_tick` is the value used for the check, and a
+warning explains when the fallback was used. Qubic needs at least two ticks of
+lead, and the node
 pending pool only accepts a limited window of future ticks. A tick at or before
 `head + 1` fails; a tick at `head + 2` or `head + 3` passes with a warning.
 Malformed hex or bytes that do not decode as a transaction return
@@ -1491,7 +1494,8 @@ so a target at or before `head + 1` is rejected with
 `400 invalid_target_tick`. Targets at `head + 2` or `head + 3` are accepted with
 a warning. Targets beyond the node pending pool window are also rejected. The
 accepted response includes `meta.head_tick` and `meta.warnings` so the caller
-can see the basis for the decision.
+can see the basis for the decision. `head_tick` is the peer head when available,
+otherwise the indexed head plus a three-tick safety margin.
 
 ```json
 {

@@ -1143,7 +1143,7 @@ async fn transaction_validation_reports_local_checks() {
 
     let (status, body, headers) = {
         let mut store = MockStore::new();
-        store.ticks[0].tick = transaction.tick - 4;
+        store.ticks[0].tick = transaction.tick - 10;
         let app = router(AppState::new(Arc::new(store)));
         let response = app
             .oneshot(
@@ -1192,8 +1192,11 @@ async fn transaction_validation_reports_local_checks() {
     let checks = body["data"]["checks"].as_array().expect("checks array");
     assert_eq!(checks.len(), 5);
     assert!(checks.iter().all(|check| check["passed"] == true));
-    assert_eq!(body["data"]["head_tick"], transaction.tick - 4);
-    assert_eq!(body["data"]["warnings"], serde_json::json!([]));
+    assert_eq!(body["data"]["head_tick"], transaction.tick - 7);
+    assert_eq!(
+        body["data"]["warnings"].as_array().expect("warnings").len(),
+        1
+    );
     assert_eq!(body["meta"]["source"], "local");
     assert_eq!(body["meta"]["broadcast"], false);
 }

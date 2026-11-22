@@ -28,6 +28,8 @@ use crate::{ApiError, AppState};
 /// can hold a request open instead of paying the full peer retry budget.
 const TX_STATUS_TIMEOUT: Duration = Duration::from_secs(3);
 const TICK_TRANSACTIONS_TIMEOUT: Duration = Duration::from_secs(5);
+const TARGET_TICK_HEAD_TIMEOUT: Duration = Duration::from_millis(750);
+const INDEX_LAG_MARGIN: u32 = 3;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -457,18 +459,36 @@ struct TickAssessment {
 /// ticks inside the node pending window, and tick data for `T + 2` is built
 /// during tick `T`, so a target at or before `head + 1` cannot make it.
 async fn target_tick_assessment(state: &AppState, target_tick: u32) -> TickAssessment {
-    let head_tick = match state.store.head().await {
-        Ok(Some(row)) => Some(row.tick),
+    let (indexed, live) = tokio::join!(
+        state.store.head(),
+        tokio::time::timeout(TARGET_TICK_HEAD_TIMEOUT, state.pool.head())
+    );
+    let indexed = indexed.ok().flatten().map(|row| row.tick);
+    let live = match live {
+        Ok(Ok(head)) => Some(head.tick),
         _ => None,
+    };
+    let mut warnings = Vec::new();
+    let head_tick = match (live, indexed) {
+        (Some(live), _) => Some(live),
+        (None, Some(indexed)) => {
+            let effective = indexed.saturating_add(INDEX_LAG_MARGIN);
+            warnings.push(format!(
+                "live peer head unavailable; using indexed head {indexed} plus a {INDEX_LAG_MARGIN} tick safety margin ({effective}) for target tick validation."
+            ));
+            Some(effective)
+        }
+        (None, None) => None,
     };
     let Some(head) = head_tick else {
         return TickAssessment {
             head_tick: None,
             checks: Vec::new(),
-            warnings: Vec::new(),
+            warnings,
         };
     };
-    let (check, warnings) = target_tick_check(head, target_tick);
+    let (check, tick_warnings) = target_tick_check(head, target_tick);
+    warnings.extend(tick_warnings);
     TickAssessment {
         head_tick: Some(head),
         checks: vec![check],
