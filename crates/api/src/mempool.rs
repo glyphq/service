@@ -335,19 +335,26 @@ impl Mempool {
                 .broadcast_transaction_fanout(&transaction, usize::from(entry.peers.max(1)))
                 .await;
             let sent = attempts.iter().filter(|attempt| attempt.sent).count();
+            let was_broadcast = entry.status == MempoolStatus::Broadcast;
             entry.attempts = entry.attempts.saturating_add(1);
             entry.broadcast_at = Some(now);
             entry.updated_at = now;
+            let event = retry_event(
+                was_broadcast,
+                sent,
+                entry.attempts,
+                self.config.max_attempts,
+            );
             let event = if sent > 0 {
                 entry.status = MempoolStatus::Broadcast;
                 entry.broadcast_peers = u8::try_from(sent).unwrap_or(u8::MAX);
                 entry.error = None;
-                Some("transaction.broadcast")
+                event
             } else if entry.attempts >= self.config.max_attempts {
                 entry.status = MempoolStatus::Failed;
                 entry.broadcast_peers = 0;
                 entry.error = Some(broadcast_error(&attempts));
-                Some("transaction.failed")
+                event
             } else {
                 entry.broadcast_peers = 0;
                 entry.error = Some(broadcast_error(&attempts));
@@ -372,6 +379,23 @@ fn broadcast_error(attempts: &[node::BroadcastAttempt]) -> String {
         "no peer accepted the transaction".to_owned()
     } else {
         errors
+    }
+}
+
+/// Webhook event emitted by a tracked rebroadcast. Successful retries do not
+/// repeat `transaction.broadcast` once the entry is already broadcast.
+fn retry_event(
+    was_broadcast: bool,
+    sent: usize,
+    attempts: u8,
+    max_attempts: u8,
+) -> Option<&'static str> {
+    if sent > 0 {
+        (!was_broadcast).then_some("transaction.broadcast")
+    } else if attempts >= max_attempts {
+        Some("transaction.failed")
+    } else {
+        None
     }
 }
 
@@ -466,6 +490,14 @@ mod tests {
         ];
         assert_eq!(broadcast_error(&attempts), "connection refused");
         assert_eq!(broadcast_error(&[]), "no peer accepted the transaction");
+    }
+
+    #[test]
+    fn successful_retries_do_not_repeat_the_broadcast_event() {
+        assert_eq!(retry_event(false, 3, 1, 10), Some("transaction.broadcast"));
+        assert_eq!(retry_event(true, 3, 2, 10), None);
+        assert_eq!(retry_event(false, 0, 9, 10), None);
+        assert_eq!(retry_event(false, 0, 10, 10), Some("transaction.failed"));
     }
 
     #[test]

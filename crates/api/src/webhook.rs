@@ -814,9 +814,10 @@ async fn deliveries(
     }
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let deliveries = service.deliveries(&id, limit).await?;
+    let count = deliveries.len();
     Ok(Json(json!({
         "data": deliveries,
-        "meta": { "limit": limit }
+        "meta": { "count": count, "limit": limit }
     })))
 }
 
