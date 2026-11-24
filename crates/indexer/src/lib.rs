@@ -218,7 +218,7 @@ struct FetchWork {
 struct FetchResult {
     tick: u32,
     attempt: u32,
-    outcome: std::result::Result<TickBundle, node::Error>,
+    outcome: Result<VerifiedTick>,
 }
 
 struct RetryRequest {
@@ -544,6 +544,7 @@ impl<S: Store + 'static> Indexer<S> {
                 shared_head.clone(),
                 shared_computors.clone(),
                 shared_boundaries.clone(),
+                self.config.verify_signatures,
                 pipeline_cancel.clone(),
             )));
         }
@@ -614,79 +615,7 @@ impl<S: Store + 'static> Indexer<S> {
                         }
                     };
 
-                    let epoch = fetched.tick.epoch;
-                    let mut fetched = fetched;
-                    if let Some(cached) = shared_computors.read().await.get(&epoch).cloned() {
-                        fetched.computors = cached;
-                    } else if fetched.computors.epoch == epoch {
-                        shared_computors
-                            .write()
-                            .await
-                            .insert(epoch, fetched.computors.clone());
-                    } else {
-                        tracing::error!(
-                            tick = consume_next,
-                            epoch,
-                            computors_epoch = fetched.computors.epoch,
-                            "peer returned computors for the wrong epoch"
-                        );
-                        consecutive_failures += 1;
-                        retry_tx
-                            .send(RetryRequest {
-                                tick: consume_next,
-                                attempt: result.attempt + 1,
-                                delay: Duration::from_millis(50),
-                            })
-                            .await
-                            .ok();
-                        continue 'writer;
-                    }
-
-                    let verify_started = Instant::now();
-                    let verified = match verify_bundle(fetched, self.config.verify_signatures) {
-                        Ok(verified) => verified,
-                        Err(error) => {
-                            tracing::error!(
-                            tick = consume_next,
-                                %error,
-                                "verification failed, refusing to index"
-                            );
-                            consecutive_failures += 1;
-                            if consume_next < head_snapshot.initial_tick
-                                && consecutive_failures >= 3
-                            {
-                                tracing::warn!(
-                                    tick = consume_next,
-                                    initial_tick = head_snapshot.initial_tick,
-                                    skipped_from = consume_next,
-                                    skipped_to = head_snapshot.initial_tick,
-                                    "previous epoch tail did not verify, skipping range"
-                                );
-                                next = head_snapshot.initial_tick;
-                                consume_next = next;
-                                next_write.store(next, Ordering::Release);
-                                let dropped = buffer.retain_from(consume_next);
-                                pending.fetch_sub(dropped, Ordering::Release);
-                                consecutive_failures = 0;
-                            } else {
-                                retry_tx
-                                    .send(RetryRequest {
-                                        tick: consume_next,
-                                        attempt: result.attempt + 1,
-                                        delay: Duration::from_millis(50),
-                                    })
-                                    .await
-                                    .ok();
-                            }
-                            continue 'writer;
-                        }
-                    };
-                    tracing::debug!(
-                        tick = consume_next,
-                        verify_signatures = self.config.verify_signatures,
-                        elapsed_ms = verify_started.elapsed().as_secs_f64() * 1_000.0,
-                        "tick verified"
-                    );
+                    let verified = fetched;
 
                     let mut archives = Vec::new();
                     if let (Some(archive), Some(semaphore)) =
@@ -978,15 +907,15 @@ impl<S: Store + 'static> Indexer<S> {
         &self,
         next: u32,
         attempt: u32,
-        error: node::Error,
+        error: Error,
         head: &Head,
         retry: &mpsc::Sender<RetryRequest>,
         backoff: &mut Duration,
         consecutive_failures: &mut u32,
     ) -> bool {
-        if let node::Error::NotSynchronized {
+        if let Error::Node(node::Error::NotSynchronized {
             head: peer_head, ..
-        } = &error
+        }) = &error
         {
             tracing::warn!(
                 tick = next,
@@ -1005,7 +934,7 @@ impl<S: Store + 'static> Indexer<S> {
             return false;
         }
 
-        if let node::Error::Verification(message) = &error {
+        if let Error::Node(node::Error::Verification(message)) = &error {
             if message.starts_with("unknown epoch boundary") {
                 tracing::warn!(tick = next, %message, "skipping a tick with no known epoch");
                 *consecutive_failures = 0;
@@ -1013,9 +942,40 @@ impl<S: Store + 'static> Indexer<S> {
             }
         }
 
+        if let Error::Verification(message) = &error {
+            tracing::error!(
+                tick = next,
+                %message,
+                "verification failed, refusing to index"
+            );
+            *consecutive_failures += 1;
+            if next < head.initial_tick && *consecutive_failures >= 3 {
+                tracing::warn!(
+                    tick = next,
+                    initial_tick = head.initial_tick,
+                    skipped_from = next,
+                    skipped_to = head.initial_tick,
+                    "previous epoch tail did not verify, skipping range"
+                );
+                *consecutive_failures = 0;
+                return true;
+            }
+            retry
+                .send(RetryRequest {
+                    tick: next,
+                    attempt: attempt.saturating_add(1),
+                    delay: Duration::from_millis(50),
+                })
+                .await
+                .ok();
+            return false;
+        }
+
         if matches!(
             &error,
-            node::Error::Io(_) | node::Error::Timeout(_) | node::Error::RetriesExhausted { .. }
+            Error::Node(
+                node::Error::Io(_) | node::Error::Timeout(_) | node::Error::RetriesExhausted { .. }
+            )
         ) {
             // A reset or timeout is a peer problem, not a reason to pause the
             // tick. Retry immediately and let health-aware selection pick a
@@ -1354,7 +1314,25 @@ type VoteGroupKey = [u8; 32];
 
 /// Verifies quorum, transaction inclusion, log digests, and optionally
 /// SchnorrQ signatures.
-pub fn verify_bundle(mut bundle: TickBundle, verify_signatures: bool) -> Result<VerifiedTick> {
+pub fn verify_bundle(bundle: TickBundle, verify_signatures: bool) -> Result<VerifiedTick> {
+    verify_bundle_with(bundle, verify_signatures, true)
+}
+
+/// Verify without spawning per-tick verification threads. The indexer runs
+/// many verifications concurrently on its fetch workers, so an inner thread
+/// pool only adds contention and startup cost.
+pub fn verify_bundle_sequential(
+    bundle: TickBundle,
+    verify_signatures: bool,
+) -> Result<VerifiedTick> {
+    verify_bundle_with(bundle, verify_signatures, false)
+}
+
+fn verify_bundle_with(
+    mut bundle: TickBundle,
+    verify_signatures: bool,
+    parallel_votes: bool,
+) -> Result<VerifiedTick> {
     let tick_data = bundle.tick_data.clone();
     let tick_number = tick_data.tick;
     let epoch = if tick_data.epoch == 0 {
@@ -1413,7 +1391,7 @@ pub fn verify_bundle(mut bundle: TickBundle, verify_signatures: bool) -> Result<
         required_quorum,
         |group, required| {
             if verify_signatures {
-                verify_vote_group(group, &bundle.computors, required).valid
+                verify_vote_group(group, &bundle.computors, required, parallel_votes).valid
             } else {
                 group.len()
             }
@@ -1829,6 +1807,7 @@ async fn fetch_worker(
     head: Arc<AsyncRwLock<Head>>,
     computors: Arc<AsyncRwLock<HashMap<u16, Computors>>>,
     boundaries: Arc<AsyncRwLock<EpochBoundaries>>,
+    verify_signatures: bool,
     cancel: CancellationToken,
 ) {
     loop {
@@ -1872,10 +1851,10 @@ async fn fetch_worker(
                 .send(FetchResult {
                     tick: item.tick,
                     attempt: item.attempt,
-                    outcome: Err(node::Error::Verification(format!(
+                    outcome: Err(Error::Node(node::Error::Verification(format!(
                         "unknown epoch boundary for tick {}",
                         item.tick
-                    ))),
+                    )))),
                 })
                 .await
                 .is_err()
@@ -1885,7 +1864,7 @@ async fn fetch_worker(
             continue;
         };
         let cached = computors.read().await.get(&epoch).cloned();
-        let outcome = if let Some(computors) = cached {
+        let fetched = if let Some(computors) = cached {
             tokio::select! {
                 _ = cancel.cancelled() => return,
                 outcome = peer.as_mut().expect("worker peer").bundle_with(
@@ -1900,13 +1879,19 @@ async fn fetch_worker(
                 item.tick
             )))
         };
+        let verify_started = Instant::now();
+        let outcome = match fetched {
+            Ok(bundle) => verify_bundle_sequential(bundle, verify_signatures),
+            Err(error) => Err(Error::Node(error)),
+        };
         tracing::debug!(
             tick = item.tick,
             epoch,
             attempt = item.attempt,
             ok = outcome.is_ok(),
             elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
-            "tick bundle fetched"
+            verify_ms = verify_started.elapsed().as_secs_f64() * 1_000.0,
+            "tick fetched and verified"
         );
 
         let peer_addr = peer.as_ref().expect("worker peer").addr();
@@ -1914,9 +1899,9 @@ async fn fetch_worker(
             pool.record_healthy(peer_addr);
         } else if matches!(
             &outcome,
-            Err(node::Error::Io(_)
-                | node::Error::Timeout(_)
-                | node::Error::RetriesExhausted { .. })
+            Err(Error::Node(
+                node::Error::Io(_) | node::Error::Timeout(_) | node::Error::RetriesExhausted { .. }
+            ))
         ) {
             pool.record_failure(peer_addr);
             // Drop the broken connection now. The next work item connects to
@@ -2118,10 +2103,15 @@ pub fn verify_vote_group_parallel(
     })
 }
 
-fn verify_vote_group(votes: &[&Tick], computors: &Computors, required: usize) -> VoteVerification {
+fn verify_vote_group(
+    votes: &[&Tick],
+    computors: &Computors,
+    required: usize,
+    parallel: bool,
+) -> VoteVerification {
     // Thread startup is not worth it for the handful of votes in a tiny group.
     const PARALLEL_MIN: usize = 64;
-    if votes.len() >= PARALLEL_MIN {
+    if parallel && votes.len() >= PARALLEL_MIN {
         verify_vote_group_parallel(votes, computors, required)
     } else {
         verify_vote_group_sequential(votes, computors, required)

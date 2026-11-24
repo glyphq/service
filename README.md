@@ -149,8 +149,10 @@ Relevant settings:
 The indexer pipelines tick data, quorum votes, and tick transactions on one
 connection, then fetches logs separately. Fetch workers lease the least-loaded
 healthy peer, fail over immediately on resets or timeouts, and quarantine a
-peer after repeated failures. This keeps live ingestion ahead of the chain
-during normal 4-5 tick/s operation and short bursts.
+peer after repeated failures. Verification runs inside the fetch workers, so
+multiple ticks verify in parallel while the ordered writer only builds and
+persists rows. This keeps live ingestion ahead of the chain during normal 4-5
+tick/s operation and short bursts.
 
 Live Qubic traffic is a few ticks per second, so full verification is comfortable.
 Historical backfill is CPU-bound by signature verification. On one core this
