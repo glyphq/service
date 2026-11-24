@@ -185,6 +185,12 @@ pub struct TickBundle {
     pub warnings: Vec<String>,
 }
 
+struct BundlePackets {
+    tick_data: Option<Packet>,
+    votes: Vec<Packet>,
+    transactions: Vec<Packet>,
+}
+
 /// Status of one confirmed transaction inside a tick.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TransactionStatusEntry {
@@ -524,14 +530,7 @@ impl Peer {
                 MessageType::BroadcastTick,
             )
             .await?;
-        let mut votes = Vec::with_capacity(packets.len());
-        for packet in packets {
-            let vote = Tick::decode(&packet.payload)?;
-            if vote.tick == tick {
-                votes.push(vote);
-            }
-        }
-        Ok(votes)
+        decode_votes(packets, tick)
     }
 
     /// Requests tick transactions. `known` bits mark slots we already have.
@@ -547,16 +546,7 @@ impl Peer {
                 MessageType::BroadcastTransaction,
             )
             .await?;
-        let mut transactions = Vec::with_capacity(packets.len());
-        for packet in packets {
-            let transaction = Transaction::decode(&packet.payload)?;
-            // The node may pad empty slots with zeroed transactions.
-            if transaction.signature == [0u8; 64] || transaction.tick != tick {
-                continue;
-            }
-            transactions.push(transaction);
-        }
-        Ok(transactions)
+        decode_transactions(packets, tick)
     }
 
     /// Requests one spectrum entity record, including its Merkle siblings.
@@ -1321,22 +1311,24 @@ impl Peer {
                 requested: tick,
             });
         }
-        tracing::debug!(tick, "bundle: tick data");
+        tracing::debug!(tick, "bundle: pipelined tick data, votes, transactions");
+        let packets = self.request_bundle_packets(tick).await?;
+        let votes = decode_votes(packets.votes, tick)?;
+        let transactions = decode_transactions(packets.transactions, tick)?;
+
         // `RequestTickData` omits ticks with no transaction payload. Those
         // ticks are still part of the chain: quorum votes carry the timestamp
         // and prove the empty transaction set. Synthesize the data payload so
         // the verifier can accept the 226-vote empty-tick quorum.
-        let (tick_data, preloaded_votes) = match self.tick_data(tick).await {
-            Ok(tick_data) => (tick_data, None),
-            Err(Error::EndResponse(MessageType::RequestTickData)) => {
+        let tick_data = match packets.tick_data {
+            Some(packet) => TickData::decode(&packet.payload)?,
+            None => {
                 tracing::debug!(tick, "tick data absent; checking for an empty tick");
-                let votes = self.votes(tick, &[false; COMPUTOR_COUNT]).await?;
                 let Some(vote) = votes.iter().find(|vote| vote.is_empty_vote()) else {
                     return Err(Error::EndResponse(MessageType::RequestTickData));
                 };
-                (empty_tick_data(vote), Some(votes))
+                empty_tick_data(vote)
             }
-            Err(error) => return Err(error),
         };
         if tick_data.tick != tick {
             return Err(Error::Verification(format!(
@@ -1345,13 +1337,12 @@ impl Peer {
             )));
         }
 
-        tracing::debug!(tick, "bundle: quorum votes");
-        let votes = match preloaded_votes {
-            Some(votes) => votes,
-            None => self.votes(tick, &[false; COMPUTOR_COUNT]).await?,
-        };
-        tracing::debug!(tick, votes = votes.len(), "bundle: transactions");
-        let transactions = self.transactions(tick, &[false; TX_PER_TICK]).await?;
+        tracing::debug!(
+            tick,
+            votes = votes.len(),
+            transactions = transactions.len(),
+            "bundle: streams decoded"
+        );
 
         // Historical or unindexed ticks may not have log data; that is not fatal.
         tracing::debug!(
@@ -1434,6 +1425,130 @@ impl Peer {
             logs,
             warnings,
         })
+    }
+
+    /// Sends tick data, quorum votes, and tick transactions before reading any
+    /// response. A live tick then costs one round trip for all three streams
+    /// instead of one round trip per request.
+    async fn request_bundle_packets(&mut self, tick: u32) -> Result<BundlePackets> {
+        let tick_data = self
+            .send(MessageType::RequestTickData, request_tick_data(tick))
+            .await?;
+        let votes = self
+            .send(
+                MessageType::RequestQuorumTick,
+                request_quorum_tick(tick, &[false; COMPUTOR_COUNT]),
+            )
+            .await?;
+        let transactions = self
+            .send(
+                MessageType::RequestTickTransactions,
+                request_tick_transactions(tick, &[false; TX_PER_TICK]),
+            )
+            .await?;
+        let deadline = tokio::time::Instant::now() + self.config.timeout;
+        let mut out = BundlePackets {
+            tick_data: None,
+            votes: Vec::with_capacity(COMPUTOR_COUNT),
+            transactions: Vec::with_capacity(TX_PER_TICK),
+        };
+        let mut tick_data_done = false;
+        let mut votes_done = false;
+        let mut transactions_done = false;
+
+        while !(tick_data_done && votes_done && transactions_done) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                self.desynced = true;
+                return Err(Error::Timeout(self.config.timeout));
+            }
+            let packet = self.read_packet_timeout(remaining).await?;
+            if packet.kind == MessageType::ExchangePublicPeers {
+                self.record_peers(&packet);
+                continue;
+            }
+            if packet.dejavu == tick_data {
+                self.pending.remove(&tick_data);
+                tick_data_done = true;
+                match packet.kind {
+                    MessageType::BroadcastFutureTickData => out.tick_data = Some(packet),
+                    MessageType::EndResponse => {}
+                    MessageType::TryAgain => {
+                        self.desynced = true;
+                        return Err(Error::TryAgain(MessageType::RequestTickData));
+                    }
+                    actual => {
+                        self.desynced = true;
+                        return Err(Error::UnexpectedPacket {
+                            expected: MessageType::BroadcastFutureTickData,
+                            actual,
+                        });
+                    }
+                }
+            } else if packet.dejavu == votes {
+                match packet.kind {
+                    MessageType::BroadcastTick => {
+                        if out.votes.len() >= COMPUTOR_COUNT {
+                            self.pending.remove(&votes);
+                            self.desynced = true;
+                            return Err(Error::InvalidRequest(
+                                "peer sent too many quorum votes".into(),
+                            ));
+                        }
+                        out.votes.push(packet);
+                    }
+                    MessageType::EndResponse => {
+                        self.pending.remove(&votes);
+                        votes_done = true;
+                    }
+                    MessageType::TryAgain => {
+                        self.pending.remove(&votes);
+                        self.desynced = true;
+                        return Err(Error::TryAgain(MessageType::RequestQuorumTick));
+                    }
+                    actual => {
+                        self.pending.remove(&votes);
+                        self.desynced = true;
+                        return Err(Error::UnexpectedPacket {
+                            expected: MessageType::BroadcastTick,
+                            actual,
+                        });
+                    }
+                }
+            } else if packet.dejavu == transactions {
+                match packet.kind {
+                    MessageType::BroadcastTransaction => {
+                        if out.transactions.len() >= TX_PER_TICK {
+                            self.pending.remove(&transactions);
+                            self.desynced = true;
+                            return Err(Error::InvalidRequest(
+                                "peer sent too many transactions".into(),
+                            ));
+                        }
+                        out.transactions.push(packet);
+                    }
+                    MessageType::EndResponse => {
+                        self.pending.remove(&transactions);
+                        transactions_done = true;
+                    }
+                    MessageType::TryAgain => {
+                        self.pending.remove(&transactions);
+                        self.desynced = true;
+                        return Err(Error::TryAgain(MessageType::RequestTickTransactions));
+                    }
+                    actual => {
+                        self.pending.remove(&transactions);
+                        self.desynced = true;
+                        return Err(Error::UnexpectedPacket {
+                            expected: MessageType::BroadcastTransaction,
+                            actual,
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     /// Fetches log ranges, falling back to the per-transaction request when the
@@ -1821,6 +1936,7 @@ impl Peer {
 pub struct NodePool {
     peers: Vec<PeerConfig>,
     manager: PeerManager,
+    load: std::sync::Arc<std::sync::Mutex<HashMap<SocketAddr, usize>>>,
 }
 
 impl NodePool {
@@ -1834,6 +1950,7 @@ impl NodePool {
         Self {
             peers,
             manager: PeerManager::new(policy),
+            load: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -1843,6 +1960,90 @@ impl NodePool {
 
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
+    }
+
+    /// Replace the peer list while keeping the shared health state.
+    pub fn set_peers(&mut self, peers: Vec<PeerConfig>) {
+        self.peers = peers;
+    }
+
+    /// Record a request success against a peer already returned by this pool.
+    pub fn record_success(&self, addr: SocketAddr, latency: Duration) {
+        self.manager.record_success(addr, latency);
+    }
+
+    /// Clear failures after a successful request without touching latency.
+    pub fn record_healthy(&self, addr: SocketAddr) {
+        self.manager.record_healthy(addr);
+    }
+
+    /// Record a request failure so repeated resets quarantine the peer.
+    pub fn record_failure(&self, addr: SocketAddr) {
+        self.manager.record_failure(addr);
+    }
+
+    /// Connect to the least-loaded healthy peer and hold a connection lease.
+    ///
+    /// `connect_best` is right for one-shot API reads. A pool of long-lived
+    /// indexer workers needs `connect_balanced`, otherwise every worker picks
+    /// the same low-latency peer and resets its connection under the herd.
+    pub async fn connect_balanced(&self) -> Result<PooledPeer> {
+        let mut candidates = self.manager.attempt_order(&self.peers);
+        if candidates.is_empty() {
+            // Health quarantines must not turn a brief all-peer outage into a
+            // long stall. Fall back to every configured peer; a successful
+            // connect clears its quarantine.
+            candidates = self.peers.clone();
+        }
+        let mut last_error = None;
+        while !candidates.is_empty() {
+            let (config, index) = self
+                .reserve_least_loaded(&candidates)
+                .expect("non-empty candidate list");
+            let addr = config.addr;
+            let started = std::time::Instant::now();
+            match Peer::connect(config).await {
+                Ok(peer) => {
+                    self.manager.record_success(addr, started.elapsed());
+                    return Ok(PooledPeer {
+                        peer,
+                        addr,
+                        load: self.load.clone(),
+                    });
+                }
+                Err(error) => {
+                    self.add_load(addr, -1);
+                    self.manager.record_failure(addr);
+                    candidates.remove(index);
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.unwrap_or(Error::NoPeers))
+    }
+
+    /// Reserve the least-loaded candidate while holding the load lock, so
+    /// simultaneous workers cannot all pick the same peer.
+    fn reserve_least_loaded(&self, candidates: &[PeerConfig]) -> Option<(PeerConfig, usize)> {
+        let mut loads = self.load.lock().ok()?;
+        let (index, _) = candidates
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, config)| loads.get(&config.addr).copied().unwrap_or(0))?;
+        let config = candidates[index].clone();
+        *loads.entry(config.addr).or_insert(0) += 1;
+        Some((config, index))
+    }
+
+    fn add_load(&self, addr: SocketAddr, delta: isize) {
+        if let Ok(mut loads) = self.load.lock() {
+            let entry = loads.entry(addr).or_insert(0);
+            *entry = if delta < 0 {
+                entry.saturating_sub(delta.unsigned_abs())
+            } else {
+                entry.saturating_add(delta as usize)
+            };
+        }
     }
 
     /// Per-peer operator view: score, counters, latency, and quarantine.
@@ -2180,6 +2381,44 @@ impl NodePool {
     }
 }
 
+/// A peer connection that releases its slot in the pool's per-peer load
+/// counter when dropped.
+pub struct PooledPeer {
+    peer: Peer,
+    addr: SocketAddr,
+    load: std::sync::Arc<std::sync::Mutex<HashMap<SocketAddr, usize>>>,
+}
+
+impl PooledPeer {
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+}
+
+impl std::ops::Deref for PooledPeer {
+    type Target = Peer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.peer
+    }
+}
+
+impl std::ops::DerefMut for PooledPeer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.peer
+    }
+}
+
+impl Drop for PooledPeer {
+    fn drop(&mut self) {
+        if let Ok(mut loads) = self.load.lock() {
+            if let Some(entry) = loads.get_mut(&self.addr) {
+                *entry = entry.saturating_sub(1);
+            }
+        }
+    }
+}
+
 fn random_dejavu() -> u32 {
     let mut value = rand::random::<u32>();
     if value == 0 {
@@ -2235,6 +2474,30 @@ fn decode_computors(payload: &[u8]) -> Result<Computors> {
     Ok(Computors::decode(
         &payload[..qubic::messages::COMPUTORS_SIZE],
     )?)
+}
+
+fn decode_votes(packets: Vec<Packet>, tick: u32) -> Result<Vec<Tick>> {
+    let mut votes = Vec::with_capacity(packets.len());
+    for packet in packets {
+        let vote = Tick::decode(&packet.payload)?;
+        if vote.tick == tick {
+            votes.push(vote);
+        }
+    }
+    Ok(votes)
+}
+
+fn decode_transactions(packets: Vec<Packet>, tick: u32) -> Result<Vec<Transaction>> {
+    let mut transactions = Vec::with_capacity(packets.len());
+    for packet in packets {
+        let transaction = Transaction::decode(&packet.payload)?;
+        // The node may pad empty slots with zeroed transactions.
+        if transaction.signature == [0u8; 64] || transaction.tick != tick {
+            continue;
+        }
+        transactions.push(transaction);
+    }
+    Ok(transactions)
 }
 
 /// Log ranges with every slot marked unavailable.

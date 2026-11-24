@@ -139,12 +139,18 @@ Relevant settings:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `INDEXER_FETCH_CONCURRENCY` | `32` | Concurrent peer connections used for fetching |
-| `INDEXER_FETCH_WINDOW` | `512` | Maximum ticks in flight or buffered |
+| `INDEXER_FETCH_CONCURRENCY` | `32` | Fetch workers, balanced across healthy peers |
+| `INDEXER_FETCH_WINDOW` | `512` | Maximum tick bundles in flight or buffered |
 | `INDEXER_WRITE_BATCH` | `128` | Maximum ticks per ClickHouse insert batch |
 | `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before a partial batch is flushed |
 | `INDEXER_POLL_MS` | `750` | Head poll interval when caught up |
 | `GLYPH_VERIFY_SIGNATURES` | `true` | Verify SchnorrQ signatures in addition to quorum digests |
+
+The indexer pipelines tick data, quorum votes, and tick transactions on one
+connection, then fetches logs separately. Fetch workers lease the least-loaded
+healthy peer, fail over immediately on resets or timeouts, and quarantine a
+peer after repeated failures. This keeps live ingestion ahead of the chain
+during normal 4-5 tick/s operation and short bursts.
 
 Live Qubic traffic is a few ticks per second, so full verification is comfortable.
 Historical backfill is CPU-bound by signature verification. On one core this

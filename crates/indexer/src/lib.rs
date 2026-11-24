@@ -384,9 +384,17 @@ pub struct Indexer<S: Store + 'static> {
 }
 
 impl<S: Store + 'static> Indexer<S> {
-    pub fn new(store: Arc<S>, config: IndexerConfig) -> Result<Self> {
+    pub fn new(store: Arc<S>, mut config: IndexerConfig) -> Result<Self> {
         if config.peers.is_empty() {
             return Err(Error::Config("at least one peer is required".into()));
+        }
+        // Live ingestion must fail over fast. The API can afford the longer
+        // defaults for one-off reads; the indexer cannot let a dead peer hold
+        // a worker for 8 seconds while the chain advances.
+        for peer in &mut config.peers {
+            peer.connect_timeout = peer.connect_timeout.min(Duration::from_millis(1_500));
+            peer.timeout = peer.timeout.min(Duration::from_secs(4));
+            peer.retries = 0;
         }
         let pool = NodePool::new(config.peers.clone());
         Ok(Self {
@@ -496,6 +504,7 @@ impl<S: Store + 'static> Indexer<S> {
                 total = peer_configs.len(),
                 "peer discovery complete"
             );
+            self.pool.set_peers(peer_configs.clone());
         }
 
         let head_poll = Duration::from_millis(100).min(self.config.poll_interval);
@@ -526,11 +535,10 @@ impl<S: Store + 'static> Indexer<S> {
         ));
 
         let mut workers = Vec::with_capacity(tuning.fetch_concurrency);
-        for index in 0..tuning.fetch_concurrency {
+        for _ in 0..tuning.fetch_concurrency {
             workers.push(tokio::spawn(fetch_worker(
                 None,
-                index,
-                peer_configs.to_vec(),
+                self.pool.clone(),
                 work_rx.clone(),
                 result_tx.clone(),
                 shared_head.clone(),
@@ -627,7 +635,7 @@ impl<S: Store + 'static> Indexer<S> {
                             .send(RetryRequest {
                                 tick: consume_next,
                                 attempt: result.attempt + 1,
-                                delay: Duration::from_secs(2),
+                                delay: Duration::from_millis(50),
                             })
                             .await
                             .ok();
@@ -665,7 +673,7 @@ impl<S: Store + 'static> Indexer<S> {
                                     .send(RetryRequest {
                                         tick: consume_next,
                                         attempt: result.attempt + 1,
-                                        delay: Duration::from_secs(2),
+                                        delay: Duration::from_millis(50),
                                     })
                                     .await
                                     .ok();
@@ -1005,6 +1013,25 @@ impl<S: Store + 'static> Indexer<S> {
             }
         }
 
+        if matches!(
+            &error,
+            node::Error::Io(_) | node::Error::Timeout(_) | node::Error::RetriesExhausted { .. }
+        ) {
+            // A reset or timeout is a peer problem, not a reason to pause the
+            // tick. Retry immediately and let health-aware selection pick a
+            // different peer.
+            *consecutive_failures += 1;
+            retry
+                .send(RetryRequest {
+                    tick: next,
+                    attempt: attempt.saturating_add(1),
+                    delay: Duration::ZERO,
+                })
+                .await
+                .ok();
+            return false;
+        }
+
         tracing::warn!(tick = next, %error, "tick fetch failed, retrying");
         *consecutive_failures += 1;
         retry
@@ -1015,7 +1042,7 @@ impl<S: Store + 'static> Indexer<S> {
             })
             .await
             .ok();
-        *backoff = (*backoff * 2).min(Duration::from_secs(5));
+        *backoff = (*backoff * 2).min(Duration::from_secs(1));
         if next < head.initial_tick && *consecutive_failures >= 5 {
             tracing::warn!(
                 tick = next,
@@ -1150,7 +1177,7 @@ impl<S: Store + 'static> Indexer<S> {
         verified: &VerifiedTick,
     ) -> Result<Vec<IdentityRow>> {
         let tick = verified.tick.tick;
-        let mut touched = BTreeMap::<[u8; 32], IdentityRow>::new();
+        let mut ops = Vec::<([u8; 32], IdentityChange)>::new();
         for event in &verified.logs {
             match event.body() {
                 EventBody::QuTransfer { from, to, amount } => {
@@ -1158,16 +1185,12 @@ impl<S: Store + 'static> Indexer<S> {
                         if key == [0u8; 32] {
                             continue;
                         }
-                        let row = self.load_identity(key).await?;
-                        let row = touched.entry(key).or_insert(row);
-                        apply_transfer(row, incoming, amount, tick);
+                        ops.push((key, IdentityChange::Transfer { incoming, amount }));
                     }
                 }
                 EventBody::Burning { from, amount, .. } => {
                     if from != [0u8; 32] {
-                        let row = self.load_identity(from).await?;
-                        let row = touched.entry(from).or_insert(row);
-                        apply_burn(row, amount, tick);
+                        ops.push((from, IdentityChange::Burn { amount }));
                     }
                 }
                 EventBody::DustBurning { burns } => {
@@ -1175,13 +1198,49 @@ impl<S: Store + 'static> Indexer<S> {
                         if key == [0u8; 32] {
                             continue;
                         }
-                        let row = self.load_identity(key).await?;
-                        let row = touched.entry(key).or_insert(row);
-                        apply_burn(row, amount, tick);
+                        ops.push((key, IdentityChange::Burn { amount }));
                     }
                 }
                 _ => {}
             }
+        }
+
+        // Load every first-seen identity for this tick in one query. Doing one
+        // identity lookup per transfer turns a busy tick into dozens of serial
+        // ClickHouse round trips.
+        let mut missing = BTreeMap::<[u8; 32], String>::new();
+        for (key, _) in &ops {
+            if !self.identities.contains_key(key) {
+                missing
+                    .entry(*key)
+                    .or_insert_with(|| PublicKey(*key).to_identity());
+            }
+        }
+        if !missing.is_empty() {
+            let identities = missing.values().cloned().collect::<Vec<_>>();
+            let loaded = self.store.identities_by_id(&identities).await?;
+            for (key, identity) in missing {
+                if let Some(row) = loaded.get(&identity) {
+                    self.identities.insert(key, row.clone());
+                }
+            }
+        }
+
+        let mut touched = BTreeMap::<[u8; 32], IdentityRow>::new();
+        for (key, change) in ops {
+            let row = touched
+                .get(&key)
+                .cloned()
+                .or_else(|| self.identities.get(&key).cloned())
+                .unwrap_or_else(|| empty_identity(key));
+            let mut row = row;
+            match change {
+                IdentityChange::Transfer { incoming, amount } => {
+                    apply_transfer(&mut row, incoming, amount, tick)
+                }
+                IdentityChange::Burn { amount } => apply_burn(&mut row, amount, tick),
+            }
+            touched.insert(key, row);
         }
 
         let mut rows = Vec::with_capacity(touched.len());
@@ -1191,27 +1250,24 @@ impl<S: Store + 'static> Indexer<S> {
         }
         Ok(rows)
     }
+}
 
-    async fn load_identity(&mut self, key: [u8; 32]) -> Result<IdentityRow> {
-        if let Some(row) = self.identities.get(&key) {
-            return Ok(row.clone());
-        }
-        let identity = PublicKey(key).to_identity();
-        let row = match self.store.identity(&identity).await? {
-            Some(row) => row,
-            None => IdentityRow {
-                identity: identity.clone(),
-                public_key: PublicKey(key).to_hex(),
-                balance: 0,
-                incoming_amount: 0,
-                outgoing_amount: 0,
-                transfer_count: 0,
-                first_seen_tick: 0,
-                last_seen_tick: 0,
-            },
-        };
-        self.identities.insert(key, row.clone());
-        Ok(row)
+#[derive(Debug, Clone, Copy)]
+enum IdentityChange {
+    Transfer { incoming: bool, amount: i64 },
+    Burn { amount: i64 },
+}
+
+fn empty_identity(key: [u8; 32]) -> IdentityRow {
+    IdentityRow {
+        identity: PublicKey(key).to_identity(),
+        public_key: PublicKey(key).to_hex(),
+        balance: 0,
+        incoming_amount: 0,
+        outgoing_amount: 0,
+        transfer_count: 0,
+        first_seen_tick: 0,
+        last_seen_tick: 0,
     }
 }
 
@@ -1766,9 +1822,8 @@ async fn dispatch_loop(
 
 #[allow(clippy::too_many_arguments)]
 async fn fetch_worker(
-    mut peer: Option<Peer>,
-    mut preferred: usize,
-    configs: Vec<PeerConfig>,
+    mut peer: Option<node::PooledPeer>,
+    pool: NodePool,
     work: Arc<AsyncMutex<mpsc::Receiver<FetchWork>>>,
     results: mpsc::Sender<FetchResult>,
     head: Arc<AsyncRwLock<Head>>,
@@ -1791,15 +1846,13 @@ async fn fetch_worker(
         if peer.is_none() {
             let connection = tokio::select! {
                 _ = cancel.cancelled() => return,
-                connection = connect_from(&configs, preferred) => connection,
+                connection = pool.connect_balanced() => connection,
             };
             match connection {
-                Some((connected, index)) => {
-                    peer = Some(connected);
-                    preferred = index;
-                }
-                None => {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                Ok(connected) => peer = Some(connected),
+                Err(error) => {
+                    tracing::debug!(%error, "no peer available for fetch worker");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
             }
@@ -1856,20 +1909,20 @@ async fn fetch_worker(
             "tick bundle fetched"
         );
 
-        if matches!(
+        let peer_addr = peer.as_ref().expect("worker peer").addr();
+        if outcome.is_ok() {
+            pool.record_healthy(peer_addr);
+        } else if matches!(
             &outcome,
             Err(node::Error::Io(_)
                 | node::Error::Timeout(_)
                 | node::Error::RetriesExhausted { .. })
         ) {
-            let replacement = tokio::select! {
-                _ = cancel.cancelled() => return,
-                replacement = connect_from(&configs, preferred + 1) => replacement,
-            };
-            if let Some((connected, index)) = replacement {
-                peer = Some(connected);
-                preferred = index;
-            }
+            pool.record_failure(peer_addr);
+            // Drop the broken connection now. The next work item connects to
+            // the best healthy peer instead of paying a handshake before the
+            // writer can retry.
+            peer = None;
         }
         if results
             .send(FetchResult {

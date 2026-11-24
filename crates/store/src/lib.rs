@@ -597,6 +597,20 @@ pub trait Store: Send + Sync {
         Err(Error::Config("activity storage unsupported".into()))
     }
     async fn identity(&self, identity: &str) -> Result<Option<IdentityRow>>;
+    /// Load several identities in one round trip. The default keeps mocks and
+    /// alternate stores working; ClickHouse overrides it with a batched query.
+    async fn identities_by_id(
+        &self,
+        identities: &[String],
+    ) -> Result<HashMap<String, IdentityRow>> {
+        let mut rows = HashMap::with_capacity(identities.len());
+        for identity in identities {
+            if let Some(row) = self.identity(identity).await? {
+                rows.insert(identity.clone(), row);
+            }
+        }
+        Ok(rows)
+    }
     /// Identities with the highest transfer counts, then highest balance,
     /// then canonical identity.
     async fn top_identities(&self, limit: u32) -> Result<Vec<IdentityRow>> {
@@ -1589,6 +1603,33 @@ LIMIT ? OFFSET ?
             .fetch_optional::<rows::IdentitySelect>()
             .await?;
         Ok(row.map(Into::into))
+    }
+
+    async fn identities_by_id(
+        &self,
+        identities: &[String],
+    ) -> Result<HashMap<String, IdentityRow>> {
+        if identities.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM (\
+                     SELECT * FROM identities WHERE identity IN (?) \
+                     ORDER BY version DESC LIMIT 1 BY identity\
+                 )",
+            )
+            .bind(identities)
+            .fetch_all::<rows::IdentitySelect>()
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let row: IdentityRow = row.into();
+                (row.identity.clone(), row)
+            })
+            .collect())
     }
 
     async fn top_identities(&self, limit: u32) -> Result<Vec<IdentityRow>> {

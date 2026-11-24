@@ -154,6 +154,18 @@ impl PeerManager {
         }
     }
 
+    /// Records a successful request without changing the handshake-latency
+    /// EWMA. Long tick fetches must not make a healthy peer look slow.
+    pub fn record_healthy(&self, addr: SocketAddr) {
+        let now = tokio::time::Instant::now();
+        let mut state = self.state.lock().expect("peer health mutex poisoned");
+        let entry = state.entry(addr).or_default();
+        entry.successes = entry.successes.saturating_add(1);
+        entry.consecutive_failures = 0;
+        entry.last_attempt = Some(now);
+        entry.quarantined_until = None;
+    }
+
     /// Whether `addr` is currently skipped. Expired quarantines are cleared.
     pub fn is_quarantined(&self, addr: SocketAddr) -> bool {
         let now = tokio::time::Instant::now();
