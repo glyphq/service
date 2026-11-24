@@ -886,6 +886,10 @@ async fn cursors_page_without_duplicates_and_reject_other_filters() {
     let (status, body) = get("/v1/ticks?cursor=not-a-cursor").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "invalid_cursor");
+
+    let (status, body) = get("/v1/ticks?offset=10001").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "invalid_cursor");
 }
 
 #[tokio::test]
@@ -937,6 +941,49 @@ async fn middleware_sets_request_id_cache_and_cors_headers() {
         "public, max-age=31536000, immutable"
     );
     assert!(headers.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+}
+
+#[tokio::test]
+async fn metrics_expose_route_latency_and_cache_counts() {
+    let app = router(AppState::new(Arc::new(MockStore::new())));
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/ticks/7")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&bytes);
+    assert!(body.contains(
+        "glyph_http_requests_total{route=\"/v1/ticks/{tick}\",method=\"GET\",status=\"200\"} 1"
+    ));
+    assert!(body.contains(
+        "glyph_http_request_duration_seconds_bucket{route=\"/v1/ticks/{tick}\",method=\"GET\",le=\"+Inf\"} 1"
+    ));
+    assert!(body.contains("glyph_cache_requests_total{result=\"hit\"}"));
+    assert!(body.contains("glyph_cache_requests_total{result=\"miss\"}"));
 }
 
 #[tokio::test]

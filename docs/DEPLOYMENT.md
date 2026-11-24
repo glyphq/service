@@ -96,6 +96,9 @@ and the stack is reachable only from the same machine.
 | `CLICKHOUSE_DB` | `glyph` | ClickHouse database name. |
 | `CLICKHOUSE_URL` | `http://clickhouse:8123` | ClickHouse HTTP endpoint used by the API and indexer. |
 | `CLICKHOUSE_HTTP_PORT` | `8123` | Host loopback port for the ClickHouse HTTP endpoint. |
+| `CLICKHOUSE_MAX_EXECUTION_TIME` | `10` | Per-query ClickHouse time limit in seconds. |
+| `CLICKHOUSE_MAX_MEMORY_USAGE` | `2000000000` | Per-query ClickHouse memory limit in bytes. |
+| `CLICKHOUSE_MAX_THREADS` | `4` | Per-query ClickHouse thread limit. Lower this on hosts shared with ingestion. |
 | `BIND` | `0.0.0.0:8080` | Listen address for `glyph-api` inside the container. Keep the port at `8080` unless you also change the `api` port mapping. |
 | `API_HOST` | `127.0.0.1` | Host interface for the published API port. Set `0.0.0.0` to expose it. |
 | `API_PORT` | `8080` | Host port for the API. |

@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::Router;
-use axum::extract::{Request, State as AxumState};
+use axum::extract::{MatchedPath, Request, State as AxumState};
 use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -24,6 +24,7 @@ pub mod identity;
 pub mod lifecycle;
 pub mod market;
 pub mod mempool;
+pub mod metrics;
 pub mod network;
 pub mod openapi;
 pub mod peer;
@@ -67,6 +68,8 @@ pub struct AppState {
     /// Cached index-wide counts. `network_stats` runs several `FINAL` counts,
     /// so multiple dashboard reads within a few seconds should share one query.
     pub stats_cache: Arc<tokio::sync::Mutex<Option<(Instant, store::NetworkStats)>>>,
+    /// Per-process request and cache counters exposed at `/metrics`.
+    pub metrics: Arc<metrics::Metrics>,
 }
 
 impl AppState {
@@ -88,6 +91,7 @@ impl AppState {
             webhooks: None,
             live_cache: Arc::new(peer::LiveCache::default()),
             stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            metrics: Arc::new(metrics::Metrics::default()),
         }
     }
 
@@ -174,6 +178,7 @@ fn rate(previous: Option<u32>, current: Option<u32>, elapsed: f64) -> Option<f64
 
 pub fn router(state: AppState) -> Router {
     let request_id = axum::http::HeaderName::from_static("x-request-id");
+    let request_metrics = state.metrics.clone();
     let mut app = Router::new()
         .merge(routes::router())
         .merge(identity::router())
@@ -204,6 +209,7 @@ pub fn router(state: AppState) -> Router {
             "/fonts/space-grotesk-ofl.txt",
             axum::routing::get(routes::space_grotesk_license),
         )
+        .route("/metrics", axum::routing::get(metrics_handler))
         .fallback(routes::not_found)
         .with_state(state);
     if let Some(limiter) = RateLimiter::from_env() {
@@ -214,6 +220,10 @@ pub fn router(state: AppState) -> Router {
     }
     app.layer(CompressionLayer::new())
         .layer(cors_layer())
+        .layer(axum::middleware::from_fn_with_state(
+            request_metrics,
+            track_metrics,
+        ))
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
         .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
         .layer(
@@ -225,6 +235,43 @@ pub fn router(state: AppState) -> Router {
                         .latency_unit(LatencyUnit::Millis),
                 ),
         )
+}
+
+async fn metrics_handler(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
+    let (hits, misses) = state.live_cache.stats();
+    (
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        state.metrics.render(hits, misses),
+    )
+}
+
+async fn track_metrics(
+    AxumState(metrics): AxumState<Arc<metrics::Metrics>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
+    let method = request.method().as_str().to_owned();
+    let started = Instant::now();
+    metrics.request_started();
+    let response = next.run(request).await;
+    metrics.request_finished(
+        &route,
+        &method,
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+    response
 }
 
 /// Permissive by default. Set `CORS_ALLOWED_ORIGINS` to a comma-separated
@@ -452,6 +499,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         webhooks,
         live_cache: Arc::new(peer::LiveCache::default()),
         stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        metrics: Arc::new(metrics::Metrics::default()),
     });
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "glyph api listening");

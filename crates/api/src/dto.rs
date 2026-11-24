@@ -10,6 +10,10 @@ use crate::ApiError;
 pub const DEFAULT_LIMIT: u32 = 50;
 pub const MAX_LIMIT: u32 = 200;
 const CURSOR_VERSION: u8 = 1;
+/// Legacy offsets still work for shallow pages. Deeper navigation must use the
+/// cursor so a single request cannot ask ClickHouse to skip an unbounded
+/// number of rows.
+const MAX_LEGACY_OFFSET: u64 = 10_000;
 
 /// Serializes a transaction with both the indexed tick and the explicit target
 /// tick. Qubic executes a transaction in the tick named by its header, so the
@@ -58,7 +62,15 @@ impl PageParams {
         let limit = self.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = match &self.cursor {
             Some(token) => decode_cursor(token, fingerprint)?,
-            None => self.offset.unwrap_or(0),
+            None => {
+                let offset = self.offset.unwrap_or(0);
+                if offset > MAX_LEGACY_OFFSET {
+                    return Err(ApiError::invalid_cursor(format!(
+                        "offset is limited to {MAX_LEGACY_OFFSET}; use the cursor returned in meta.next_cursor"
+                    )));
+                }
+                offset
+            }
         };
         Ok(Page {
             limit,

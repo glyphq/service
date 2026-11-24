@@ -837,6 +837,18 @@ impl ClickHouseStore {
         if let Some(password) = password.clone() {
             client = client.with_password(password);
         }
+        // Bound every query made through the shared client. The API and
+        // indexer use one store, so a single pathological read must not hold a
+        // worker thread or allocate without limit on a four-core host.
+        for (name, default) in [
+            ("max_execution_time", "10"),
+            ("max_memory_usage", "2000000000"),
+            ("max_threads", "4"),
+        ] {
+            let env_name = format!("CLICKHOUSE_{}", name.to_ascii_uppercase());
+            let value = std::env::var(env_name).unwrap_or_else(|_| default.to_owned());
+            client = client.with_option(name, value);
+        }
         // DDL that creates the database cannot be scoped to a database that
         // does not exist yet.
         let mut bootstrap = clickhouse::Client::default()

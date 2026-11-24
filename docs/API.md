@@ -119,7 +119,7 @@ Every collection uses opaque cursor pagination.
 | --- | --- | --- |
 | `limit` | `50` | `1..200` |
 | `cursor` | none | Opaque token from `meta.next_cursor`. |
-| `offset` | `0` | Legacy, deprecated. Ignored when `cursor` is present. |
+| `offset` | `0` | Legacy, deprecated. Ignored when `cursor` is present. Values above `10000` are rejected with `400 invalid_cursor`; continue with `next_cursor`. |
 
 The response `meta` contains:
 
@@ -150,6 +150,14 @@ Liveness only. Does not touch ClickHouse.
 ```json
 { "ok": true }
 ```
+
+### `GET /metrics`
+
+Prometheus text exposition. It reports request counts and latency histograms by
+matched route, method, and status, the current in-flight request count, and
+lifetime hit/miss counts for the in-process live cache. The endpoint is
+`no-store` and is not part of the versioned `/v1` contract. ClickHouse query
+timings remain in `system.query_log`.
 
 ### `GET /status`
 
@@ -542,7 +550,7 @@ Transactions in slot order.
 | Query | Default | Bounds |
 | --- | --- | --- |
 | `limit` | `50` | `1..200` |
-| `offset` | `0` | `>= 0` |
+| `offset` | `0` | `0..10000` |
 
 ```json
 {
@@ -584,7 +592,7 @@ Events in log id order.
 | Query | Default | Bounds |
 | --- | --- | --- |
 | `limit` | `50` | `1..200` |
-| `offset` | `0` | `>= 0` |
+| `offset` | `0` | `0..10000` |
 
 ```json
 {

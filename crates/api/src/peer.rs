@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use node::Peer;
@@ -52,6 +53,8 @@ const LIVE_CACHE_MAX_ENTRIES: usize = 1_024;
 pub struct LiveCache {
     entries: Mutex<HashMap<String, Entry>>,
     max_entries: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
 }
 
 impl Default for LiveCache {
@@ -59,6 +62,8 @@ impl Default for LiveCache {
         Self {
             entries: Mutex::new(HashMap::new()),
             max_entries: LIVE_CACHE_MAX_ENTRIES,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
         }
     }
 }
@@ -72,8 +77,16 @@ struct Entry {
 impl LiveCache {
     pub fn get(&self, key: &str, ttl: Duration) -> Option<Value> {
         let entries = self.entries.lock().expect("live cache lock");
-        let entry = entries.get(key)?;
-        (entry.stored_at.elapsed() < ttl).then(|| entry.value.clone())
+        match entries.get(key) {
+            Some(entry) if entry.stored_at.elapsed() < ttl => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(entry.value.clone())
+            }
+            _ => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     pub fn put(&self, key: impl Into<String>, value: Value) {
@@ -95,5 +108,13 @@ impl LiveCache {
                 value,
             },
         );
+    }
+
+    /// Lifetime cache lookups, split into hits and misses.
+    pub fn stats(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
     }
 }
