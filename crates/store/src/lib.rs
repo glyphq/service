@@ -843,7 +843,7 @@ impl ClickHouseStore {
         for (name, default) in [
             ("max_execution_time", "10"),
             ("max_memory_usage", "2000000000"),
-            ("max_threads", "4"),
+            ("max_threads", "2"),
         ] {
             let env_name = format!("CLICKHOUSE_{}", name.to_ascii_uppercase());
             let value = std::env::var(env_name).unwrap_or_else(|_| default.to_owned());
