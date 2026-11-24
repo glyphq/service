@@ -659,6 +659,20 @@ async fn rejecting_mismatched_rows_writes_nothing() {
 }
 
 #[tokio::test]
+async fn last_tick_for_epoch_returns_the_partition_maximum() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    store
+        .write_ticks(&[batch(1, 100), batch(1, 102), batch(2, 200)])
+        .await
+        .expect("write ticks");
+    assert_eq!(store.last_tick_for_epoch(1).await.unwrap(), Some(102));
+    assert_eq!(store.last_tick_for_epoch(2).await.unwrap(), Some(200));
+    assert_eq!(store.last_tick_for_epoch(3).await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn advanced_reads_are_ordered_deduped_and_bucketed() {
     let Some(store) = test_store().await else {
         return;
