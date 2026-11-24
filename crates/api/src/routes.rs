@@ -690,17 +690,24 @@ async fn transactions(
         params.epoch, params.tick, identity
     );
     let page = params.page().resolve(&fingerprint)?;
-    let mut rows = fetch_transactions_page(&state, &filter, &page).await?;
-    let has_more = rows.len() > page.limit as usize;
-    rows.truncate(page.limit as usize);
-    let rows: Vec<Value> = rows.iter().map(transaction_value).collect();
-    Ok((
-        [(header::CACHE_CONTROL, RECENT)],
-        Json(json!({
-            "data": rows,
-            "meta": page.meta(rows.len(), has_more),
-        })),
-    ))
+    let body = state
+        .live_cache
+        .get_or_insert(
+            format!("{fingerprint}:{}:{}", page.limit, page.offset),
+            Duration::from_secs(2),
+            || async {
+                let mut rows = fetch_transactions_page(&state, &filter, &page).await?;
+                let has_more = rows.len() > page.limit as usize;
+                rows.truncate(page.limit as usize);
+                let rows: Vec<Value> = rows.iter().map(transaction_value).collect();
+                Ok::<Value, ApiError>(json!({
+                    "data": rows,
+                    "meta": page.meta(rows.len(), has_more),
+                }))
+            },
+        )
+        .await?;
+    Ok(([(header::CACHE_CONTROL, RECENT)], Json(body)))
 }
 
 async fn events(
@@ -718,17 +725,24 @@ async fn events(
         params.epoch, params.tick, params.event_type
     );
     let page = params.page().resolve(&fingerprint)?;
-    let mut rows = fetch_events_page(&state, &filter, &page).await?;
-    let has_more = rows.len() > page.limit as usize;
-    rows.truncate(page.limit as usize);
-    let rows: Vec<Value> = rows.into_iter().map(event_value).collect();
-    Ok((
-        [(header::CACHE_CONTROL, RECENT)],
-        Json(json!({
-            "data": rows,
-            "meta": page.meta(rows.len(), has_more),
-        })),
-    ))
+    let body = state
+        .live_cache
+        .get_or_insert(
+            format!("{fingerprint}:{}:{}", page.limit, page.offset),
+            Duration::from_secs(2),
+            || async {
+                let mut rows = fetch_events_page(&state, &filter, &page).await?;
+                let has_more = rows.len() > page.limit as usize;
+                rows.truncate(page.limit as usize);
+                let rows: Vec<Value> = rows.into_iter().map(event_value).collect();
+                Ok::<Value, ApiError>(json!({
+                    "data": rows,
+                    "meta": page.meta(rows.len(), has_more),
+                }))
+            },
+        )
+        .await?;
+    Ok(([(header::CACHE_CONTROL, RECENT)], Json(body)))
 }
 
 /// Returns the current head tick and the earliest indexed tick when a recent
