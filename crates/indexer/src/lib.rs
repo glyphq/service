@@ -182,6 +182,7 @@ struct PipelineTuning {
     write_batch: usize,
     write_flush: Duration,
     archive_concurrency: usize,
+    verify_concurrency: usize,
 }
 
 fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
@@ -194,6 +195,9 @@ fn env_usize(name: &str, default: usize, min: usize, max: usize) -> usize {
 
 impl PipelineTuning {
     fn from_env() -> Self {
+        let cpus = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(4);
         Self {
             // Fetching is I/O-bound, so a wide worker pool is cheap. The
             // window bounds memory: at most `fetch_window` bundles are in
@@ -205,6 +209,13 @@ impl PipelineTuning {
                 env_usize("INDEXER_WRITE_FLUSH_MS", 250, 10, 10_000) as u64,
             ),
             archive_concurrency: env_usize("INDEXER_ARCHIVE_CONCURRENCY", 16, 1, 64),
+            // Leave one core for the writer, ClickHouse client, and API.
+            verify_concurrency: env_usize(
+                "INDEXER_VERIFY_CONCURRENCY",
+                cpus.saturating_sub(1).max(1),
+                1,
+                64,
+            ),
         }
     }
 }
@@ -443,6 +454,7 @@ impl<S: Store + 'static> Indexer<S> {
             fetch_window = tuning.fetch_window,
             write_batch = tuning.write_batch,
             write_flush_ms = tuning.write_flush.as_millis() as u64,
+            verify_concurrency = tuning.verify_concurrency,
             "indexer started"
         );
 
@@ -533,6 +545,7 @@ impl<S: Store + 'static> Indexer<S> {
             pipeline_cancel.clone(),
             tuning.fetch_window,
         ));
+        let verify_semaphore = Arc::new(tokio::sync::Semaphore::new(tuning.verify_concurrency));
 
         let mut workers = Vec::with_capacity(tuning.fetch_concurrency);
         for _ in 0..tuning.fetch_concurrency {
@@ -545,6 +558,7 @@ impl<S: Store + 'static> Indexer<S> {
                 shared_computors.clone(),
                 shared_boundaries.clone(),
                 self.config.verify_signatures,
+                verify_semaphore.clone(),
                 pipeline_cancel.clone(),
             )));
         }
@@ -1808,6 +1822,7 @@ async fn fetch_worker(
     computors: Arc<AsyncRwLock<HashMap<u16, Computors>>>,
     boundaries: Arc<AsyncRwLock<EpochBoundaries>>,
     verify_signatures: bool,
+    verify_semaphore: Arc<tokio::sync::Semaphore>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -1881,7 +1896,26 @@ async fn fetch_worker(
         };
         let verify_started = Instant::now();
         let outcome = match fetched {
-            Ok(bundle) => verify_bundle_sequential(bundle, verify_signatures),
+            Ok(bundle) if verify_signatures => {
+                let permit = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    permit = verify_semaphore.acquire() => match permit {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    },
+                };
+                let result =
+                    tokio::task::spawn_blocking(move || verify_bundle_sequential(bundle, true))
+                        .await;
+                drop(permit);
+                match result {
+                    Ok(result) => result,
+                    Err(error) => Err(Error::Verification(format!(
+                        "verification task failed: {error}"
+                    ))),
+                }
+            }
+            Ok(bundle) => verify_bundle_sequential(bundle, false),
             Err(error) => Err(Error::Node(error)),
         };
         tracing::debug!(

@@ -143,6 +143,7 @@ Relevant settings:
 | `INDEXER_FETCH_WINDOW` | `512` | Maximum tick bundles in flight or buffered |
 | `INDEXER_WRITE_BATCH` | `128` | Maximum ticks per ClickHouse insert batch |
 | `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before a partial batch is flushed |
+| `INDEXER_VERIFY_CONCURRENCY` | CPU count minus one | Concurrent signature-verification tasks |
 | `INDEXER_POLL_MS` | `750` | Head poll interval when caught up |
 | `GLYPH_VERIFY_SIGNATURES` | `true` | Verify SchnorrQ signatures in addition to quorum digests |
 
