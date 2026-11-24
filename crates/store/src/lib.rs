@@ -1424,13 +1424,14 @@ LIMIT ? OFFSET ?
         limit: u32,
         offset: u64,
     ) -> Result<Vec<EventRow>> {
-        // The participant primary key starts with `identity`, so the left side
-        // is a bounded key read. The right side first narrows `events` to the
-        // identity's log ids. Deduplicating every event and then joining is
-        // quadratic in practice: it reads the whole events table for one page.
-        // An identity can hold several roles on one log, hence the final
-        // `LIMIT 1 BY` on the event key.
+        // The participant primary key starts with `identity`, so this is a
+        // bounded key read. The event side first turns those participant rows
+        // into a small `(epoch, log_id)` set; a plain `log_id IN (subquery)`
+        // makes ClickHouse scan an entire epoch partition because it cannot
+        // build primary-key ranges from the nested subquery. An identity can
+        // hold several roles on one log, hence the final `LIMIT 1 BY`.
         let limit = limit.clamp(1, 500);
+        let key_limit = offset.saturating_add(u64::from(limit));
         let rows = self
             .client
             .query(
@@ -1454,11 +1455,13 @@ SELECT ?fields FROM (
     ) AS p
     INNER JOIN (
         SELECT * FROM events
-        WHERE epoch IN (
-            SELECT epoch FROM event_participants WHERE identity = ?
-        )
-          AND log_id IN (
-            SELECT log_id FROM event_participants WHERE identity = ?
+        WHERE (epoch, log_id) IN (
+            SELECT epoch, log_id
+            FROM event_participants
+            WHERE identity = ?
+            GROUP BY epoch, log_id
+            ORDER BY max(tick) DESC, log_id DESC
+            LIMIT ?
         )
         ORDER BY version DESC
         LIMIT 1 BY epoch, log_id
@@ -1472,7 +1475,7 @@ LIMIT ? OFFSET ?
             )
             .bind(identity)
             .bind(identity)
-            .bind(identity)
+            .bind(key_limit)
             .bind(limit)
             .bind(offset)
             .fetch_all::<rows::EventSelect>()
@@ -1490,8 +1493,11 @@ LIMIT ? OFFSET ?
         // identity participated in. Each branch is capped before the union, so
         // a page does not materialize the identity's entire history. Both
         // branches are version-deduped so replayed ticks contribute once. The
-        // union columns have a common type and order; `kind` tells callers
-        // which source produced the row.
+        // event branch first reduces participants to the page's `(epoch,
+        // log_id)` keys; filtering `events` on separate epoch/log_id subqueries
+        // makes ClickHouse scan the whole epoch. The union columns have a
+        // common type and order; `kind` tells callers which source produced
+        // the row.
         let limit = limit.clamp(1, 200);
         let branch_limit = offset.saturating_add(u64::from(limit)).saturating_add(1);
         let rows = self
@@ -1568,11 +1574,13 @@ FROM (
         ) AS p
         INNER JOIN (
             SELECT * FROM events
-            WHERE epoch IN (
-                SELECT epoch FROM event_participants WHERE identity = ?
-            )
-              AND log_id IN (
-                SELECT log_id FROM event_participants WHERE identity = ?
+            WHERE (epoch, log_id) IN (
+                SELECT epoch, log_id
+                FROM event_participants
+                WHERE identity = ?
+                GROUP BY epoch, log_id
+                ORDER BY max(tick) DESC, log_id DESC
+                LIMIT ?
             )
             ORDER BY version DESC
             LIMIT 1 BY epoch, log_id
@@ -1590,7 +1598,7 @@ LIMIT ? OFFSET ?
             .bind(branch_limit)
             .bind(identity)
             .bind(identity)
-            .bind(identity)
+            .bind(branch_limit)
             .bind(branch_limit)
             .bind(limit)
             .bind(offset)
