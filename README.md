@@ -375,6 +375,8 @@ when `CLICKHOUSE_TEST_URL` is unreachable, so a clean runner does not need a dat
 | [`scripts/dev-up.sh`](scripts/dev-up.sh) | Start ClickHouse, apply schema, build and start API and indexer |
 | [`scripts/dev-down.sh`](scripts/dev-down.sh) | Stop API, indexer, and ClickHouse. `--wipe` deletes data |
 | [`scripts/smoke.sh`](scripts/smoke.sh) | Check ClickHouse, API status, peer head, and a tick fetch |
+| [`scripts/bench-api.sh`](scripts/bench-api.sh) | Measure warm p50/p95/p99 for each read route |
+| [`scripts/bench-load.py`](scripts/bench-load.py) | Run a timed concurrency benchmark with error counts |
 | [`scripts/docker-up.sh`](scripts/docker-up.sh) | Build and start the Compose stack, then wait for health |
 | [`scripts/docker-down.sh`](scripts/docker-down.sh) | Stop the Compose stack. `--wipe` deletes volumes |
 
