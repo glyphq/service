@@ -853,20 +853,30 @@ async fn identity_transactions(
     let _ = qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
     let page = params.resolve(&format!("identities/{identity}/transactions"))?;
-    let mut rows = state
-        .store
-        .transactions_for_identity(&identity, page.fetch_limit(), page.offset)
+    let body = state
+        .live_cache
+        .get_or_insert(
+            format!(
+                "identity_transactions:{identity}:{}:{}",
+                page.limit, page.offset
+            ),
+            Duration::from_secs(2),
+            || async {
+                let mut rows = state
+                    .store
+                    .transactions_for_identity(&identity, page.fetch_limit(), page.offset)
+                    .await?;
+                let has_more = rows.len() > page.limit as usize;
+                rows.truncate(page.limit as usize);
+                let rows: Vec<Value> = rows.iter().map(transaction_value).collect();
+                Ok::<Value, ApiError>(json!({
+                    "data": rows,
+                    "meta": page.meta(rows.len(), has_more),
+                }))
+            },
+        )
         .await?;
-    let has_more = rows.len() > page.limit as usize;
-    rows.truncate(page.limit as usize);
-    let rows: Vec<Value> = rows.iter().map(transaction_value).collect();
-    Ok((
-        [(header::CACHE_CONTROL, AGGREGATE)],
-        Json(json!({
-            "data": rows,
-            "meta": page.meta(rows.len(), has_more),
-        })),
-    ))
+    Ok(([(header::CACHE_CONTROL, AGGREGATE)], Json(body)))
 }
 
 async fn identity_activity(
@@ -878,19 +888,29 @@ async fn identity_activity(
     qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
     let page = params.resolve(&format!("identities/{identity}/activity"))?;
-    let mut rows = state
-        .store
-        .activity_for_identity(&identity, page.fetch_limit(), page.offset)
+    let body = state
+        .live_cache
+        .get_or_insert(
+            format!(
+                "identity_activity:{identity}:{}:{}",
+                page.limit, page.offset
+            ),
+            Duration::from_secs(2),
+            || async {
+                let mut rows = state
+                    .store
+                    .activity_for_identity(&identity, page.fetch_limit(), page.offset)
+                    .await?;
+                let has_more = rows.len() > page.limit as usize;
+                rows.truncate(page.limit as usize);
+                Ok::<Value, ApiError>(json!({
+                    "data": rows,
+                    "meta": page.meta(rows.len(), has_more),
+                }))
+            },
+        )
         .await?;
-    let has_more = rows.len() > page.limit as usize;
-    rows.truncate(page.limit as usize);
-    Ok((
-        [(header::CACHE_CONTROL, RECENT)],
-        Json(json!({
-            "data": rows,
-            "meta": page.meta(rows.len(), has_more),
-        })),
-    ))
+    Ok(([(header::CACHE_CONTROL, RECENT)], Json(body)))
 }
 
 async fn identity_events(
@@ -902,19 +922,26 @@ async fn identity_events(
     qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
     let page = params.resolve(&format!("identities/{identity}/events"))?;
-    let mut rows = state
-        .store
-        .events_for_identity(&identity, page.fetch_limit(), page.offset)
+    let body = state
+        .live_cache
+        .get_or_insert(
+            format!("identity_events:{identity}:{}:{}", page.limit, page.offset),
+            Duration::from_secs(2),
+            || async {
+                let mut rows = state
+                    .store
+                    .events_for_identity(&identity, page.fetch_limit(), page.offset)
+                    .await?;
+                let has_more = rows.len() > page.limit as usize;
+                rows.truncate(page.limit as usize);
+                Ok::<Value, ApiError>(json!({
+                    "data": rows,
+                    "meta": page.meta(rows.len(), has_more),
+                }))
+            },
+        )
         .await?;
-    let has_more = rows.len() > page.limit as usize;
-    rows.truncate(page.limit as usize);
-    Ok((
-        [(header::CACHE_CONTROL, RECENT)],
-        Json(json!({
-            "data": rows,
-            "meta": page.meta(rows.len(), has_more),
-        })),
-    ))
+    Ok(([(header::CACHE_CONTROL, RECENT)], Json(body)))
 }
 
 async fn identity(

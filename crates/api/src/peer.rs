@@ -7,8 +7,8 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use node::Peer;
@@ -52,6 +52,7 @@ const LIVE_CACHE_MAX_ENTRIES: usize = 1_024;
 #[derive(Debug)]
 pub struct LiveCache {
     entries: Mutex<HashMap<String, Entry>>,
+    flights: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     max_entries: usize,
     hits: AtomicU64,
     misses: AtomicU64,
@@ -61,6 +62,7 @@ impl Default for LiveCache {
     fn default() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            flights: Mutex::new(HashMap::new()),
             max_entries: LIVE_CACHE_MAX_ENTRIES,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -110,11 +112,87 @@ impl LiveCache {
         );
     }
 
+    /// Returns a cached value, or runs `build` once for concurrent callers of
+    /// the same key.
+    pub async fn get_or_insert<F, Fut, E>(
+        &self,
+        key: impl Into<String>,
+        ttl: Duration,
+        build: F,
+    ) -> Result<Value, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Value, E>>,
+    {
+        let key = key.into();
+        if let Some(value) = self.get(&key, ttl) {
+            return Ok(value);
+        }
+        let flight = {
+            let mut flights = self.flights.lock().expect("live cache flights lock");
+            flights
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let guard = flight.lock().await;
+        if let Some(value) = self.get(&key, ttl) {
+            drop(guard);
+            self.finish_flight(&key, &flight);
+            return Ok(value);
+        }
+        let result = build().await;
+        if let Ok(value) = &result {
+            self.put(key.clone(), value.clone());
+        }
+        drop(guard);
+        self.finish_flight(&key, &flight);
+        result
+    }
+
     /// Lifetime cache lookups, split into hits and misses.
     pub fn stats(&self) -> (u64, u64) {
         (
             self.hits.load(Ordering::Relaxed),
             self.misses.load(Ordering::Relaxed),
         )
+    }
+
+    fn finish_flight(&self, key: &str, flight: &Arc<tokio::sync::Mutex<()>>) {
+        let mut flights = self.flights.lock().expect("live cache flights lock");
+        if Arc::strong_count(flight) == 1 {
+            flights.remove(key);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn get_or_insert_runs_one_build_for_concurrent_callers() {
+        let cache = Arc::new(LiveCache::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..12 {
+            let cache = cache.clone();
+            let calls = calls.clone();
+            tasks.push(tokio::spawn(async move {
+                cache
+                    .get_or_insert("shared", Duration::from_secs(1), || async {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        Ok::<Value, ()>(serde_json::json!({ "ok": true }))
+                    })
+                    .await
+                    .expect("cache build")
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.expect("task"), serde_json::json!({ "ok": true }));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
