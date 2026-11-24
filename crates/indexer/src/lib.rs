@@ -316,6 +316,25 @@ fn next_after_flush(current: u32, persisted: Option<u32>) -> u32 {
 ///
 type EpochBoundaries = BTreeMap<u16, u32>;
 
+/// A restart-based epoch boundary can skip a range of tick numbers. Qubic
+/// publishes a new `TICK` when the network restarts from scratch, so the first
+/// tick of the new epoch is not `old_last + 1`. The dispatcher stops feeding
+/// ticks beyond the old epoch's last observed tick, and the writer jumps over
+/// the gap once the old tail is drained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EpochRollover {
+    old_epoch: u16,
+    old_last: u32,
+    new_epoch: u16,
+    new_initial: u32,
+}
+
+impl EpochRollover {
+    fn contains(self, tick: u32) -> bool {
+        tick > self.old_last && tick < self.new_initial
+    }
+}
+
 /// Resolve the epoch that owns `tick` from observed boundaries.
 ///
 /// Returns `None` when the tick predates every observed epoch start. Callers
@@ -369,10 +388,17 @@ async fn close_stale_epochs<S: Store>(store: &S, boundaries: &EpochBoundaries, h
             .iter()
             .find(|(epoch, _)| *epoch == row.epoch.saturating_add(1))
             .map(|(_, initial_tick)| *initial_tick);
-        let Some(successor) = successor else {
+        if successor.is_none() {
             continue;
+        }
+        let last_tick = match store.last_tick_for_epoch(row.epoch).await {
+            Ok(Some(tick)) => tick,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::warn!(epoch = row.epoch, %error, "last indexed tick was not read");
+                continue;
+            }
         };
-        let last_tick = successor.saturating_sub(1);
         if last_tick < row.initial_tick {
             continue;
         }
@@ -479,6 +505,7 @@ impl<S: Store + 'static> Indexer<S> {
 
         let shared_head = Arc::new(AsyncRwLock::new(head.clone()));
         let shared_computors = Arc::new(AsyncRwLock::new(initial_computors));
+        let rollover = Arc::new(AsyncRwLock::new(None));
         let next_write = Arc::new(AtomicU32::new(next));
         let pending = Arc::new(AtomicUsize::new(0));
         let pipeline_cancel = CancellationToken::new();
@@ -530,6 +557,7 @@ impl<S: Store + 'static> Indexer<S> {
             shared_head.clone(),
             shared_computors.clone(),
             shared_boundaries.clone(),
+            rollover.clone(),
             self.store.clone(),
             prune_keep,
             pipeline_cancel.clone(),
@@ -538,6 +566,7 @@ impl<S: Store + 'static> Indexer<S> {
         let dispatcher = tokio::spawn(dispatch_loop(
             next,
             shared_head.clone(),
+            rollover.clone(),
             next_write.clone(),
             pending.clone(),
             work_tx,
@@ -585,6 +614,22 @@ impl<S: Store + 'static> Indexer<S> {
         let mut run_result = Ok(());
 
         'writer: loop {
+            if let Some(state) = *rollover.read().await {
+                if state.contains(consume_next) {
+                    tracing::info!(
+                        from = consume_next,
+                        to = state.new_initial,
+                        old_epoch = state.old_epoch,
+                        new_epoch = state.new_epoch,
+                        "skipping restart tick gap"
+                    );
+                    next = state.new_initial;
+                    consume_next = next;
+                    next_write.store(next, Ordering::Release);
+                    let dropped = buffer.retain_from(consume_next);
+                    pending.fetch_sub(dropped, Ordering::Release);
+                }
+            }
             let (received, timed_out) = tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = pipeline_cancel.cancelled() => break,
@@ -1596,6 +1641,7 @@ async fn coordinate<S: Store + 'static>(
     head: Arc<AsyncRwLock<Head>>,
     computors: Arc<AsyncRwLock<HashMap<u16, Computors>>>,
     boundaries: Arc<AsyncRwLock<EpochBoundaries>>,
+    rollover: Arc<AsyncRwLock<Option<EpochRollover>>>,
     store: Arc<S>,
     prune_keep: Option<u16>,
     cancel: CancellationToken,
@@ -1663,31 +1709,48 @@ async fn coordinate<S: Store + 'static>(
                         );
                     }
                 }
-                *head.write().await = updated.clone();
                 if epoch_changed {
+                    let old_last = old_head.tick.max(old_head.initial_tick);
+                    let skipped = updated
+                        .initial_tick
+                        .saturating_sub(old_last)
+                        .saturating_sub(1);
+                    *rollover.write().await = Some(EpochRollover {
+                        old_epoch: old_head.epoch,
+                        old_last,
+                        new_epoch: updated.epoch,
+                        new_initial: updated.initial_tick,
+                    });
+                    if skipped > 0 {
+                        tracing::info!(
+                            old_epoch = old_head.epoch,
+                            old_last,
+                            new_epoch = updated.epoch,
+                            new_initial = updated.initial_tick,
+                            skipped,
+                            "restart tick gap observed"
+                        );
+                    }
                     if updated.epoch != old_head.epoch.saturating_add(1) {
                         tracing::warn!(
                             old_epoch = old_head.epoch,
                             new_epoch = updated.epoch,
-                            "epoch gap observed; leaving the previous epoch open instead of guessing its last tick"
+                            "epoch number gap observed"
                         );
-                    } else if let Some(last_tick) = updated.initial_tick.checked_sub(1) {
-                        let previous_first = if old_head.initial_tick <= last_tick {
-                            old_head.initial_tick
-                        } else {
-                            last_tick
-                        };
-                        if let Err(error) = store
-                            .close_epoch(old_head.epoch, previous_first, last_tick)
-                            .await
-                        {
-                            tracing::warn!(
-                                epoch = old_head.epoch,
-                                %error,
-                                "previous epoch was not closed"
-                            );
-                        }
                     }
+                    if let Err(error) = store
+                        .close_epoch(old_head.epoch, old_head.initial_tick, old_last)
+                        .await
+                    {
+                        tracing::warn!(
+                            epoch = old_head.epoch,
+                            %error,
+                            "previous epoch was not closed"
+                        );
+                    }
+                }
+                *head.write().await = updated.clone();
+                if epoch_changed {
                     tracing::info!(
                         old_epoch = old_head.epoch,
                         new_epoch = updated.epoch,
@@ -1728,6 +1791,7 @@ async fn coordinate<S: Store + 'static>(
 async fn dispatch_loop(
     initial: u32,
     head: Arc<AsyncRwLock<Head>>,
+    rollover: Arc<AsyncRwLock<Option<EpochRollover>>>,
     next_write: Arc<AtomicU32>,
     pending: Arc<AtomicUsize>,
     work_tx: mpsc::Sender<FetchWork>,
@@ -1747,6 +1811,13 @@ async fn dispatch_loop(
         if let Some(position) = retries.iter().position(|(at, _, _)| *at <= now) {
             let (_, tick, attempt) = retries.remove(position).expect("retry entry");
             if tick < next_write.load(Ordering::Acquire) {
+                continue;
+            }
+            if rollover
+                .read()
+                .await
+                .is_some_and(|state| state.contains(tick))
+            {
                 continue;
             }
             if pending.load(Ordering::Acquire) < window {
@@ -1770,6 +1841,14 @@ async fn dispatch_loop(
             Some(upto) => upto.saturating_add(1),
             None => initial,
         };
+        if let Some(state) = *rollover.read().await {
+            if state.contains(next_tick) {
+                // The writer drains the old epoch tail, then jumps to the new
+                // initial tick. Do not queue skipped tick numbers.
+                assigned_upto = Some(state.new_initial.saturating_sub(1));
+                continue;
+            }
+        }
         if pending.load(Ordering::Acquire) < window {
             if let Some(upper) = dispatch_upper_bound(next_write_tick, head_tick, window) {
                 if next_tick >= next_write_tick && next_tick <= upper {
@@ -2540,6 +2619,20 @@ mod tests {
         assert_eq!(epoch_for_tick(&boundaries, 220), Some(2));
     }
 
+    #[test]
+    fn restart_gap_contains_only_skipped_ticks() {
+        let rollover = EpochRollover {
+            old_epoch: 240,
+            old_last: 100,
+            new_epoch: 241,
+            new_initial: 200,
+        };
+        assert!(!rollover.contains(100));
+        assert!(rollover.contains(101));
+        assert!(rollover.contains(199));
+        assert!(!rollover.contains(200));
+    }
+
     #[tokio::test]
     async fn dispatcher_cancels_cleanly() {
         let head = Arc::new(AsyncRwLock::new(Head {
@@ -2556,6 +2649,7 @@ mod tests {
         let task = tokio::spawn(dispatch_loop(
             100,
             head,
+            Arc::new(AsyncRwLock::new(None)),
             next_write,
             pending,
             work_tx,
@@ -2569,5 +2663,54 @@ mod tests {
             .await
             .expect("dispatcher must stop promptly")
             .expect("dispatcher task");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_skips_restart_tick_gap() {
+        let head = Arc::new(AsyncRwLock::new(Head {
+            epoch: 2,
+            tick: 300,
+            initial_tick: 200,
+            tick_duration: 1_000,
+        }));
+        let rollover = Arc::new(AsyncRwLock::new(Some(EpochRollover {
+            old_epoch: 1,
+            old_last: 105,
+            new_epoch: 2,
+            new_initial: 200,
+        })));
+        let next_write = Arc::new(AtomicU32::new(100));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (work_tx, mut work_rx) = mpsc::channel::<FetchWork>(256);
+        let (_retry_tx, retry_rx) = mpsc::channel::<RetryRequest>(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(dispatch_loop(
+            100,
+            head,
+            rollover,
+            next_write,
+            pending,
+            work_tx,
+            retry_rx,
+            cancel.clone(),
+            256,
+        ));
+
+        let mut seen = Vec::new();
+        for _ in 0..16 {
+            let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(1), work_rx.recv()).await
+            else {
+                break;
+            };
+            seen.push(item.tick);
+            if item.tick == 200 {
+                break;
+            }
+        }
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+        assert!(seen.contains(&105));
+        assert!(seen.contains(&200));
+        assert!(!seen.iter().any(|tick| (106..200).contains(tick)));
     }
 }

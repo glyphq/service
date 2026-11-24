@@ -148,8 +148,8 @@ Ingestion is a bounded prefetch pipeline, not a serial tick loop.
    `ExchangePublicPeers` and merge discovered IPv4 addresses into the candidate set.
 2. A coordinator polls `RequestCurrentTickInfo` and keeps the head in shared state. It
    records the observed `(epoch, initial_tick)` boundary on startup and whenever the head
-   changes. When the epoch changes it closes the previous epoch at
-   `new_initial_tick - 1`, fetches and verifies `RequestComputors` for the new epoch, and
+   changes. When the epoch changes it closes the previous epoch at its last observed
+   tick, fetches and verifies `RequestComputors` for the new epoch, and
    caches the set by epoch. Boundaries are persisted in `glyph.epochs`; the indexer does
    not assume a fixed number of ticks per epoch.
 3. A dispatcher hands tick numbers to workers from a bounded window,
@@ -183,8 +183,9 @@ Ingestion is a bounded prefetch pipeline, not a serial tick loop.
    order: transactions, events, `event_participants`, identity snapshots, quorum
    evidence when present, then ticks. The head and ingest cursors advance after the tick
    rows. Every row in a batch shares one `version`, so a retry is idempotent.
-10. On an epoch change, move the dispatcher forward to the new `initialTick` once the
-    previous range is persisted.
+10. On a restart-based epoch change, stop dispatching at the old epoch's last observed
+    tick, then move forward to the new `initialTick` once the old tail is drained.
+    The skipped tick numbers are never requested or archived.
 
 Default tuning, overridable by environment:
 
@@ -260,8 +261,11 @@ changed tick rate before, so Glyph never assumes 604,800 ticks per epoch.
 - The current epoch and `initialTick` are discovered from `CurrentTickInfo`, not from wall
   time. On startup and on every head refresh the indexer records the observed boundary in
   `glyph.epochs`.
-- On an epoch change, the previous epoch is closed at `new_initial_tick - 1`. The boundary
+- On an epoch change, the previous epoch is closed at its last observed tick. The boundary
   map is loaded from ClickHouse at startup so restarts keep the same assignment.
+- Restart-based transitions can skip a large range of tick numbers. The new epoch's
+  `initialTick` is authoritative, and the gap is skipped instead of treated as missing
+  data.
 - With no stored cursor, the indexer starts at the current epoch `initialTick`. With a
   cursor, it resumes at `last_indexed_tick + 1`. A tick whose epoch cannot be resolved
   from the persisted boundaries is skipped with a warning rather than guessed.

@@ -78,7 +78,8 @@ Indexer behavior:
 
 - On startup and on every head refresh, record the current epoch and initial
   tick.
-- On an epoch change, close the previous epoch at `new_initial_tick - 1`.
+- On an epoch change, close the previous epoch at its last observed tick. Do not use
+  `new_initial_tick - 1`; restart-based transitions skip tick numbers.
 - Replace the hardcoded `TICKS_PER_EPOCH` lookup with the persisted boundary
   map. If a tick's epoch cannot be determined, skip it with a warning rather
   than guessing.

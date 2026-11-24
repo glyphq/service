@@ -357,7 +357,9 @@ ORDER BY epoch
 ```
 
 The indexer upserts a boundary on startup and on every head refresh, and closes the
-previous epoch at `new_initial_tick - 1` on rollover. `GET /v1/epochs` reads the persisted
+previous epoch at its last observed tick on rollover. Restart-based transitions can skip
+tick numbers, so the next epoch's initial tick is not used to infer the previous last
+tick. `GET /v1/epochs` reads the persisted
 row and includes `initial_tick`; when no row exists for an epoch, the API falls back to
 values derived from `glyph.ticks` so older databases still work.
 

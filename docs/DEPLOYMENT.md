@@ -183,6 +183,12 @@ Epoch boundaries are observed from peer `Head` values and stored in
 `glyph.epochs`. Do not size or configure around a fixed 604,800-tick epoch; the
 current network uses roughly 330k ticks and the rate can change.
 
+Epochs are not tick-number contiguous. Qubic has started epochs from a
+published `TICK` after a coordinated restart, so the next epoch's
+`initial_tick` can be tens of thousands above the previous epoch's last tick.
+The indexer closes the previous epoch at its last observed tick and skips the
+nonexistent gap instead of retrying those tick numbers.
+
 - All chain tables live in the single `CLICKHOUSE_DB` database and are
   partitioned by `epoch`. Per-epoch databases are deprecated. They duplicate
   DDL, break cross-epoch tables (`identities`, `price_points`), and complicate

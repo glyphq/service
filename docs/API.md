@@ -391,6 +391,11 @@ observed first tick of the epoch recorded in `glyph.epochs`; `first_tick` and
 epoch, the API falls back to values derived from `glyph.ticks`, so databases
 created before the epoch table still work.
 
+Epochs are not guaranteed to be tick-number contiguous. A restart-based
+transition starts the new epoch at a published `TICK`, so `last_tick + 1` may
+be far below the next epoch's `initial_tick`. The skipped tick numbers do not
+exist on chain.
+
 ```json
 {
   "data": [
@@ -430,9 +435,10 @@ derives a boundary from 604,800 ticks.
 
 - On startup and on every head refresh the indexer upserts `(epoch,
   initial_tick)` into the `glyph.epochs` table.
-- On an epoch change the previous epoch is closed at `new_initial_tick - 1`.
-  `closed` is therefore a persisted fact, not a guess from the newest indexed
-  tick.
+- On an epoch change the previous epoch is closed at its last observed tick,
+  not at `new_initial_tick - 1`. A restart-based transition can skip tens of
+  thousands of tick numbers, so the next initial tick does not prove the
+  previous epoch's last tick. `closed` is a persisted fact.
 - Tick-to-epoch assignment uses the persisted boundary map. A tick whose epoch
   cannot be resolved is skipped with a warning instead of being guessed.
 - Previous-epoch catch-up runs only when that epoch's boundary and computor set

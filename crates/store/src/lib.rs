@@ -480,6 +480,13 @@ pub trait Store: Send + Sync {
     async fn earliest_tick(&self) -> Result<Option<u32>> {
         Ok(None)
     }
+    /// Highest tick persisted for `epoch`, or `None` when the epoch has no
+    /// indexed ticks. Restart-based epoch changes leave a gap in tick numbers,
+    /// so callers cannot derive the last tick from the next epoch boundary.
+    async fn last_tick_for_epoch(&self, epoch: u16) -> Result<Option<u32>> {
+        let _ = epoch;
+        Ok(None)
+    }
     async fn tick(&self, tick: u32) -> Result<Option<TickRow>>;
     async fn transactions_for_tick(
         &self,
@@ -1097,6 +1104,16 @@ impl Store for ClickHouseStore {
             .fetch_one::<rows::EarliestTickRow>()
             .await?;
         Ok((row.n > 0).then_some(row.tick))
+    }
+
+    async fn last_tick_for_epoch(&self, epoch: u16) -> Result<Option<u32>> {
+        let row = self
+            .client
+            .query("SELECT max(tick) AS tick FROM ticks WHERE epoch = ?")
+            .bind(epoch)
+            .fetch_one::<rows::TickNumberSelect>()
+            .await?;
+        Ok((row.tick > 0).then_some(row.tick))
     }
 
     async fn tick(&self, tick: u32) -> Result<Option<TickRow>> {
