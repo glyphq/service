@@ -537,6 +537,53 @@ The indexer is the only writer. Never run two indexers against the same
 ClickHouse database. To upgrade, replace the binaries and restart in order:
 `glyph-indexer`, then `glyph-api`.
 
+
+## Cloudflare cache rules
+
+The API already sends `Cache-Control` on public reads. Cloudflare does not cache
+JSON by default, so a Cache Rule is required. The rule below caches only GET
+requests under `/v1/`, respects the origin TTL, and bypasses streams,
+WebSockets, live peer reads, and webhook administration:
+
+```text
+(http.request.method eq "GET"
+ and starts_with(http.request.uri.path, "/v1/")
+ and not starts_with(http.request.uri.path, "/v1/stream")
+ and not starts_with(http.request.uri.path, "/v1/ws")
+ and not starts_with(http.request.uri.path, "/v1/live/")
+ and not starts_with(http.request.uri.path, "/v1/webhooks"))
+```
+
+Action parameters:
+
+```json
+{
+  "cache": true,
+  "edge_ttl": { "mode": "respect_origin" },
+  "browser_ttl": { "mode": "respect_origin" }
+}
+```
+
+With `edge_ttl` and `browser_ttl` set to `respect_origin`, the API controls
+freshness. Current policies:
+
+| Class | Header |
+| --- | --- |
+| Recent reads | `public, max-age=2, stale-while-revalidate=5` |
+| Aggregates | `public, max-age=30, stale-while-revalidate=60` |
+| Immutable reads | `public, max-age=31536000, immutable` |
+| Status and errors | `no-store` |
+
+Verify the rule with:
+
+```bash
+curl -sSI https://api.glyphq.org/v1/transactions?limit=50 | grep -i cf-cache-status
+curl -sSI https://api.glyphq.org/v1/status | grep -i cf-cache-status
+```
+
+The first request should be `MISS`, the next within two seconds `HIT`, and
+status should stay `BYPASS`.
+
 ## Continuous deployment
 
 `.github/workflows/deploy.yml` deploys every push to `main`:

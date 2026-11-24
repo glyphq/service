@@ -41,14 +41,26 @@ where
     }
 }
 
+const LIVE_CACHE_MAX_ENTRIES: usize = 1_024;
+
 /// Small in-process TTL cache for JSON values derived from peer responses.
 ///
-/// Entries are copied on read and write. The cache intentionally has no
-/// eviction pass: the number of distinct keys is bounded by the route surface
-/// and the current epoch, so a process restart is an acceptable reset.
-#[derive(Debug, Default)]
+/// Entries are copied on read and write. Per-entity keys are bounded by an
+/// oldest-entry eviction pass so a long-lived process cannot grow without
+/// limit as wallets and transactions are queried.
+#[derive(Debug)]
 pub struct LiveCache {
     entries: Mutex<HashMap<String, Entry>>,
+    max_entries: usize,
+}
+
+impl Default for LiveCache {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            max_entries: LIVE_CACHE_MAX_ENTRIES,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -66,8 +78,18 @@ impl LiveCache {
 
     pub fn put(&self, key: impl Into<String>, value: Value) {
         let mut entries = self.entries.lock().expect("live cache lock");
+        let key = key.into();
+        if entries.len() >= self.max_entries && !entries.contains_key(&key) {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.stored_at)
+                .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
+            }
+        }
         entries.insert(
-            key.into(),
+            key,
             Entry {
                 stored_at: Instant::now(),
                 value,

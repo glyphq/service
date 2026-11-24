@@ -15,19 +15,24 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use store::{EventFilter, TransactionFilter};
 
-use crate::dto::{PageParams, event_value, transaction_value};
+use crate::dto::{Page, PageParams, event_value, transaction_value};
 use crate::{ApiError, AppState};
 
 const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const RECENT: &str = "public, max-age=2, stale-while-revalidate=5";
 const AGGREGATE: &str = "public, max-age=30, stale-while-revalidate=60";
+/// Initial recent-page scan window in ticks. Sparse collections expand this
+/// until the page is full or the indexed range is exhausted.
+const RECENT_PAGE_START_TICKS: u32 = 64;
+/// Largest bounded window before falling back to an unbounded historical page.
+const RECENT_PAGE_MAX_TICKS: u32 = 8_192;
 /// Maximum concurrent peer spectrum lookups used to enrich top identities.
 const TOP_IDENTITY_CONCURRENCY: usize = 8;
 /// A single peer lookup must not hold the analytics request open.
-const TOP_IDENTITY_PEER_TIMEOUT: Duration = Duration::from_millis(1_500);
+const TOP_IDENTITY_PEER_TIMEOUT: Duration = Duration::from_millis(300);
 /// Enrichment is best effort; after this budget every missed row falls back to
 /// its indexed values instead of delaying the response.
-const TOP_IDENTITY_BUDGET: Duration = Duration::from_secs(4);
+const TOP_IDENTITY_BUDGET: Duration = Duration::from_millis(800);
 const LOGO_DARK_PNG: &[u8] = include_bytes!("../assets/logo-dark.png");
 const LOGO_LIGHT_PNG: &[u8] = include_bytes!("../assets/logo-light.png");
 const FAVICON_PNG: &[u8] = include_bytes!("../assets/favicon.png");
@@ -269,15 +274,21 @@ async fn healthz() -> Json<Value> {
 }
 
 async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let (head, stats, earliest, network) = tokio::join!(
+    let (head, earliest, network) = tokio::join!(
         state.store.head(),
-        state.store.stats(),
         state.store.earliest_tick(),
         tokio::time::timeout(Duration::from_secs(2), state.pool.head()),
     );
     let head = head?;
-    let stats = stats?;
     let earliest = earliest?;
+    let stats = match state.live_cache.get("status:stats", Duration::from_secs(5)) {
+        Some(stats) => stats,
+        None => {
+            let stats = state.store.stats().await?;
+            state.live_cache.put("status:stats", stats.clone());
+            stats
+        }
+    };
     let (network, network_error) = match network {
         Ok(Ok(network)) => (Some(network), None),
         Ok(Err(error)) => (None, Some(error.to_string())),
@@ -656,6 +667,7 @@ async fn transactions(
     let filter = TransactionFilter {
         epoch: params.epoch,
         tick: params.tick,
+        min_tick: None,
         identity: identity.clone(),
     };
     let fingerprint = format!(
@@ -663,10 +675,7 @@ async fn transactions(
         params.epoch, params.tick, identity
     );
     let page = params.page().resolve(&fingerprint)?;
-    let mut rows = state
-        .store
-        .transactions_page(&filter, page.fetch_limit(), page.offset)
-        .await?;
+    let mut rows = fetch_transactions_page(&state, &filter, &page).await?;
     let has_more = rows.len() > page.limit as usize;
     rows.truncate(page.limit as usize);
     let rows: Vec<Value> = rows.iter().map(transaction_value).collect();
@@ -686,6 +695,7 @@ async fn events(
     let filter = EventFilter {
         epoch: params.epoch,
         tick: params.tick,
+        min_tick: None,
         type_name: params.event_type.clone(),
     };
     let fingerprint = format!(
@@ -693,10 +703,7 @@ async fn events(
         params.epoch, params.tick, params.event_type
     );
     let page = params.page().resolve(&fingerprint)?;
-    let mut rows = state
-        .store
-        .events_page(&filter, page.fetch_limit(), page.offset)
-        .await?;
+    let mut rows = fetch_events_page(&state, &filter, &page).await?;
     let has_more = rows.len() > page.limit as usize;
     rows.truncate(page.limit as usize);
     let rows: Vec<Value> = rows.into_iter().map(event_value).collect();
@@ -707,6 +714,99 @@ async fn events(
             "meta": page.meta(rows.len(), has_more),
         })),
     ))
+}
+
+/// Returns the current head tick and the earliest indexed tick when a recent
+/// scan is valid for the requested epoch.
+async fn recent_window(
+    state: &AppState,
+    epoch: Option<u16>,
+) -> Result<Option<(u32, u32)>, ApiError> {
+    let (head, earliest) = tokio::join!(state.store.head(), state.store.earliest_tick());
+    let Some(head) = head? else {
+        return Ok(None);
+    };
+    if epoch.is_some_and(|epoch| epoch != head.epoch) {
+        return Ok(None);
+    }
+    let floor = earliest?.unwrap_or(head.tick);
+    Ok(Some((head.tick, floor)))
+}
+
+/// Fetches a recent transaction page without scanning the whole table. The
+/// window doubles until the page is full, then falls back to an unbounded
+/// historical page once it reaches the start of the indexed range.
+async fn fetch_transactions_page(
+    state: &AppState,
+    filter: &TransactionFilter,
+    page: &Page,
+) -> Result<Vec<store::TransactionRow>, ApiError> {
+    if filter.tick.is_none() {
+        if let Some((head, floor)) = recent_window(state, filter.epoch).await? {
+            let mut bounded = filter.clone();
+            let mut span = RECENT_PAGE_START_TICKS;
+            loop {
+                let min_tick = head.saturating_sub(span).max(floor);
+                bounded.min_tick = Some(min_tick);
+                let rows = state
+                    .store
+                    .transactions_page(&bounded, page.fetch_limit(), page.offset)
+                    .await?;
+                if rows.len() >= page.fetch_limit() as usize || min_tick <= floor {
+                    return Ok(rows);
+                }
+                if span >= RECENT_PAGE_MAX_TICKS {
+                    bounded.min_tick = None;
+                    return Ok(state
+                        .store
+                        .transactions_page(&bounded, page.fetch_limit(), page.offset)
+                        .await?);
+                }
+                span = span.saturating_mul(2);
+            }
+        }
+    }
+    Ok(state
+        .store
+        .transactions_page(filter, page.fetch_limit(), page.offset)
+        .await?)
+}
+
+/// Event equivalent of [`fetch_transactions_page`].
+async fn fetch_events_page(
+    state: &AppState,
+    filter: &EventFilter,
+    page: &Page,
+) -> Result<Vec<store::EventRow>, ApiError> {
+    if filter.tick.is_none() {
+        if let Some((head, floor)) = recent_window(state, filter.epoch).await? {
+            let mut bounded = filter.clone();
+            let mut span = RECENT_PAGE_START_TICKS;
+            loop {
+                let min_tick = head.saturating_sub(span).max(floor);
+                bounded.min_tick = Some(min_tick);
+                let rows = state
+                    .store
+                    .events_page(&bounded, page.fetch_limit(), page.offset)
+                    .await?;
+                if rows.len() >= page.fetch_limit() as usize || min_tick <= floor {
+                    return Ok(rows);
+                }
+                if span >= RECENT_PAGE_MAX_TICKS {
+                    bounded.min_tick = None;
+                    return Ok(state
+                        .store
+                        .events_page(&bounded, page.fetch_limit(), page.offset)
+                        .await?);
+                }
+                span = span.saturating_mul(2);
+            }
+        }
+    }
+    Ok(state
+        .store
+        .events_page(filter, page.fetch_limit(), page.offset)
+        .await?)
 }
 
 async fn identities(
@@ -1098,6 +1198,10 @@ async fn analytics_top_identities(
     Query(params): Query<AnalyticsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     let limit = params.limit.unwrap_or(25).clamp(1, 200);
+    let cache_key = format!("top_identities:{limit}");
+    if let Some(value) = state.live_cache.get(&cache_key, Duration::from_secs(30)) {
+        return Ok(([(header::CACHE_CONTROL, AGGREGATE)], Json(value)));
+    }
     let rows = state.store.top_identities(limit).await?;
     let peers_configured = !state.peers.is_empty();
     let mut balances = vec![None; rows.len()];
@@ -1132,13 +1236,12 @@ async fn analytics_top_identities(
         .zip(balances.iter())
         .map(|(row, balance)| top_identity_value(row, balance.as_ref()))
         .collect();
-    Ok((
-        [(header::CACHE_CONTROL, AGGREGATE)],
-        Json(json!({
-            "data": data,
-            "meta": top_identities_meta(limit, peers_configured, indexed_fallbacks, live),
-        })),
-    ))
+    let body = json!({
+        "data": data,
+        "meta": top_identities_meta(limit, peers_configured, indexed_fallbacks, live),
+    });
+    state.live_cache.put(cache_key, body.clone());
+    Ok(([(header::CACHE_CONTROL, AGGREGATE)], Json(body)))
 }
 
 async fn analytics_event_types(

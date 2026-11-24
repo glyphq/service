@@ -388,6 +388,9 @@ pub struct PriceSnapshot {
 pub struct TransactionFilter {
     pub epoch: Option<u16>,
     pub tick: Option<u32>,
+    /// Inclusive lower bound used by recent-page queries to keep the scan
+    /// window bounded. `None` scans the full table.
+    pub min_tick: Option<u32>,
     /// Canonical uppercase identity matched against source or destination.
     pub identity: Option<String>,
 }
@@ -397,6 +400,9 @@ pub struct TransactionFilter {
 pub struct EventFilter {
     pub epoch: Option<u16>,
     pub tick: Option<u32>,
+    /// Inclusive lower bound used by recent-page queries to keep the scan
+    /// window bounded. `None` scans the full table.
+    pub min_tick: Option<u32>,
     pub type_name: Option<String>,
 }
 
@@ -1244,8 +1250,10 @@ LIMIT ? OFFSET ?
         let rows = self
             .client
             .query(
-                "SELECT ?fields FROM events FINAL WHERE tx_hash = ? \
-                 ORDER BY tick ASC, log_id ASC",
+                "SELECT ?fields FROM (\
+                     SELECT * FROM events WHERE tx_hash = ? \
+                     ORDER BY version DESC LIMIT 1 BY epoch, log_id\
+                 ) ORDER BY tick ASC, log_id ASC",
             )
             .bind(hash)
             .fetch_all::<rows::EventSelect>()
@@ -1416,11 +1424,12 @@ LIMIT ? OFFSET ?
         limit: u32,
         offset: u64,
     ) -> Result<Vec<EventRow>> {
-        // Both sides of the join read a version-deduped subquery instead of
-        // scanning with FINAL. The participant primary key starts with
-        // `identity`, so the left side is a bounded key read. An identity can
-        // hold several roles on one log, hence the final `LIMIT 1 BY` on the
-        // event key.
+        // The participant primary key starts with `identity`, so the left side
+        // is a bounded key read. The right side first narrows `events` to the
+        // identity's log ids. Deduplicating every event and then joining is
+        // quadratic in practice: it reads the whole events table for one page.
+        // An identity can hold several roles on one log, hence the final
+        // `LIMIT 1 BY` on the event key.
         let limit = limit.clamp(1, 500);
         let rows = self
             .client
@@ -1445,6 +1454,12 @@ SELECT ?fields FROM (
     ) AS p
     INNER JOIN (
         SELECT * FROM events
+        WHERE epoch IN (
+            SELECT epoch FROM event_participants WHERE identity = ?
+        )
+          AND log_id IN (
+            SELECT log_id FROM event_participants WHERE identity = ?
+        )
         ORDER BY version DESC
         LIMIT 1 BY epoch, log_id
     ) AS e ON e.epoch = p.epoch AND e.log_id = p.log_id
@@ -1455,6 +1470,8 @@ ORDER BY tick DESC, log_id DESC
 LIMIT ? OFFSET ?
 "#,
             )
+            .bind(identity)
+            .bind(identity)
             .bind(identity)
             .bind(limit)
             .bind(offset)
@@ -1470,12 +1487,13 @@ LIMIT ? OFFSET ?
         offset: u64,
     ) -> Result<Vec<IdentityActivityRow>> {
         // One linear history over two sources: direct transfers and events the
-        // identity participated in. Both branches are version-deduped before
-        // the union so replayed ticks contribute once. The union columns have a
-        // common type and order; `kind` tells callers which source produced the
-        // row. For event rows the transfer-shaped fields are read from the
-        // decoded JSON body and default to empty/zero for other event types.
+        // identity participated in. Each branch is capped before the union, so
+        // a page does not materialize the identity's entire history. Both
+        // branches are version-deduped so replayed ticks contribute once. The
+        // union columns have a common type and order; `kind` tells callers
+        // which source produced the row.
         let limit = limit.clamp(1, 200);
+        let branch_limit = offset.saturating_add(u64::from(limit)).saturating_add(1);
         let rows = self
             .client
             .query(
@@ -1501,10 +1519,17 @@ FROM (
         '' AS body,
         '' AS role
     FROM (
-        SELECT * FROM transactions
-        WHERE source = ? OR destination = ?
-        ORDER BY version DESC
-        LIMIT 1 BY tick, tx_index
+        SELECT * FROM (
+            SELECT * FROM (
+                SELECT * FROM transactions WHERE source = ?
+                UNION ALL
+                SELECT * FROM transactions WHERE destination = ?
+            )
+            ORDER BY version DESC
+            LIMIT 1 BY tick, tx_index
+        )
+        ORDER BY tick DESC, tx_index DESC
+        LIMIT ?
     ) AS t
     UNION ALL
     SELECT
@@ -1523,18 +1548,38 @@ FROM (
         '' AS status,
         e.type_name AS type_name,
         e.body AS body,
-        p.role AS role
+        e.role AS role
     FROM (
-        SELECT * FROM event_participants
-        WHERE identity = ?
-        ORDER BY version DESC
-        LIMIT 1 BY epoch, log_id, identity, role
-    ) AS p
-    INNER JOIN (
-        SELECT * FROM events
-        ORDER BY version DESC
-        LIMIT 1 BY epoch, log_id
-    ) AS e ON e.epoch = p.epoch AND e.log_id = p.log_id
+        SELECT
+            e.epoch AS epoch,
+            e.tick AS tick,
+            e.log_id AS log_id,
+            e.type_name AS type_name,
+            e.tx_hash AS tx_hash,
+            e.tx_index AS tx_index,
+            e.body AS body,
+            e.timestamp AS timestamp,
+            p.role AS role
+        FROM (
+            SELECT * FROM event_participants
+            WHERE identity = ?
+            ORDER BY version DESC
+            LIMIT 1 BY epoch, log_id, identity, role
+        ) AS p
+        INNER JOIN (
+            SELECT * FROM events
+            WHERE epoch IN (
+                SELECT epoch FROM event_participants WHERE identity = ?
+            )
+              AND log_id IN (
+                SELECT log_id FROM event_participants WHERE identity = ?
+            )
+            ORDER BY version DESC
+            LIMIT 1 BY epoch, log_id
+        ) AS e ON e.epoch = p.epoch AND e.log_id = p.log_id
+        ORDER BY e.tick DESC, e.log_id DESC
+        LIMIT ?
+    ) AS e
 )
 ORDER BY tick DESC, log_id DESC NULLS LAST, tx_index DESC, hash DESC
 LIMIT ? OFFSET ?
@@ -1542,7 +1587,11 @@ LIMIT ? OFFSET ?
             )
             .bind(identity)
             .bind(identity)
+            .bind(branch_limit)
             .bind(identity)
+            .bind(identity)
+            .bind(identity)
+            .bind(branch_limit)
             .bind(limit)
             .bind(offset)
             .fetch_all::<rows::IdentityActivitySelect>()
@@ -2012,6 +2061,9 @@ LIMIT ? OFFSET ?
         if filter.identity.is_none() {
             let mut sql = String::from("SELECT ?fields FROM transactions FINAL");
             let mut conditions = Vec::new();
+            if filter.min_tick.is_some() {
+                conditions.push("tick >= ?");
+            }
             if filter.epoch.is_some() {
                 conditions.push("epoch = ?");
             }
@@ -2024,6 +2076,9 @@ LIMIT ? OFFSET ?
             }
             sql.push_str(" ORDER BY tick DESC, tx_index ASC LIMIT ? OFFSET ?");
             let mut query = self.client.query(&sql);
+            if let Some(min_tick) = filter.min_tick {
+                query = query.bind(min_tick);
+            }
             if let Some(epoch) = filter.epoch {
                 query = query.bind(epoch);
             }
@@ -2037,35 +2092,48 @@ LIMIT ? OFFSET ?
                 .await?;
             return Ok(rows.into_iter().map(Into::into).collect());
         }
-        let mut sql = String::from("SELECT ?fields FROM (SELECT * FROM transactions");
+
+        // Split source and destination into separate branches so ClickHouse can
+        // use the `by_source` and `by_destination` projections. A single
+        // `source = ? OR destination = ?` predicate forces a full scan.
         let mut conditions = Vec::new();
+        if filter.min_tick.is_some() {
+            conditions.push("tick >= ?");
+        }
         if filter.epoch.is_some() {
             conditions.push("epoch = ?");
         }
         if filter.tick.is_some() {
             conditions.push("tick = ?");
         }
-        if filter.identity.is_some() {
-            conditions.push("(source = ? OR destination = ?)");
-        }
-        if !conditions.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&conditions.join(" AND "));
-        }
-        sql.push_str(
-            " ORDER BY version DESC LIMIT 1 BY tick, tx_index\
-             ) ORDER BY tick DESC, tx_index ASC LIMIT ? OFFSET ?",
+        let branch_filter = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", conditions.join(" AND "))
+        };
+        let sql = format!(
+            "SELECT ?fields FROM (\
+                 SELECT * FROM (\
+                     SELECT * FROM transactions WHERE 1 = 1{branch_filter} AND source = ? \
+                     UNION ALL \
+                     SELECT * FROM transactions WHERE 1 = 1{branch_filter} AND destination = ?\
+                 ) ORDER BY version DESC LIMIT 1 BY tick, tx_index\
+             ) ORDER BY tick DESC, tx_index ASC LIMIT ? OFFSET ?"
         );
 
         let mut query = self.client.query(&sql);
-        if let Some(epoch) = filter.epoch {
-            query = query.bind(epoch);
-        }
-        if let Some(tick) = filter.tick {
-            query = query.bind(tick);
-        }
-        if let Some(identity) = &filter.identity {
-            query = query.bind(identity.as_str()).bind(identity.as_str());
+        let identity = filter.identity.as_deref().unwrap_or_default();
+        for _ in 0..2 {
+            if let Some(min_tick) = filter.min_tick {
+                query = query.bind(min_tick);
+            }
+            if let Some(epoch) = filter.epoch {
+                query = query.bind(epoch);
+            }
+            if let Some(tick) = filter.tick {
+                query = query.bind(tick);
+            }
+            query = query.bind(identity);
         }
         let rows = query
             .bind(limit)
@@ -2081,8 +2149,14 @@ LIMIT ? OFFSET ?
         limit: u32,
         offset: u64,
     ) -> Result<Vec<EventRow>> {
-        let mut sql = String::from("SELECT ?fields FROM events FINAL");
+        // Deduplicate with `LIMIT 1 BY` instead of `FINAL`. On a bounded tick
+        // window this lets ClickHouse stop at the requested page instead of
+        // merging every part in the table.
+        let mut sql = String::from("SELECT ?fields FROM events");
         let mut conditions = Vec::new();
+        if filter.min_tick.is_some() {
+            conditions.push("tick >= ?");
+        }
         if filter.epoch.is_some() {
             conditions.push("epoch = ?");
         }
@@ -2096,9 +2170,15 @@ LIMIT ? OFFSET ?
             sql.push_str(" WHERE ");
             sql.push_str(&conditions.join(" AND "));
         }
-        sql.push_str(" ORDER BY tick DESC, log_id DESC LIMIT ? OFFSET ?");
+        sql.push_str(
+            " ORDER BY tick DESC, log_id DESC, version DESC \
+             LIMIT 1 BY epoch, log_id LIMIT ? OFFSET ?",
+        );
 
         let mut query = self.client.query(&sql);
+        if let Some(min_tick) = filter.min_tick {
+            query = query.bind(min_tick);
+        }
         if let Some(epoch) = filter.epoch {
             query = query.bind(epoch);
         }

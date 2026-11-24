@@ -24,6 +24,9 @@ use crate::{ApiError, AppState, peer};
 const RECENT: &str = "public, max-age=2, stale-while-revalidate=5";
 const AGGREGATE: &str = "public, max-age=30, stale-while-revalidate=60";
 const PEER_TIMEOUT: Duration = Duration::from_secs(2);
+/// Tx-status is an optional peer add-on. Most peers do not run it, so do not
+/// make the indexed response wait seconds for a feature that will not answer.
+const ADDON_TIMEOUT: Duration = Duration::from_millis(400);
 /// A transaction lives in the node's pending pool for about ten minutes. At a
 /// one-second tick, a target further away than this is likely to be dropped.
 const PENDING_HORIZON_TICKS: u32 = 600;
@@ -53,6 +56,10 @@ async fn lifecycle(
     let hash = hash.trim().to_ascii_lowercase();
     let digest =
         qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
+    let cache_key = format!("lifecycle:{hash}");
+    if let Some(value) = state.live_cache.get(&cache_key, Duration::from_secs(2)) {
+        return Ok(([(header::CACHE_CONTROL, RECENT)], Json(value)));
+    }
 
     let indexed = state.store.transaction(&hash).await?;
     let mempool = match &state.mempool {
@@ -163,18 +170,17 @@ async fn lifecycle(
             current,
         ),
     });
-    Ok((
-        [(header::CACHE_CONTROL, RECENT)],
-        Json(json!({
-            "data": data,
-            "meta": {
-                "source": if indexed.is_some() { "index" } else if mempool.is_some() { "tracking" } else { "peer" },
-                "peer_error": network_error,
-                "pending_pool_public": false,
-                "note": "money_flew is only known when a peer running the tx-status add-on answers. It is null otherwise, not false."
-            }
-        })),
-    ))
+    let body = json!({
+        "data": data,
+        "meta": {
+            "source": if indexed.is_some() { "index" } else if mempool.is_some() { "tracking" } else { "peer" },
+            "peer_error": network_error,
+            "pending_pool_public": false,
+            "note": "money_flew is only known when a peer running the tx-status add-on answers. It is null otherwise, not false."
+        }
+    });
+    state.live_cache.put(cache_key, body.clone());
+    Ok(([(header::CACHE_CONTROL, RECENT)], Json(body)))
 }
 
 fn lifecycle_state(
@@ -315,7 +321,7 @@ fn timeline_json(
 async fn peer_money_flew(state: &AppState, tick: u32, digest: &[u8; 32]) -> Option<bool> {
     let status = peer::request(
         "peer transaction status",
-        PEER_TIMEOUT,
+        ADDON_TIMEOUT,
         state.pool.tx_status(tick),
     )
     .await
@@ -324,10 +330,13 @@ async fn peer_money_flew(state: &AppState, tick: u32, digest: &[u8; 32]) -> Opti
 }
 
 async fn current_tick(state: &AppState) -> Option<u32> {
-    match peer::request("peer system info", PEER_TIMEOUT, state.pool.system_info()).await {
-        Ok(info) => Some(info.tick),
-        _ => state.store.head().await.ok().flatten().map(|row| row.tick),
+    if let Some(row) = state.store.head().await.ok().flatten() {
+        return Some(row.tick);
     }
+    peer::request("peer system info", PEER_TIMEOUT, state.pool.system_info())
+        .await
+        .ok()
+        .map(|info| info.tick)
 }
 
 async fn inclusion_risk(
@@ -652,6 +661,10 @@ async fn tick_capacity(
     State(state): State<AppState>,
     Path(tick): Path<u32>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let cache_key = format!("tick_capacity:{tick}");
+    if let Some(value) = state.live_cache.get(&cache_key, Duration::from_secs(30)) {
+        return Ok(([(header::CACHE_CONTROL, AGGREGATE)], Json(value)));
+    }
     let row = state
         .store
         .tick(tick)
@@ -696,7 +709,7 @@ async fn tick_capacity(
 
     let peer_status = peer::request(
         "peer transaction status",
-        PEER_TIMEOUT,
+        ADDON_TIMEOUT,
         state.pool.tx_status(tick),
     )
     .await
@@ -717,35 +730,34 @@ async fn tick_capacity(
     });
 
     let fill = f64::from(row.transaction_count) / TX_PER_TICK as f64;
-    Ok((
-        [(header::CACHE_CONTROL, AGGREGATE)],
-        Json(json!({
-            "data": {
-                "tick": tick,
-                "epoch": row.epoch,
-                "timestamp": row.timestamp,
-                "transaction_count": row.transaction_count,
-                "event_count": row.event_count,
-                "transaction_slots": TX_PER_TICK,
-                "remaining_slots": TX_PER_TICK.saturating_sub(row.transaction_count as usize),
-                "fill_ratio": fill,
-                "fill_percent": fill * 100.0,
-                "volume": volume,
-                "transfer_count": transfer_count,
-                "contract_call_count": contract_calls,
-                "top_senders": top_senders,
-                "money_flew": {
-                    "available": peer_status.is_some(),
-                    "true_count": money_flew_true,
-                    "false_count": money_flew_false,
-                },
+    let body = json!({
+        "data": {
+            "tick": tick,
+            "epoch": row.epoch,
+            "timestamp": row.timestamp,
+            "transaction_count": row.transaction_count,
+            "event_count": row.event_count,
+            "transaction_slots": TX_PER_TICK,
+            "remaining_slots": TX_PER_TICK.saturating_sub(row.transaction_count as usize),
+            "fill_ratio": fill,
+            "fill_percent": fill * 100.0,
+            "volume": volume,
+            "transfer_count": transfer_count,
+            "contract_call_count": contract_calls,
+            "top_senders": top_senders,
+            "money_flew": {
+                "available": peer_status.is_some(),
+                "true_count": money_flew_true,
+                "false_count": money_flew_false,
             },
-            "meta": {
-                "source": "index+peer",
-                "note": "tx_count is the stored transaction count for this tick. money_flew is null unless a peer running the tx-status add-on answered."
-            }
-        })),
-    ))
+        },
+        "meta": {
+            "source": "index+peer",
+            "note": "tx_count is the stored transaction count for this tick. money_flew is null unless a peer running the tx-status add-on answered."
+        }
+    });
+    state.live_cache.put(cache_key, body.clone());
+    Ok(([(header::CACHE_CONTROL, AGGREGATE)], Json(body)))
 }
 
 #[cfg(test)]

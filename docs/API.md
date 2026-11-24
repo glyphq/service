@@ -1292,7 +1292,9 @@ spectrum entity and the issued, owned, and possessed asset lists.
 - A malformed identity returns `400 invalid_identity`.
 - `404 not_found` is returned only when the identity is absent from both the
   index and the peer spectrum.
-- No reachable peer returns `503 unavailable`. Responses are `no-store`.
+- No reachable peer returns `503 unavailable`. Successful responses are
+  `Cache-Control: public, max-age=2, stale-while-revalidate=5`; the process
+  also keeps a 5-second in-memory copy.
 
 ### `GET /v1/wallets/{identity}/assets?kind=issued|owned|possessed`
 

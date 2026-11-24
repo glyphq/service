@@ -12,6 +12,7 @@
 //! - `GET /v1/assets/{issuer}/{name}/holders?limit=` ownership holders
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, header};
@@ -284,10 +285,26 @@ async fn wallet(
     Path(identity): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (identity, key) = parse_identity(&identity)?;
-    let local = state.store.identity(&identity).await?;
-    let mut peer = connect(&state).await?;
-
-    let entity_response = peer.entity(key.0).await.map_err(|error| {
+    let cache_key = format!("wallet:{identity}");
+    if let Some(value) = state.live_cache.get(&cache_key, Duration::from_secs(5)) {
+        return Ok((
+            [(
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=2, stale-while-revalidate=5"),
+            )],
+            Json(value),
+        ));
+    }
+    let (local, entity_response, issued, owned, possessed, recent) = tokio::join!(
+        state.store.identity(&identity),
+        state.pool.entity(key.0),
+        state.pool.issued_assets(key.0),
+        state.pool.owned_assets(key.0),
+        state.pool.possessed_assets(key.0),
+        state.store.transactions_for_identity(&identity, 10, 0),
+    );
+    let local = local?;
+    let entity_response = entity_response.map_err(|error| {
         ApiError::unavailable(format!("entity lookup failed for {identity}: {error}"))
     })?;
     let warning = truncation_warning(&entity_response);
@@ -297,43 +314,40 @@ async fn wallet(
         )));
     }
 
-    let issued = peer
-        .issued_assets(key.0)
-        .await
+    let issued = issued
         .map_err(|error| ApiError::unavailable(format!("issued asset lookup failed: {error}")))?;
-    let owned = peer
-        .owned_assets(key.0)
-        .await
+    let owned = owned
         .map_err(|error| ApiError::unavailable(format!("owned asset lookup failed: {error}")))?;
-    let possessed = peer.possessed_assets(key.0).await.map_err(|error| {
+    let possessed = possessed.map_err(|error| {
         ApiError::unavailable(format!("possessed asset lookup failed: {error}"))
     })?;
+    let recent = recent?;
 
-    let recent = state
-        .store
-        .transactions_for_identity(&identity, 10, 0)
-        .await?;
-
-    Ok((
-        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
-        Json(json!({
-            "data": {
-                "identity": identity,
-                "public_key": key.to_hex(),
-                "entity": entity_value(&entity_response),
-                "assets": {
-                    "issued": issued_list(&issued),
-                    "owned": owned_list(&owned),
-                    "possessed": possessed_list(&possessed),
-                },
-                "recent": recent,
+    let body = json!({
+        "data": {
+            "identity": identity,
+            "public_key": key.to_hex(),
+            "entity": entity_value(&entity_response),
+            "assets": {
+                "issued": issued_list(&issued),
+                "owned": owned_list(&owned),
+                "possessed": possessed_list(&possessed),
             },
-            "meta": {
-                "source": "peer+index",
-                "peer_tick": entity_response.tick,
-                "warning": warning,
-            }
-        })),
+            "recent": recent,
+        },
+        "meta": {
+            "source": "peer+index",
+            "peer_tick": entity_response.tick,
+            "warning": warning,
+        }
+    });
+    state.live_cache.put(cache_key, body.clone());
+    Ok((
+        [(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=2, stale-while-revalidate=5"),
+        )],
+        Json(body),
     ))
 }
 

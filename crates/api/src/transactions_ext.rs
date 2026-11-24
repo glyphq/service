@@ -27,7 +27,8 @@ use crate::{ApiError, AppState};
 const PEER_LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Cap on the optional tx-status add-on probe. Peers without the add-on drop
 /// the request silently, so this keeps a status request responsive.
-const PEER_STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+const PEER_STATUS_TIMEOUT: Duration = Duration::from_millis(400);
+const RECENT: &str = "public, max-age=2, stale-while-revalidate=5";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -186,6 +187,10 @@ async fn transaction_status(
     let hash = hash.trim().to_ascii_lowercase();
     let digest =
         qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
+    let cache_key = format!("tx_status:{hash}");
+    if let Some(value) = state.live_cache.get(&cache_key, Duration::from_secs(2)) {
+        return Ok(([(header::CACHE_CONTROL, RECENT)], Json(value)));
+    }
 
     let indexed = state.store.transaction(&hash).await?;
     let (mut peer, mut peer_error) = match connect(&state).await {
@@ -291,13 +296,12 @@ async fn transaction_status(
         meta["peer_error"] = json!(error);
         meta["source"] = json!("index");
     }
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({
-            "data": data,
-            "meta": meta
-        })),
-    ))
+    let body = json!({
+        "data": data,
+        "meta": meta
+    });
+    state.live_cache.put(cache_key, body.clone());
+    Ok(([(header::CACHE_CONTROL, RECENT)], Json(body)))
 }
 
 async fn connect(state: &AppState) -> Result<Peer, ApiError> {

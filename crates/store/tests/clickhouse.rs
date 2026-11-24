@@ -11,9 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, TimeZone, Utc};
 use serde::Deserialize;
 use store::{
-    CURSOR_HEAD, CURSOR_INGEST, ClickHouseStore, ComputorRow, Error, EventParticipantRow, EventRow,
-    IdentityActivityRow, IdentityRow, IngestCursor, PricePointRow, QuorumEvidenceRow, Store,
-    TickBatch, TickRow, TransactionRow,
+    CURSOR_HEAD, CURSOR_INGEST, ClickHouseStore, ComputorRow, Error, EventFilter,
+    EventParticipantRow, EventRow, IdentityActivityRow, IdentityRow, IngestCursor, PricePointRow,
+    QuorumEvidenceRow, Store, TickBatch, TickRow, TransactionFilter, TransactionRow,
 };
 
 static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1803,4 +1803,100 @@ async fn explorer_history_queries_return_deduped_rows() {
     assert_eq!(transfers[0].from, "ALICE");
     assert_eq!(transfers[0].to, "BOB");
     assert_eq!(transfers[0].shares, 5);
+}
+
+#[tokio::test]
+async fn paged_reads_bound_by_tick_and_union_identity_filters() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+
+    let mut first = batch(1, 100);
+    first.transactions = vec![
+        transfer(100, 0, "hash-a", "ALICE", "BOB"),
+        transfer(100, 1, "hash-b", "BOB", "ALICE"),
+    ];
+    first.events = vec![event_typed(
+        1,
+        100,
+        20,
+        "qu_transfer",
+        r#"{"from":"ALICE","to":"BOB","amount":10}"#,
+    )];
+    first.event_participants = vec![
+        participant(1, 100, 20, "ALICE", "from"),
+        participant(1, 100, 20, "BOB", "to"),
+    ];
+    store.write_tick(&first).await.expect("write first tick");
+
+    let mut second = batch(1, 101);
+    second.transactions = vec![transfer(101, 0, "hash-c", "ALICE", "CAROL")];
+    second.events = vec![event_typed(
+        1,
+        101,
+        30,
+        "qu_transfer",
+        r#"{"from":"ALICE","to":"CAROL","amount":11}"#,
+    )];
+    second.event_participants = vec![
+        participant(1, 101, 30, "ALICE", "from"),
+        participant(1, 101, 30, "CAROL", "to"),
+    ];
+    store.write_tick(&second).await.expect("write second tick");
+
+    let recent = TransactionFilter {
+        epoch: Some(1),
+        tick: None,
+        min_tick: Some(101),
+        identity: Some("ALICE".into()),
+    };
+    let rows = store
+        .transactions_page(&recent, 10, 0)
+        .await
+        .expect("recent identity page");
+    assert_eq!(
+        rows.iter().map(|row| row.hash.as_str()).collect::<Vec<_>>(),
+        vec!["hash-c"]
+    );
+
+    let all = TransactionFilter {
+        min_tick: Some(100),
+        ..recent
+    };
+    let rows = store
+        .transactions_page(&all, 10, 0)
+        .await
+        .expect("full identity page");
+    assert_eq!(
+        rows.iter().map(|row| row.hash.as_str()).collect::<Vec<_>>(),
+        vec!["hash-c", "hash-a", "hash-b"]
+    );
+
+    let recent_events = EventFilter {
+        epoch: Some(1),
+        tick: None,
+        min_tick: Some(101),
+        type_name: Some("qu_transfer".into()),
+    };
+    let events = store
+        .events_page(&recent_events, 10, 0)
+        .await
+        .expect("recent typed events");
+    assert_eq!(
+        events.iter().map(|event| event.log_id).collect::<Vec<_>>(),
+        vec![30]
+    );
+
+    let all_events = EventFilter {
+        min_tick: Some(100),
+        ..recent_events
+    };
+    let events = store
+        .events_page(&all_events, 10, 0)
+        .await
+        .expect("all typed events");
+    assert_eq!(
+        events.iter().map(|event| event.log_id).collect::<Vec<_>>(),
+        vec![30, 20]
+    );
 }

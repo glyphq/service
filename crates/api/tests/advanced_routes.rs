@@ -906,7 +906,10 @@ async fn wallet_overview_joins_peer_entity_assets_and_index() {
         get(state, &format!("/v1/wallets/{}", identity(&WALLET_KEY))).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        headers[header::CACHE_CONTROL],
+        "public, max-age=2, stale-while-revalidate=5"
+    );
     assert_eq!(body["data"]["identity"], identity(&WALLET_KEY));
     assert_eq!(
         body["data"]["public_key"],
@@ -1172,7 +1175,10 @@ async fn indexed_transaction_status_degrades_when_peer_errors() {
     let (status, body, headers) = get(state, &format!("/v1/transactions/{hash}/status")).await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        headers[header::CACHE_CONTROL],
+        "public, max-age=2, stale-while-revalidate=5"
+    );
     assert_eq!(body["data"]["indexed"]["hash"], hash);
     assert_eq!(body["data"]["network"]["found"], false);
     assert_eq!(body["meta"]["source"], "index");

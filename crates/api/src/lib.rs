@@ -11,10 +11,11 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use node::{NodePool, PeerConfig};
 use store::Store;
+use tower_http::LatencyUnit;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 
 pub mod advanced;
 pub mod dto;
@@ -63,6 +64,9 @@ pub struct AppState {
     pub webhooks: Option<Arc<webhook::Webhooks>>,
     /// Short-lived cache for peer-backed reads.
     pub live_cache: Arc<peer::LiveCache>,
+    /// Cached index-wide counts. `network_stats` runs several `FINAL` counts,
+    /// so multiple dashboard reads within a few seconds should share one query.
+    pub stats_cache: Arc<tokio::sync::Mutex<Option<(Instant, store::NetworkStats)>>>,
 }
 
 impl AppState {
@@ -83,11 +87,27 @@ impl AppState {
             mempool: None,
             webhooks: None,
             live_cache: Arc::new(peer::LiveCache::default()),
+            stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
     pub fn uptime_seconds(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+
+    /// Returns index-wide counts, reusing a recent snapshot. The mutex is held
+    /// across the query so a burst of dashboard refreshes performs one scan.
+    pub async fn network_stats(&self) -> Result<store::NetworkStats, store::Error> {
+        const TTL: Duration = Duration::from_secs(5);
+        let mut cache = self.stats_cache.lock().await;
+        if let Some((stored_at, stats)) = cache.as_ref() {
+            if stored_at.elapsed() < TTL {
+                return Ok(stats.clone());
+            }
+        }
+        let stats = self.store.network_stats().await?;
+        *cache = Some((Instant::now(), stats.clone()));
+        Ok(stats)
     }
 }
 
@@ -196,7 +216,15 @@ pub fn router(state: AppState) -> Router {
         .layer(cors_layer())
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
         .layer(SetRequestIdLayer::new(request_id, MakeRequestUuid))
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO))
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(tracing::Level::INFO)
+                        .latency_unit(LatencyUnit::Millis),
+                ),
+        )
 }
 
 /// Permissive by default. Set `CORS_ALLOWED_ORIGINS` to a comma-separated
@@ -423,6 +451,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         mempool,
         webhooks,
         live_cache: Arc::new(peer::LiveCache::default()),
+        stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
     });
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "glyph api listening");

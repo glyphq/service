@@ -94,8 +94,18 @@ struct OracleSubscriptionParams {
 }
 
 async fn overview(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let cache_key = "network:overview";
+    if let Some(value) = state.live_cache.get(cache_key, Duration::from_secs(2)) {
+        return Ok((
+            [(header::CACHE_CONTROL, RECENT)],
+            Json(json!({
+                "data": value,
+                "meta": { "source": "index+peer", "cached": true }
+            })),
+        ));
+    }
     let (indexed, head, system) = tokio::join!(
-        state.store.network_stats(),
+        state.network_stats(),
         state.store.head(),
         peer::request("peer system info", PEER_TIMEOUT, state.pool.system_info()),
     );
@@ -142,6 +152,7 @@ async fn overview(State(state): State<AppState>) -> Result<impl IntoResponse, Ap
             "network_tick": system.as_ref().map(|info| info.tick),
         },
     });
+    state.live_cache.put(cache_key, data.clone());
     Ok((
         [(header::CACHE_CONTROL, RECENT)],
         Json(json!({
@@ -155,7 +166,7 @@ async fn overview(State(state): State<AppState>) -> Result<impl IntoResponse, Ap
 }
 
 async fn indexed(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
-    let stats = state.store.network_stats().await?;
+    let stats = state.network_stats().await?;
     Ok((
         [(header::CACHE_CONTROL, RECENT)],
         Json(json!({
