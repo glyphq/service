@@ -1868,8 +1868,14 @@ policy. Epoch, identity, identity history, and asset reads use:
 Cache-Control: public, max-age=30, stale-while-revalidate=60
 ```
 
-Status and error responses use `no-store`. Health, search, and OpenAPI do not
-set an explicit policy. There is no ETag or conditional request handling in the
+Status uses a one-second policy:
+
+```text
+Cache-Control: public, max-age=1, stale-while-revalidate=2
+```
+
+Error responses use `no-store`. Health, search, and OpenAPI do not set an
+explicit policy. There is no ETag or conditional request handling in the
 current surface.
 
 ## Middleware

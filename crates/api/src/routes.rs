@@ -274,6 +274,16 @@ async fn healthz() -> Json<Value> {
 }
 
 async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let cache_key = "status:body";
+    if let Some(value) = state.live_cache.get(cache_key, Duration::from_secs(1)) {
+        return Ok((
+            [(
+                header::CACHE_CONTROL,
+                "public, max-age=1, stale-while-revalidate=2",
+            )],
+            Json(value),
+        ));
+    }
     let (head, earliest, network) = tokio::join!(
         state.store.head(),
         state.store.earliest_tick(),
@@ -318,41 +328,46 @@ async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiE
         earliest,
         last_indexed,
     );
-    Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        Json(json!({
-            "data": {
-                "head": head,
-                "ingest": stats.get("ingest").cloned().unwrap_or(Value::Null),
-                "ingest_status": {
-                    "last_indexed_tick": last_indexed,
-                    "indexed_ticks": indexed_ticks,
-                    "ticks_per_second": rates.ingest,
-                    "lag_ticks": lag_ticks,
-                    "eta_seconds": eta_seconds,
-                },
-                "network": {
-                    "reachable": network.is_some(),
-                    "head": network_head,
-                    "epoch": network.as_ref().map(|head| head.epoch),
-                    "initial_tick": network.as_ref().map(|head| head.initial_tick),
-                    "tick_duration": network.as_ref().map(|head| head.tick_duration),
-                    "ticks_per_second": rates.network,
-                    "error": network_error,
-                },
-                "backfill": backfill,
-                "stats": stats,
+    let body = json!({
+        "data": {
+            "head": head,
+            "ingest": stats.get("ingest").cloned().unwrap_or(Value::Null),
+            "ingest_status": {
+                "last_indexed_tick": last_indexed,
+                "indexed_ticks": indexed_ticks,
+                "ticks_per_second": rates.ingest,
+                "lag_ticks": lag_ticks,
+                "eta_seconds": eta_seconds,
             },
-            "meta": {
-                "source": "direct-qubic-peers",
-                "version": env!("CARGO_PKG_VERSION"),
-                "uptime_seconds": state.uptime_seconds(),
-                "streaming": state.hub.is_some(),
-                "broadcast": state.allow_broadcast,
-                "archive": state.archive.is_some(),
-                "peers_configured": state.peers.len(),
-            }
-        })),
+            "network": {
+                "reachable": network.is_some(),
+                "head": network_head,
+                "epoch": network.as_ref().map(|head| head.epoch),
+                "initial_tick": network.as_ref().map(|head| head.initial_tick),
+                "tick_duration": network.as_ref().map(|head| head.tick_duration),
+                "ticks_per_second": rates.network,
+                "error": network_error,
+            },
+            "backfill": backfill,
+            "stats": stats,
+        },
+        "meta": {
+            "source": "direct-qubic-peers",
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime_seconds": state.uptime_seconds(),
+            "streaming": state.hub.is_some(),
+            "broadcast": state.allow_broadcast,
+            "archive": state.archive.is_some(),
+            "peers_configured": state.peers.len(),
+        }
+    });
+    state.live_cache.put(cache_key, body.clone());
+    Ok((
+        [(
+            header::CACHE_CONTROL,
+            "public, max-age=1, stale-while-revalidate=2",
+        )],
+        Json(body),
     ))
 }
 
