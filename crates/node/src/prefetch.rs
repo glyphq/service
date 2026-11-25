@@ -154,11 +154,16 @@ impl Peer {
         let mut parts = (0..ticks.len()).map(|_| None).collect::<Vec<_>>();
         let mut results = (0..ticks.len()).map(|_| None).collect::<Vec<_>>();
         let mut missing = Vec::new();
+        let mut missing_votes = Vec::new();
+        let fallback = fallback.cloned();
         for (index, mut state) in states.into_iter().enumerate() {
             match state.error.take() {
                 Some(error) => results[index] = Some(Err(error)),
                 None => match decode_main_parts(state) {
                     Ok(mut part) => {
+                        if part.votes.is_empty() {
+                            missing_votes.push((index, part.tick));
+                        }
                         if part.tick_data.is_none() {
                             if part.votes.iter().any(|vote| !vote.is_empty_vote())
                                 || part.votes.is_empty()
@@ -194,7 +199,6 @@ impl Peer {
                 },
                 None => None,
             };
-            let fallback = fallback.cloned();
             let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
             let mut tasks = tokio::task::JoinSet::new();
             for (index, tick) in missing {
@@ -256,6 +260,41 @@ impl Peer {
                     }
                     Err(error) => {
                         tracing::warn!(%error, "tick-data fallback task failed");
+                    }
+                }
+            }
+        }
+
+        if !missing_votes.is_empty() {
+            if let Some(fallback) = fallback.as_ref() {
+                let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+                let mut tasks = tokio::task::JoinSet::new();
+                for (index, tick) in missing_votes {
+                    let fallback = fallback.clone();
+                    let semaphore = semaphore.clone();
+                    tasks.spawn(async move {
+                        let _permit = semaphore
+                            .acquire()
+                            .await
+                            .expect("vote semaphore is never closed");
+                        (index, tick, fallback.votes(tick).await)
+                    });
+                }
+                while let Some(joined) = tasks.join_next().await {
+                    match joined {
+                        Ok((index, _tick, Ok(votes))) => {
+                            if let Some(part) = parts[index].as_mut() {
+                                part.votes = votes;
+                            }
+                        }
+                        Ok((index, _tick, Err(error))) => {
+                            if results[index].is_none() {
+                                results[index] = Some(Err(error));
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "vote fallback task failed");
+                        }
                     }
                 }
             }

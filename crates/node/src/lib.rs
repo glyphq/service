@@ -2124,6 +2124,71 @@ impl NodePool {
         Err(last_error.unwrap_or(Error::NoPeers))
     }
 
+    /// Requests quorum votes from every configured peer in parallel and
+    /// returns the largest set. A batch can miss votes from one peer even when
+    /// another peer has the full quorum.
+    pub async fn votes(&self, tick: u32) -> Result<Vec<Tick>> {
+        let mut candidates = self.manager.attempt_order(&self.peers);
+        for config in &self.peers {
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.addr == config.addr)
+            {
+                candidates.push(config.clone());
+            }
+        }
+        if candidates.is_empty() {
+            return Err(Error::NoPeers);
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for config in candidates {
+            tasks.spawn(async move {
+                let started = std::time::Instant::now();
+                let addr = config.addr;
+                let mut peer = match Peer::connect(config).await {
+                    Ok(peer) => peer,
+                    Err(error) => return Err((error, addr)),
+                };
+                match peer.votes(tick, &[false; COMPUTOR_COUNT]).await {
+                    Ok(votes) => Ok((votes, addr, started.elapsed())),
+                    Err(error) => Err((error, addr)),
+                }
+            });
+        }
+        let mut best = Vec::new();
+        let mut last_error = None;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok((votes, addr, latency))) => {
+                    self.manager.record_success(addr, latency);
+                    if unique_votes(&votes) > unique_votes(&best) {
+                        best = votes;
+                    }
+                }
+                Ok(Err((error, addr))) => {
+                    if matches!(
+                        error,
+                        Error::Io(_)
+                            | Error::Wire(_)
+                            | Error::Timeout(_)
+                            | Error::RetriesExhausted { .. }
+                            | Error::TryAgain(_)
+                            | Error::UnexpectedPacket { .. }
+                    ) {
+                        self.manager.record_failure(addr);
+                    }
+                    last_error = Some(error);
+                }
+                Err(_) => last_error = Some(Error::NoPeers),
+            }
+        }
+        if best.is_empty() {
+            Err(last_error.unwrap_or(Error::NoPeers))
+        } else {
+            Ok(best)
+        }
+    }
+
     /// Reserve the least-loaded candidate while holding the load lock, so
     /// simultaneous workers cannot all pick the same peer.
     fn reserve_least_loaded(&self, candidates: &[PeerConfig]) -> Option<(PeerConfig, usize)> {
@@ -2481,6 +2546,16 @@ impl NodePool {
         }
         Err(last_error.unwrap_or(Error::NoPeers))
     }
+}
+
+fn unique_votes(votes: &[Tick]) -> usize {
+    let mut seen = [false; COMPUTOR_COUNT];
+    for vote in votes {
+        if let Some(slot) = seen.get_mut(vote.computor_index as usize) {
+            *slot = true;
+        }
+    }
+    seen.iter().filter(|seen| **seen).count()
 }
 
 /// A peer connection that releases its slot in the pool's per-peer load
