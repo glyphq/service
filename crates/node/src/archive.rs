@@ -5,7 +5,7 @@
 //! full tick data and exposes it over HTTPS, so the indexer can recover those
 //! ticks instead of stalling or skipping them.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -15,6 +15,22 @@ use qubic::messages::{MAX_CONTRACTS, TICK_DATA_SIZE, TX_PER_TICK, TickData};
 use crate::{Error, Result};
 
 const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(5);
+const ARCHIVE_INTERVAL: Duration = Duration::from_millis(100);
+const ARCHIVE_ATTEMPTS: u32 = 4;
+
+/// The public Query API rate-limits a host. Serialize requests across every
+/// peer and worker so a batch of missing ticks does not turn into a burst of
+/// 429 responses.
+struct ArchiveGate {
+    next: tokio::sync::Mutex<Instant>,
+}
+
+fn archive_gate() -> &'static ArchiveGate {
+    static GATE: std::sync::OnceLock<ArchiveGate> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| ArchiveGate {
+        next: tokio::sync::Mutex::new(Instant::now()),
+    })
+}
 
 #[derive(Clone)]
 pub(crate) struct ArchiveClient {
@@ -33,21 +49,54 @@ impl ArchiveClient {
 
     pub(crate) async fn tick_data(&self, tick: u32) -> Result<TickData> {
         let url = format!("{}/getTickData", self.base_url.trim_end_matches('/'));
-        let response = self
-            .client
-            .post(url)
-            .json(&serde_json::json!({ "tickNumber": tick }))
-            .send()
-            .await
-            .map_err(|error| Error::Archive(format!("request tick {tick}: {error}")))?;
-        let response = response
-            .error_for_status()
-            .map_err(|error| Error::Archive(format!("request tick {tick}: {error}")))?;
-        let body = response
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|error| Error::Archive(format!("decode tick {tick}: {error}")))?;
-        parse_tick_data(&body, tick)
+        let mut last_error = None;
+        for attempt in 0..ARCHIVE_ATTEMPTS {
+            {
+                let mut next = archive_gate().next.lock().await;
+                let now = Instant::now();
+                if *next > now {
+                    tokio::time::sleep(*next - now).await;
+                }
+                *next = Instant::now() + ARCHIVE_INTERVAL;
+            }
+            let response = match self
+                .client
+                .post(&url)
+                .json(&serde_json::json!({ "tickNumber": tick }))
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = Some(Error::Archive(format!("request tick {tick}: {error}")));
+                    tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                    continue;
+                }
+            };
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let wait = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| Duration::from_millis(500 * (1 << attempt)));
+                last_error = Some(Error::Archive(format!(
+                    "request tick {tick}: HTTP 429 too many requests"
+                )));
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            let response = response
+                .error_for_status()
+                .map_err(|error| Error::Archive(format!("request tick {tick}: {error}")))?;
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|error| Error::Archive(format!("decode tick {tick}: {error}")))?;
+            return parse_tick_data(&body, tick);
+        }
+        Err(last_error.unwrap_or_else(|| Error::Archive(format!("request tick {tick} failed"))))
     }
 }
 

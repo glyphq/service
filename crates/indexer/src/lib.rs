@@ -1107,6 +1107,30 @@ impl<S: Store + 'static> Indexer<S> {
             return FetchAction::Retry;
         }
 
+        if let Error::Node(node::Error::Archive(_)) = &error {
+            *consecutive_failures += 1;
+            if attempt.saturating_add(1) >= self.config.max_tick_attempts.saturating_mul(5) {
+                tracing::error!(
+                    tick = next,
+                    attempts = attempt.saturating_add(1),
+                    "archive tick data is unavailable, skipping tick"
+                );
+                *consecutive_failures = 0;
+                return FetchAction::SkipTo(next.saturating_add(1));
+            }
+            retry
+                .send(RetryRequest {
+                    start: next,
+                    count: 1,
+                    attempt: attempt.saturating_add(1),
+                    delay: *backoff,
+                })
+                .await
+                .ok();
+            *backoff = (*backoff * 2).min(Duration::from_secs(2));
+            return FetchAction::Retry;
+        }
+
         if let Error::Node(node::Error::Verification(message)) = &error {
             if message.starts_with("unknown epoch boundary") {
                 tracing::warn!(tick = next, %message, "skipping a tick with no known epoch");

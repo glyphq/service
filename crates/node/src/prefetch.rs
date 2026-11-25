@@ -199,17 +199,7 @@ impl Peer {
                                 %error,
                                 "public archive could not supply missing tick data"
                             );
-                            let fallback = parts[index]
-                                .as_ref()
-                                .and_then(|part| empty_tick_from_votes(&part.votes, tick).ok());
-                            if let Some(fallback) = fallback {
-                                if let Some(part) = parts[index].as_mut() {
-                                    part.tick_data = Some(fallback);
-                                }
-                            } else {
-                                results[index] =
-                                    Some(Err(Error::EndResponse(MessageType::RequestTickData)));
-                            }
+                            results[index] = Some(Err(Error::Archive(error.to_string())));
                         }
                         Err(error) => {
                             tracing::warn!(%error, "archive tick-data task failed");
@@ -221,6 +211,9 @@ impl Peer {
 
         let mut decoded = (0..ticks.len()).map(|_| None).collect::<Vec<_>>();
         for (index, part) in parts.into_iter().enumerate() {
+            if results[index].is_some() {
+                continue;
+            }
             let Some(part) = part else {
                 continue;
             };
