@@ -84,6 +84,8 @@ struct PeerState {
     ewma_ms: Option<f64>,
     fetch_ms_per_tick: Option<f64>,
     log_failures: u32,
+    head_epoch: Option<u16>,
+    head_tick: Option<u32>,
     last_latency: Option<Duration>,
     last_attempt: Option<tokio::time::Instant>,
     quarantined_until: Option<tokio::time::Instant>,
@@ -191,6 +193,32 @@ impl PeerManager {
         entry.last_attempt = Some(now);
     }
 
+    /// Records the head a peer reported. Peers behind the best observed head
+    /// are stale and rank below the live set.
+    pub fn record_head(&self, addr: SocketAddr, epoch: u16, tick: u32) {
+        let mut state = self.state.lock().expect("peer health mutex poisoned");
+        let entry = state.entry(addr).or_default();
+        match (entry.head_epoch, entry.head_tick) {
+            (Some(existing_epoch), Some(existing_tick))
+                if existing_epoch > epoch || (existing_epoch == epoch && existing_tick >= tick) => {
+            }
+            _ => {
+                entry.head_epoch = Some(epoch);
+                entry.head_tick = Some(tick);
+            }
+        }
+    }
+
+    pub fn head_tick(&self, addr: SocketAddr) -> Option<u32> {
+        let state = self.state.lock().expect("peer health mutex poisoned");
+        state.get(&addr).and_then(|entry| entry.head_tick)
+    }
+
+    pub fn best_head(&self) -> Option<u32> {
+        let state = self.state.lock().expect("peer health mutex poisoned");
+        state.values().filter_map(|entry| entry.head_tick).max()
+    }
+
     /// Penalizes a peer that cannot supply complete log data. The main tick
     /// streams stay usable, but workers should prefer peers that can finish a
     /// bundle without a per-tick retry.
@@ -237,6 +265,7 @@ impl PeerManager {
     pub fn attempt_order(&self, peers: &[PeerConfig]) -> Vec<PeerConfig> {
         let now = tokio::time::Instant::now();
         let state = self.state.lock().expect("peer health mutex poisoned");
+        let best_head = state.values().filter_map(|entry| entry.head_tick).max();
         let mut scored: Vec<(f64, PeerConfig)> = peers
             .iter()
             .filter(|config| {
@@ -246,10 +275,17 @@ impl PeerManager {
                     .is_none_or(|until| until <= now)
             })
             .map(|config| {
-                let score = state
+                let mut score = state
                     .get(&config.addr)
                     .map(|entry| self.score_at(entry, now))
                     .unwrap_or(self.policy.unknown_latency.as_secs_f64() * 1_000.0);
+                if let Some(best) = best_head {
+                    let head = state.get(&config.addr).and_then(|entry| entry.head_tick);
+                    score += match head {
+                        Some(head) => best.saturating_sub(head) as f64 * 20.0,
+                        None => 100_000.0,
+                    };
+                }
                 (score, config.clone())
             })
             .collect();
@@ -501,6 +537,19 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn stale_peer_ranks_behind_live_peer() {
+        let manager = PeerManager::new(fast_policy());
+        let stale = config(1);
+        let live = config(2);
+        manager.record_success(stale.addr, Duration::from_millis(1));
+        manager.record_success(live.addr, Duration::from_millis(1));
+        manager.record_head(stale.addr, 241, 1_000);
+        manager.record_head(live.addr, 241, 5_000);
+        let order = manager.attempt_order(&[stale, live.clone()]);
+        assert_eq!(order[0].addr, live.addr);
     }
 
     #[test]

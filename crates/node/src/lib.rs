@@ -1936,6 +1936,32 @@ impl NodePool {
         self.manager.record_fetch(addr, ticks, elapsed);
     }
 
+    pub fn record_head(&self, addr: SocketAddr, epoch: u16, tick: u32) {
+        self.manager.record_head(addr, epoch, tick);
+    }
+
+    /// Drops configured peers that are more than `max_lag` ticks behind the
+    /// best observed head. Peers whose head is unknown are kept for the first
+    /// probe, then filtered on the next call.
+    pub fn retain_fresh_peers(&mut self, max_lag: u32) {
+        let Some(best) = self.manager.best_head() else {
+            return;
+        };
+        let fresh = self
+            .peers
+            .iter()
+            .filter(|config| {
+                self.manager
+                    .head_tick(config.addr)
+                    .is_none_or(|tick| best.saturating_sub(tick) <= max_lag)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if !fresh.is_empty() {
+            self.peers = fresh;
+        }
+    }
+
     /// Connect to the best healthy peer with a free connection slot and hold a
     /// connection lease.
     ///

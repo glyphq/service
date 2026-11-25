@@ -551,10 +551,10 @@ impl<S: Store + 'static> Indexer<S> {
             peer.retries = 0;
         }
         let pool = NodePool::new(config.peers.clone()).with_connection_limit(env_usize(
-            "INDEXER_CONNECTIONS_PER_PEER",
-            2,
+            "INDEXER_PEER_CONNECTIONS",
+            8,
             1,
-            16,
+            32,
         ));
         Ok(Self {
             store,
@@ -578,6 +578,7 @@ impl<S: Store + 'static> Indexer<S> {
         let mut peer = self.pool.connect_best().await?;
         let mut head = peer.head().await?;
         let mut current = peer.config().addr;
+        self.pool.record_head(current, head.epoch, head.tick);
         let mut probes = tokio::task::JoinSet::new();
         for config in self.config.peers.clone() {
             if config.addr == current {
@@ -593,6 +594,11 @@ impl<S: Store + 'static> Indexer<S> {
             let Ok(Some((candidate, candidate_head))) = joined else {
                 continue;
             };
+            self.pool.record_head(
+                candidate.config().addr,
+                candidate_head.epoch,
+                candidate_head.tick,
+            );
             let newer = candidate_head.epoch > head.epoch
                 || (candidate_head.epoch == head.epoch && candidate_head.tick > head.tick);
             if newer {
@@ -608,6 +614,12 @@ impl<S: Store + 'static> Indexer<S> {
                 head = candidate_head;
             }
         }
+        self.pool
+            .retain_fresh_peers(env_usize("INDEXER_MAX_PEER_LAG", 2_048, 1, 1_000_000) as u32);
+        tracing::info!(
+            peers = self.pool.peer_configs().len(),
+            "fresh peer set selected"
+        );
         let mut next = self.next_tick(&head).await?;
         let tuning = PipelineTuning::from_env();
 
