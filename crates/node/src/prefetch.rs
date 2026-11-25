@@ -82,6 +82,7 @@ impl Peer {
         if ticks.is_empty() {
             return Ok(Vec::new());
         }
+        let fetch_started = Instant::now();
         if ticks.len() > MAX_PREFETCH_TICKS {
             return Err(Error::InvalidRequest(format!(
                 "prefetch batch has {} ticks, maximum is {MAX_PREFETCH_TICKS}",
@@ -170,6 +171,16 @@ impl Peer {
                     Ok(part) => {
                         if part.votes.is_empty() {
                             missing_votes.push((index, part.tick));
+                        }
+                        let mut part = part;
+                        if part.tick_data.is_none() {
+                            // A full aligned group of empty votes is already a
+                            // proof that this tick has no tick data. Asking
+                            // every peer again turns an empty-tick run into a
+                            // serial timeout stall.
+                            if let Ok(data) = empty_tick_from_votes(&part.votes, part.tick) {
+                                part.tick_data = Some(data);
+                            }
                         }
                         if part.tick_data.is_none() {
                             missing.push((index, part.tick));
@@ -311,7 +322,9 @@ impl Peer {
             }
         }
 
+        let main_elapsed = fetch_started.elapsed();
         let mut log_fetches = self.prefetch_logs(&decoded).await;
+        let log_elapsed = fetch_started.elapsed().saturating_sub(main_elapsed);
         let incomplete = (0..decoded.len())
             .filter(|index| decoded[*index].is_some() && !log_fetches[*index].complete)
             .collect::<Vec<_>>();
@@ -389,6 +402,26 @@ impl Peer {
             }));
         }
 
+        let total_elapsed = fetch_started.elapsed();
+        if total_elapsed >= Duration::from_secs(3) {
+            tracing::warn!(
+                peer = %self.config.addr,
+                requested = ticks.len(),
+                main_ms = main_elapsed.as_millis() as u64,
+                logs_ms = log_elapsed.as_millis() as u64,
+                total_ms = total_elapsed.as_millis() as u64,
+                "slow tick fetch"
+            );
+        } else {
+            tracing::debug!(
+                peer = %self.config.addr,
+                requested = ticks.len(),
+                main_ms = main_elapsed.as_millis() as u64,
+                logs_ms = log_elapsed.as_millis() as u64,
+                total_ms = total_elapsed.as_millis() as u64,
+                "tick fetch"
+            );
+        }
         Ok(results
             .into_iter()
             .map(|result| {

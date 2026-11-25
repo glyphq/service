@@ -226,6 +226,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Logs { tick, peer } => {
             let mut connection = node::Peer::connect(PeerConfig::new(peer)).await?;
             let tick_data = connection.tick_data(tick).await?;
+            let protocol = connection
+                .log_protocol_name(&tick_data)
+                .await
+                .unwrap_or("unavailable");
             let fetched = connection.complete_logs(&tick_data).await?;
             let slots = fetched
                 .ranges
@@ -247,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "tick": tick,
                     "peer": peer.to_string(),
+                    "protocol": protocol,
                     "complete": fetched.complete,
                     "ranges_count": fetched.ranges.count(),
                     "logs": fetched.logs.len(),
@@ -612,6 +617,11 @@ impl indexer::BatchSink for NatsSink {
 }
 
 fn archive_from_env() -> anyhow::Result<Option<SharedArchive>> {
+    if std::env::var("ARCHIVE_ENABLED")
+        .is_ok_and(|value| matches!(value.as_str(), "0" | "false" | "no" | "off"))
+    {
+        return Ok(None);
+    }
     if let Some(s3) = S3Archive::from_env().context("configure S3 raw archive")? {
         return Ok(Some(Arc::new(s3)));
     }

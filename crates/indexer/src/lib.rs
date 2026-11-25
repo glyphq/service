@@ -206,6 +206,7 @@ struct PipelineTuning {
     write_batch: usize,
     write_flush: Duration,
     archive_concurrency: usize,
+    archive_queue: usize,
     verify_concurrency: usize,
 }
 
@@ -236,6 +237,7 @@ impl PipelineTuning {
                 env_usize("INDEXER_WRITE_FLUSH_MS", 250, 10, 10_000) as u64,
             ),
             archive_concurrency: env_usize("INDEXER_ARCHIVE_CONCURRENCY", 16, 1, 64),
+            archive_queue: env_usize("INDEXER_ARCHIVE_QUEUE", 4096, 1, 65_536),
             // Leave one core for the writer, ClickHouse client, and API.
             verify_concurrency: env_usize(
                 "INDEXER_VERIFY_CONCURRENCY",
@@ -306,6 +308,7 @@ struct FetchResult {
     attempt: u32,
     outcomes: Vec<TickOutcome>,
     batch_error: Option<Error>,
+    peer: Option<std::net::SocketAddr>,
 }
 
 struct RetryRequest {
@@ -787,6 +790,45 @@ impl<S: Store + 'static> Indexer<S> {
             .archive
             .as_ref()
             .map(|_| Arc::new(tokio::sync::Semaphore::new(tuning.archive_concurrency)));
+        let (archive_tx, archive_workers) = match self.config.archive.clone() {
+            Some(archive) if !self.config.archive_fail_closed => {
+                let (tx, rx) = mpsc::channel::<archive::RawBundle>(tuning.archive_queue);
+                let rx = Arc::new(AsyncMutex::new(rx));
+                let mut workers = Vec::with_capacity(tuning.archive_concurrency);
+                for _ in 0..tuning.archive_concurrency {
+                    let archive = archive.clone();
+                    let rx = rx.clone();
+                    workers.push(tokio::spawn(async move {
+                        loop {
+                            let raw = {
+                                let mut receiver = rx.lock().await;
+                                receiver.recv().await
+                            };
+                            let Some(raw) = raw else {
+                                break;
+                            };
+                            let tick = raw.tick;
+                            let epoch = raw.epoch;
+                            let started = Instant::now();
+                            let result = archive::put_bundle(archive.as_ref(), &raw).await;
+                            if let Err(error) = result {
+                                tracing::warn!(tick, epoch, %error, "raw archive failed");
+                            } else {
+                                tracing::debug!(
+                                    tick,
+                                    epoch,
+                                    elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                                    "raw bundle archived"
+                                );
+                            }
+                        }
+                    }));
+                }
+                (Some(tx), workers)
+            }
+            _ => (None, Vec::new()),
+        };
+        let mut archive_dropped = 0u64;
         let mut stored_epochs = HashSet::new();
         let mut last_flush = Instant::now();
         let mut run_result = Ok(());
@@ -824,6 +866,7 @@ impl<S: Store + 'static> Indexer<S> {
                     tracing::warn!(
                         start = result.start,
                         count = result.count,
+                        peer = ?result.peer,
                         %error,
                         "batch fetch failed; retrying"
                     );
@@ -883,7 +926,28 @@ impl<S: Store + 'static> Indexer<S> {
                     let verified = fetched;
 
                     let mut archives = Vec::new();
-                    if let (Some(archive), Some(semaphore)) =
+                    if let Some(archive_tx) = archive_tx.as_ref() {
+                        let raw = archive_policy::raw_bundle(&verified, &self.archive_policy);
+                        match archive_tx.try_send(raw) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(raw)) => {
+                                archive_dropped = archive_dropped.saturating_add(1);
+                                if archive_dropped % 1_000 == 1 {
+                                    tracing::warn!(
+                                        tick = raw.tick,
+                                        dropped = archive_dropped,
+                                        "raw archive queue is full; dropping bundles"
+                                    );
+                                }
+                            }
+                            Err(mpsc::error::TrySendError::Closed(raw)) => {
+                                tracing::warn!(
+                                    tick = raw.tick,
+                                    "raw archive workers stopped; dropping bundle"
+                                );
+                            }
+                        }
+                    } else if let (Some(archive), Some(semaphore)) =
                         (self.config.archive.clone(), archive_semaphore.clone())
                     {
                         let tick = verified.tick.tick;
@@ -1108,6 +1172,10 @@ impl<S: Store + 'static> Indexer<S> {
             }
         }
 
+        drop(archive_tx);
+        for worker in archive_workers {
+            let _ = worker.await;
+        }
         pipeline_cancel.cancel();
         drop(result_rx);
         drop(retry_tx);
@@ -2453,6 +2521,7 @@ async fn fetch_worker(
             }
         };
         let started = Instant::now();
+        let fetch_peer = peer.as_ref().map(|peer| peer.addr());
         let head_snapshot = head.read().await.clone();
         let ticks = (item.start..item.start.saturating_add(item.count)).collect::<Vec<_>>();
         let known = boundaries.read().await.clone();
@@ -2603,6 +2672,7 @@ async fn fetch_worker(
                     attempt: item.attempt,
                     outcomes: Vec::new(),
                     batch_error: Some(error),
+                    peer: fetch_peer,
                 })
                 .await
                 .is_err()
@@ -2641,6 +2711,7 @@ async fn fetch_worker(
                 attempt: item.attempt,
                 outcomes,
                 batch_error: None,
+                peer: fetch_peer,
             })
             .await
             .is_err()

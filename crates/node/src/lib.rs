@@ -1254,6 +1254,15 @@ impl Peer {
         }
     }
 
+    /// Operator-facing name for the log protocol this connection negotiated.
+    pub async fn log_protocol_name(&mut self, tick_data: &TickData) -> Result<&'static str> {
+        Ok(match self.log_protocol(tick_data).await? {
+            LogProtocol::AllRanges => "all-ranges",
+            LogProtocol::TxRanges => "tx-ranges",
+            LogProtocol::NoLogging => "none",
+        })
+    }
+
     /// Requests one slot's log range with `RequestLogIdRangeFromTx`.
     ///
     /// `EndResponse` is deliberately propagated: it means the peer does not
@@ -1864,7 +1873,12 @@ pub struct NodePool {
 
 impl NodePool {
     pub fn new(peers: Vec<PeerConfig>) -> Self {
-        Self::with_policy(peers, PeerPolicy::default())
+        let connections = std::env::var("INDEXER_PEER_CONNECTIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 32);
+        Self::with_policy(peers, PeerPolicy::default()).with_connection_limit(connections)
     }
 
     /// Builds a pool with explicit health policy, primarily for tests and

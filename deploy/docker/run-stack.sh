@@ -53,7 +53,7 @@ s3_password="${S3_SECRET_KEY:-glyph-dev-secret}"
 s3_bucket="${S3_BUCKET:-glyph-archive}"
 s3_config="$repo_root/.data/seaweedfs/s3.json"
 nats_url="${NATS_URL:-nats://glyph-nats:4222}"
-log_opts=(--log-opt max-size=10m --log-opt max-file=3)
+log_opts=(--log-opt max-size=50m --log-opt max-file=20)
 
 app_env=(
   -e "CLICKHOUSE_URL=$clickhouse_url"
@@ -238,6 +238,10 @@ EOF
     -e "INDEXER_FETCH_BATCH=${INDEXER_FETCH_BATCH:-32}" \
     -e "INDEXER_FETCH_BATCH_INITIAL=${INDEXER_FETCH_BATCH_INITIAL:-4}" \
     -e "INDEXER_BATCH_MIN_LAG=${INDEXER_BATCH_MIN_LAG:-2}" \
+    -e "INDEXER_PEER_CONNECTIONS=${INDEXER_PEER_CONNECTIONS:-8}" \
+    -e "INDEXER_ARCHIVE_CONCURRENCY=${INDEXER_ARCHIVE_CONCURRENCY:-8}" \
+    -e "INDEXER_ARCHIVE_QUEUE=${INDEXER_ARCHIVE_QUEUE:-4096}" \
+    -e "ARCHIVE_ENABLED=${ARCHIVE_ENABLED:-false}" \
     -e "INDEXER_VERIFY_CONCURRENCY=${INDEXER_VERIFY_CONCURRENCY:-3}" \
     -e "INDEXER_WRITE_BATCH=${INDEXER_WRITE_BATCH:-32}" \
     -e "INDEXER_WRITE_FLUSH_MS=${INDEXER_WRITE_FLUSH_MS:-100}" \
