@@ -27,6 +27,7 @@ use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
 pub mod health;
+mod prefetch;
 
 /// Capability is a property of the peer, not of one TCP connection. Fetch
 /// workers open short-lived connections, so cache the answer per address to
@@ -1569,13 +1570,7 @@ impl Peer {
     /// the whole set instead of paying one round trip per slot.
     async fn log_ranges_fallback(&mut self, tick: u32, tick_data: &TickData) -> Result<LogRanges> {
         let mut ranges = empty_log_ranges();
-        let mut indices: Vec<usize> = tick_data
-            .non_empty_transactions()
-            .map(|(index, _)| index)
-            .collect();
-        indices.extend(TX_PER_TICK..LOG_TX_PER_TICK);
-        indices.sort_unstable();
-        indices.dedup();
+        let indices = log_probe_indices(tick_data);
 
         let answered = self
             .request_log_range_batch(tick, &indices, self.config.log_fallback_probe_timeout)
@@ -2508,6 +2503,19 @@ fn empty_log_ranges() -> LogRanges {
     }
 }
 
+/// Every transaction slot that can own a log range for this tick: the
+/// non-empty transaction slots plus the protocol's special-event slots.
+fn log_probe_indices(tick_data: &TickData) -> Vec<usize> {
+    let mut indices: Vec<usize> = tick_data
+        .non_empty_transactions()
+        .map(|(index, _)| index)
+        .collect();
+    indices.extend(TX_PER_TICK..LOG_TX_PER_TICK);
+    indices.sort_unstable();
+    indices.dedup();
+    indices
+}
+
 /// Node-local helper for `RequestLogIdRangeFromTx` (type 48), which the codec
 /// crate does not expose.
 fn request_log_id_range_from_tx(tick: u32, tx_id: u32, passcode: [u64; 4]) -> Vec<u8> {
@@ -2778,23 +2786,25 @@ mod tests {
                     .await;
                 }
                 MessageType::RequestQuorumTick => {
+                    let requested = u32::from_le_bytes(payload[..4].try_into().unwrap());
                     for index in [7u16, 9] {
                         send(
                             &mut stream,
                             MessageType::BroadcastTick,
                             dejavu,
-                            tick(index, TICK).encode().to_vec(),
+                            tick(index, requested).encode().to_vec(),
                         )
                         .await;
                     }
                     send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
                 }
                 MessageType::RequestTickTransactions => {
+                    let requested = u32::from_le_bytes(payload[..4].try_into().unwrap());
                     let transaction = Transaction {
                         source: [1; 32],
                         destination: [2; 32],
                         amount: 123,
-                        tick: TICK,
+                        tick: requested,
                         input_type: 0,
                         input: Vec::new(),
                         signature: [3; 64],
@@ -3446,6 +3456,36 @@ mod tests {
                 .collect::<Vec<_>>(),
             [5, 6]
         );
+    }
+
+    #[tokio::test]
+    async fn prefetch_bundles_pipelines_ticks_and_logs() {
+        let mut peer = peer_and_server().await;
+        let head = peer.head().await.unwrap();
+        let computors = peer.computors().await.unwrap();
+        let bundles = peer
+            .prefetch_bundles(&[TICK, TICK + 1], head, computors)
+            .await
+            .unwrap();
+
+        assert_eq!(bundles.len(), 2);
+        for (offset, bundle) in bundles.into_iter().enumerate() {
+            let bundle = bundle.unwrap();
+            assert_eq!(bundle.tick.tick, TICK + offset as u32);
+            assert_eq!(bundle.tick_data.tick, TICK + offset as u32);
+            assert_eq!(bundle.votes.len(), 2);
+            assert_eq!(bundle.transactions.len(), 1);
+            assert_eq!(bundle.transactions[0].tick, TICK + offset as u32);
+            assert_eq!(bundle.log_ranges.range(), Some((5, 6)));
+            assert_eq!(
+                bundle
+                    .logs
+                    .iter()
+                    .map(|event| event.log_id)
+                    .collect::<Vec<_>>(),
+                [5, 6]
+            );
+        }
     }
 
     #[test]

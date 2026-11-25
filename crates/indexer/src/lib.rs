@@ -179,6 +179,8 @@ fn transaction_hashes(verified: &VerifiedTick) -> HashMap<u16, String> {
 struct PipelineTuning {
     fetch_concurrency: usize,
     fetch_window: usize,
+    fetch_batch: usize,
+    batch_min_lag: usize,
     write_batch: usize,
     write_flush: Duration,
     archive_concurrency: usize,
@@ -204,6 +206,8 @@ impl PipelineTuning {
             // flight or buffered by the ordered writer.
             fetch_concurrency: env_usize("INDEXER_FETCH_CONCURRENCY", 32, 1, 128),
             fetch_window: env_usize("INDEXER_FETCH_WINDOW", 512, 1, 8192),
+            fetch_batch: env_usize("INDEXER_FETCH_BATCH", 32, 1, 256),
+            batch_min_lag: env_usize("INDEXER_BATCH_MIN_LAG", 64, 1, 100_000),
             write_batch: env_usize("INDEXER_WRITE_BATCH", 128, 1, 4096),
             write_flush: Duration::from_millis(
                 env_usize("INDEXER_WRITE_FLUSH_MS", 250, 10, 10_000) as u64,
@@ -222,18 +226,28 @@ impl PipelineTuning {
 
 #[derive(Debug, Clone, Copy)]
 struct FetchWork {
-    tick: u32,
+    start: u32,
+    count: u32,
     attempt: u32,
 }
 
-struct FetchResult {
+struct TickOutcome {
     tick: u32,
     attempt: u32,
     outcome: Result<VerifiedTick>,
 }
 
+struct FetchResult {
+    start: u32,
+    count: u32,
+    attempt: u32,
+    outcomes: Vec<TickOutcome>,
+    batch_error: Option<Error>,
+}
+
 struct RetryRequest {
-    tick: u32,
+    start: u32,
+    count: u32,
     attempt: u32,
     delay: Duration,
 }
@@ -605,6 +619,8 @@ impl<S: Store + 'static> Indexer<S> {
             retry_rx,
             pipeline_cancel.clone(),
             tuning.fetch_window,
+            tuning.fetch_batch,
+            tuning.batch_min_lag,
         ));
         let verify_semaphore = Arc::new(tokio::sync::Semaphore::new(tuning.verify_concurrency));
 
@@ -671,11 +687,32 @@ impl<S: Store + 'static> Indexer<S> {
                 let Some(result) = result else {
                     break;
                 };
-                if result.tick < consume_next {
-                    pending.fetch_sub(1, Ordering::Release);
-                    continue;
+                if let Some(error) = result.batch_error {
+                    pending.fetch_sub(result.count as usize, Ordering::Release);
+                    tracing::warn!(
+                        start = result.start,
+                        count = result.count,
+                        %error,
+                        "batch fetch failed; retrying"
+                    );
+                    retry_tx
+                        .send(RetryRequest {
+                            start: result.start,
+                            count: result.count,
+                            attempt: result.attempt.saturating_add(1),
+                            delay: Duration::from_millis(250),
+                        })
+                        .await
+                        .ok();
+                    continue 'writer;
                 }
-                buffer.insert(result.tick, result);
+                for tick in result.outcomes {
+                    if tick.tick < consume_next {
+                        pending.fetch_sub(1, Ordering::Release);
+                        continue;
+                    }
+                    buffer.insert(tick.tick, tick);
+                }
 
                 while let Some(result) = buffer.remove_next(consume_next) {
                     pending.fetch_sub(1, Ordering::Release);
@@ -1015,7 +1052,8 @@ impl<S: Store + 'static> Indexer<S> {
             *consecutive_failures = 0;
             retry
                 .send(RetryRequest {
-                    tick: next,
+                    start: next,
+                    count: 1,
                     attempt: attempt.saturating_add(1),
                     delay: self.config.poll_interval,
                 })
@@ -1052,7 +1090,8 @@ impl<S: Store + 'static> Indexer<S> {
             }
             retry
                 .send(RetryRequest {
-                    tick: next,
+                    start: next,
+                    count: 1,
                     attempt: attempt.saturating_add(1),
                     delay: Duration::from_millis(50),
                 })
@@ -1073,7 +1112,8 @@ impl<S: Store + 'static> Indexer<S> {
             *consecutive_failures += 1;
             retry
                 .send(RetryRequest {
-                    tick: next,
+                    start: next,
+                    count: 1,
                     attempt: attempt.saturating_add(1),
                     delay: Duration::ZERO,
                 })
@@ -1086,7 +1126,8 @@ impl<S: Store + 'static> Indexer<S> {
         *consecutive_failures += 1;
         retry
             .send(RetryRequest {
-                tick: next,
+                start: next,
+                count: 1,
                 attempt: attempt.saturating_add(1),
                 delay: *backoff,
             })
@@ -1895,8 +1936,10 @@ async fn dispatch_loop(
     mut retry_rx: mpsc::Receiver<RetryRequest>,
     cancel: CancellationToken,
     window: usize,
+    batch_max: usize,
+    batch_min_lag: usize,
 ) {
-    let mut retries = std::collections::VecDeque::<(Instant, u32, u32)>::new();
+    let mut retries = std::collections::VecDeque::<(Instant, u32, u32, u32)>::new();
     let mut assigned_upto = None;
 
     loop {
@@ -1905,22 +1948,40 @@ async fn dispatch_loop(
         }
         let now = Instant::now();
 
-        if let Some(position) = retries.iter().position(|(at, _, _)| *at <= now) {
-            let (_, tick, attempt) = retries.remove(position).expect("retry entry");
-            if tick < next_write.load(Ordering::Acquire) {
+        if let Some(position) = retries.iter().position(|(at, _, _, _)| *at <= now) {
+            let (_, mut start, mut count, attempt) = retries.remove(position).expect("retry entry");
+            let next = next_write.load(Ordering::Acquire);
+            if start.saturating_add(count) <= next {
                 continue;
             }
-            if rollover
-                .read()
-                .await
-                .is_some_and(|state| state.contains(tick))
-            {
-                continue;
+            if start < next {
+                count = count.saturating_sub(next - start);
+                start = next;
             }
-            if pending.load(Ordering::Acquire) < window {
-                pending.fetch_add(1, Ordering::Release);
-                if work_tx.send(FetchWork { tick, attempt }).await.is_err() {
-                    pending.fetch_sub(1, Ordering::Release);
+            if let Some(state) = *rollover.read().await {
+                if start > state.old_last && start < state.new_initial {
+                    continue;
+                }
+                if start <= state.old_last
+                    && start.saturating_add(count) > state.old_last.saturating_add(1)
+                {
+                    count = state.old_last.saturating_sub(start) + 1;
+                }
+            }
+            let available = window.saturating_sub(pending.load(Ordering::Acquire));
+            let count = count.min(available as u32);
+            if count > 0 {
+                pending.fetch_add(count as usize, Ordering::Release);
+                if work_tx
+                    .send(FetchWork {
+                        start,
+                        count,
+                        attempt,
+                    })
+                    .await
+                    .is_err()
+                {
+                    pending.fetch_sub(count as usize, Ordering::Release);
                     return;
                 }
                 continue;
@@ -1938,7 +1999,8 @@ async fn dispatch_loop(
             Some(upto) => upto.saturating_add(1),
             None => initial,
         };
-        if let Some(state) = *rollover.read().await {
+        let rollover_state = *rollover.read().await;
+        if let Some(state) = rollover_state {
             if state.contains(next_tick) {
                 // The writer drains the old epoch tail, then jumps to the new
                 // initial tick. Do not queue skipped tick numbers.
@@ -1949,19 +2011,39 @@ async fn dispatch_loop(
         if pending.load(Ordering::Acquire) < window {
             if let Some(upper) = dispatch_upper_bound(next_write_tick, head_tick, window) {
                 if next_tick >= next_write_tick && next_tick <= upper {
-                    pending.fetch_add(1, Ordering::Release);
+                    let lag = head_tick.saturating_sub(next_write_tick) as usize;
+                    let desired = if lag >= batch_min_lag { batch_max } else { 1 };
+                    let available = window.saturating_sub(pending.load(Ordering::Acquire));
+                    let mut count = desired
+                        .min(available)
+                        .min((upper.saturating_sub(next_tick) + 1) as usize)
+                        as u32;
+                    // A restart gap can start in the middle of a batch.
+                    if let Some(state) = rollover_state {
+                        if next_tick <= state.old_last
+                            && next_tick.saturating_add(count) > state.old_last.saturating_add(1)
+                        {
+                            count = state.old_last.saturating_sub(next_tick) + 1;
+                        }
+                    }
+                    if count == 0 {
+                        assigned_upto = Some(next_tick);
+                        continue;
+                    }
+                    pending.fetch_add(count as usize, Ordering::Release);
                     if work_tx
                         .send(FetchWork {
-                            tick: next_tick,
+                            start: next_tick,
+                            count,
                             attempt: 0,
                         })
                         .await
                         .is_err()
                     {
-                        pending.fetch_sub(1, Ordering::Release);
+                        pending.fetch_sub(count as usize, Ordering::Release);
                         return;
                     }
-                    assigned_upto = Some(next_tick);
+                    assigned_upto = Some(next_tick.saturating_add(count - 1));
                     continue;
                 }
             }
@@ -1969,7 +2051,7 @@ async fn dispatch_loop(
 
         let wait = retries
             .front()
-            .map(|(at, _, _)| at.saturating_duration_since(now))
+            .map(|(at, _, _, _)| at.saturating_duration_since(now))
             .unwrap_or(Duration::from_millis(50))
             .min(Duration::from_millis(50));
         tokio::select! {
@@ -1978,7 +2060,8 @@ async fn dispatch_loop(
                 if let Some(request) = request {
                     retries.push_back((
                         Instant::now() + request.delay,
-                        request.tick,
+                        request.start,
+                        request.count,
                         request.attempt,
                     ));
                 }
@@ -2023,29 +2106,150 @@ async fn fetch_worker(
                 Err(error) => {
                     tracing::debug!(%error, "no peer available for fetch worker");
                     tokio::time::sleep(Duration::from_millis(100)).await;
+                    if results
+                        .send(FetchResult {
+                            start: item.start,
+                            count: item.count,
+                            attempt: item.attempt,
+                            outcomes: Vec::new(),
+                            batch_error: Some(Error::Node(error)),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
                     continue;
                 }
             }
         }
         let started = Instant::now();
         let head_snapshot = head.read().await.clone();
-        let epoch = {
-            let known = boundaries.read().await;
-            epoch_for_tick(&known, item.tick)
-        };
-        let Some(epoch) = epoch else {
-            tracing::warn!(
-                tick = item.tick,
-                "epoch boundary for tick is unknown; skipping instead of guessing"
-            );
+        let ticks = (item.start..item.start.saturating_add(item.count)).collect::<Vec<_>>();
+        let known = boundaries.read().await.clone();
+        let mut runs = Vec::<BatchRun>::new();
+        let mut outcomes = (0..ticks.len()).map(|_| None).collect::<Vec<_>>();
+        for (position, tick) in ticks.iter().enumerate() {
+            let Some(epoch) = epoch_for_tick(&known, *tick) else {
+                tracing::warn!(
+                    tick,
+                    "epoch boundary for tick is unknown; skipping instead of guessing"
+                );
+                outcomes[position] = Some(Err(Error::Node(node::Error::Verification(format!(
+                    "unknown epoch boundary for tick {tick}"
+                )))));
+                continue;
+            };
+            match runs.last_mut() {
+                Some(run) if run.epoch == epoch => {
+                    run.positions.push(position);
+                    run.ticks.push(*tick);
+                }
+                _ => runs.push(BatchRun {
+                    epoch,
+                    positions: vec![position],
+                    ticks: vec![*tick],
+                }),
+            }
+        }
+
+        let mut peer_failed = false;
+        let mut batch_error: Option<Error> = None;
+        for run in runs {
+            if batch_error.is_some() {
+                break;
+            }
+            if peer_failed {
+                for position in run.positions {
+                    outcomes[position] = Some(Err(Error::Node(node::Error::NoPeers)));
+                }
+                continue;
+            }
+            let cached = computors.read().await.get(&run.epoch).cloned();
+            let Some(cached) = cached else {
+                for position in run.positions {
+                    outcomes[position] =
+                        Some(Err(Error::Node(node::Error::Verification(format!(
+                            "computors for epoch {} are unavailable for tick {}",
+                            run.epoch, run.ticks[0]
+                        )))));
+                }
+                continue;
+            };
+            let fetched = tokio::select! {
+                _ = cancel.cancelled() => return,
+                outcome = peer.as_mut().expect("worker peer").prefetch_bundles(
+                    &run.ticks,
+                    head_snapshot.clone(),
+                    cached,
+                ) => outcome,
+            };
+            let fetched = match fetched {
+                Ok(fetched) => fetched,
+                Err(error) => {
+                    if node_error_is_unusable(&error) {
+                        if let Some(peer) = peer.as_ref() {
+                            pool.record_failure(peer.addr());
+                        }
+                        peer = None;
+                    }
+                    batch_error = Some(Error::Node(error));
+                    break;
+                }
+            };
+            if fetched.len() != run.ticks.len() {
+                batch_error = Some(Error::Verification(format!(
+                    "prefetch returned {} bundles for {} ticks",
+                    fetched.len(),
+                    run.ticks.len()
+                )));
+                break;
+            }
+
+            for (offset, bundle) in fetched.into_iter().enumerate() {
+                let position = run.positions[offset];
+                let outcome = match bundle {
+                    Ok(bundle) => {
+                        match verify_fetched(bundle, verify_signatures, &verify_semaphore, &cancel)
+                            .await
+                        {
+                            Some(outcome) => outcome,
+                            None => return,
+                        }
+                    }
+                    Err(error) => {
+                        if node_error_is_unusable(&error) {
+                            peer_failed = true;
+                        }
+                        Err(Error::Node(error))
+                    }
+                };
+                outcomes[position] = Some(outcome);
+            }
+            if peer_failed {
+                if let Some(peer) = peer.as_ref() {
+                    pool.record_failure(peer.addr());
+                }
+                peer = None;
+            } else if run.positions.iter().any(|position| {
+                outcomes[*position]
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.is_ok())
+            }) {
+                if let Some(peer) = peer.as_ref() {
+                    pool.record_healthy(peer.addr());
+                }
+            }
+        }
+
+        if let Some(error) = batch_error {
             if results
                 .send(FetchResult {
-                    tick: item.tick,
+                    start: item.start,
+                    count: item.count,
                     attempt: item.attempt,
-                    outcome: Err(Error::Node(node::Error::Verification(format!(
-                        "unknown epoch boundary for tick {}",
-                        item.tick
-                    )))),
+                    outcomes: Vec::new(),
+                    batch_error: Some(error),
                 })
                 .await
                 .is_err()
@@ -2053,73 +2257,37 @@ async fn fetch_worker(
                 return;
             }
             continue;
-        };
-        let cached = computors.read().await.get(&epoch).cloned();
-        let fetched = if let Some(computors) = cached {
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                outcome = peer.as_mut().expect("worker peer").bundle_with(
-                    item.tick,
-                    head_snapshot,
-                    computors,
-                ) => outcome,
-            }
-        } else {
-            Err(node::Error::Verification(format!(
-                "computors for epoch {epoch} are unavailable for tick {}",
-                item.tick
-            )))
-        };
-        let verify_started = Instant::now();
-        let outcome = match fetched {
-            Ok(bundle) if verify_signatures => {
-                let permit = tokio::select! {
-                    _ = cancel.cancelled() => return,
-                    permit = verify_semaphore.acquire() => match permit {
-                        Ok(permit) => permit,
-                        Err(_) => return,
-                    },
-                };
-                let result =
-                    tokio::task::spawn_blocking(move || verify_bundle_sequential(bundle, true))
-                        .await;
-                drop(permit);
-                match result {
-                    Ok(result) => result,
-                    Err(error) => Err(Error::Verification(format!(
-                        "verification task failed: {error}"
-                    ))),
-                }
-            }
-            Ok(bundle) => verify_bundle_sequential(bundle, false),
-            Err(error) => Err(Error::Node(error)),
-        };
-        tracing::debug!(
-            tick = item.tick,
-            epoch,
-            attempt = item.attempt,
-            ok = outcome.is_ok(),
-            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
-            verify_ms = verify_started.elapsed().as_secs_f64() * 1_000.0,
-            "tick fetched and verified"
-        );
-
-        let peer_addr = peer.as_ref().expect("worker peer").addr();
-        if outcome.is_ok() {
-            pool.record_healthy(peer_addr);
-        } else if peer_is_unusable(&outcome) {
-            pool.record_failure(peer_addr);
-            // Drop the connection now. A peer that is behind the requested
-            // tick, has already pruned it, or is busy must not keep receiving
-            // retries for the same tick while a healthy peer can serve it.
-            // The next work item connects to the best peer instead.
-            peer = None;
         }
+        let outcomes = outcomes
+            .into_iter()
+            .enumerate()
+            .map(|(position, outcome)| TickOutcome {
+                tick: item.start.saturating_add(position as u32),
+                attempt: item.attempt,
+                outcome: outcome.unwrap_or_else(|| {
+                    Err(Error::Verification(
+                        "batch fetch produced no result for a tick".into(),
+                    ))
+                }),
+            })
+            .collect::<Vec<_>>();
+        tracing::debug!(
+            start = item.start,
+            count = item.count,
+            ok = outcomes
+                .iter()
+                .filter(|outcome| outcome.outcome.is_ok())
+                .count(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "batch fetched and verified"
+        );
         if results
             .send(FetchResult {
-                tick: item.tick,
+                start: item.start,
+                count: item.count,
                 attempt: item.attempt,
-                outcome,
+                outcomes,
+                batch_error: None,
             })
             .await
             .is_err()
@@ -2129,23 +2297,53 @@ async fn fetch_worker(
     }
 }
 
+struct BatchRun {
+    epoch: u16,
+    positions: Vec<usize>,
+    ticks: Vec<u32>,
+}
+
+async fn verify_fetched(
+    bundle: node::TickBundle,
+    verify_signatures: bool,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    cancel: &CancellationToken,
+) -> Option<Result<VerifiedTick>> {
+    if !verify_signatures {
+        return Some(verify_bundle_sequential(bundle, false));
+    }
+    let permit = tokio::select! {
+        _ = cancel.cancelled() => return None,
+        permit = semaphore.acquire() => match permit {
+            Ok(permit) => permit,
+            Err(_) => return None,
+        },
+    };
+    let result = tokio::task::spawn_blocking(move || verify_bundle_sequential(bundle, true)).await;
+    drop(permit);
+    Some(match result {
+        Ok(result) => result,
+        Err(error) => Err(Error::Verification(format!(
+            "verification task failed: {error}"
+        ))),
+    })
+}
+
 /// A peer-level failure means this connection should not receive the same
 /// request again. Verification failures are deliberately excluded: they can
 /// be a real protocol disagreement and the writer has its own handling.
-fn peer_is_unusable(outcome: &Result<VerifiedTick>) -> bool {
+fn node_error_is_unusable(error: &node::Error) -> bool {
     matches!(
-        outcome,
-        Err(Error::Node(
-            node::Error::Io(_)
-                | node::Error::Wire(_)
-                | node::Error::Timeout(_)
-                | node::Error::RetriesExhausted { .. }
-                | node::Error::NotSynchronized { .. }
-                | node::Error::TryAgain(_)
-                | node::Error::EndResponse(_)
-                | node::Error::UnexpectedPacket { .. }
-                | node::Error::InvalidRequest(_)
-        ))
+        error,
+        node::Error::Io(_)
+            | node::Error::Wire(_)
+            | node::Error::Timeout(_)
+            | node::Error::RetriesExhausted { .. }
+            | node::Error::NotSynchronized { .. }
+            | node::Error::TryAgain(_)
+            | node::Error::EndResponse(_)
+            | node::Error::UnexpectedPacket { .. }
+            | node::Error::InvalidRequest(_)
     )
 }
 
@@ -2775,15 +2973,12 @@ mod tests {
             node::Error::EndResponse(qubic::wire::MessageType::RequestTickData),
         ];
         for error in unavailable {
-            assert!(peer_is_unusable(&Err(Error::Node(error))));
+            assert!(node_error_is_unusable(&error));
         }
 
-        assert!(!peer_is_unusable(&Err(Error::Verification(
-            "bad quorum".into()
-        ))));
-        assert!(!peer_is_unusable(&Err(Error::Node(
-            node::Error::Verification("bad tick data".into())
-        ))));
+        assert!(!node_error_is_unusable(&node::Error::Verification(
+            "bad tick data".into()
+        )));
     }
 
     #[tokio::test]
@@ -2809,6 +3004,8 @@ mod tests {
             retry_rx,
             cancel.clone(),
             4,
+            1,
+            1,
         ));
         tokio::time::sleep(Duration::from_millis(10)).await;
         cancel.cancel();
@@ -2847,6 +3044,8 @@ mod tests {
             retry_rx,
             cancel.clone(),
             256,
+            16,
+            1,
         ));
 
         let mut seen = Vec::new();
@@ -2855,15 +3054,96 @@ mod tests {
             else {
                 break;
             };
-            seen.push(item.tick);
-            if item.tick == 200 {
+            seen.push((item.start, item.count));
+            if item.start == 200 {
                 break;
             }
         }
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
-        assert!(seen.contains(&105));
-        assert!(seen.contains(&200));
-        assert!(!seen.iter().any(|tick| (106..200).contains(tick)));
+        assert!(
+            seen.iter()
+                .any(|(start, count)| { *start <= 105 && start.saturating_add(*count) > 105 })
+        );
+        assert!(seen.iter().any(|(start, _)| *start == 200));
+        assert!(!seen.iter().any(|(start, count)| {
+            (*start..start.saturating_add(*count)).any(|tick| (106..200).contains(&tick))
+        }));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_batches_contiguous_ticks_while_behind() {
+        let head = Arc::new(AsyncRwLock::new(Head {
+            epoch: 1,
+            tick: 1_000,
+            initial_tick: 100,
+            tick_duration: 1_000,
+        }));
+        let next_write = Arc::new(AtomicU32::new(100));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (work_tx, mut work_rx) = mpsc::channel::<FetchWork>(64);
+        let (_retry_tx, retry_rx) = mpsc::channel::<RetryRequest>(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(dispatch_loop(
+            100,
+            head,
+            Arc::new(AsyncRwLock::new(None)),
+            next_write,
+            pending,
+            work_tx,
+            retry_rx,
+            cancel.clone(),
+            256,
+            16,
+            32,
+        ));
+
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            let Ok(Some(item)) = tokio::time::timeout(Duration::from_secs(1), work_rx.recv()).await
+            else {
+                break;
+            };
+            seen.push((item.start, item.count));
+        }
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+        assert_eq!(seen, [(100, 16), (116, 16), (132, 16), (148, 16)]);
+    }
+
+    #[tokio::test]
+    async fn dispatcher_uses_single_ticks_at_the_head() {
+        let head = Arc::new(AsyncRwLock::new(Head {
+            epoch: 1,
+            tick: 100,
+            initial_tick: 100,
+            tick_duration: 1_000,
+        }));
+        let next_write = Arc::new(AtomicU32::new(100));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let (work_tx, mut work_rx) = mpsc::channel::<FetchWork>(16);
+        let (_retry_tx, retry_rx) = mpsc::channel::<RetryRequest>(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(dispatch_loop(
+            100,
+            head,
+            Arc::new(AsyncRwLock::new(None)),
+            next_write,
+            pending,
+            work_tx,
+            retry_rx,
+            cancel.clone(),
+            256,
+            16,
+            32,
+        ));
+
+        let item = tokio::time::timeout(Duration::from_secs(1), work_rx.recv())
+            .await
+            .expect("dispatch timeout")
+            .expect("work item");
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+        assert_eq!((item.start, item.count), (100, 1));
     }
 }
