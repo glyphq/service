@@ -2251,7 +2251,22 @@ impl NodePool {
         }
         let mut best: Option<Head> = None;
         let mut last_error = None;
-        while let Some(joined) = tasks.join_next().await {
+        let mut grace_deadline = None;
+        loop {
+            let joined = if let Some(deadline) = grace_deadline {
+                tokio::select! {
+                    joined = tasks.join_next() => joined,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        tasks.abort_all();
+                        break;
+                    }
+                }
+            } else {
+                tasks.join_next().await
+            };
+            let Some(joined) = joined else {
+                break;
+            };
             match joined {
                 Ok(Ok((head, addr, latency))) => {
                     self.manager.record_success(addr, latency);
@@ -2262,6 +2277,13 @@ impl NodePool {
                     if newer {
                         best = Some(head);
                     }
+                    if grace_deadline.is_none() {
+                        // Slow peers must not make every status request wait
+                        // for their timeout once a current head is available.
+                        // Give the rest a brief chance to report a newer tick.
+                        grace_deadline =
+                            Some(tokio::time::Instant::now() + Duration::from_millis(250));
+                    }
                 }
                 Ok(Err((error, addr))) => {
                     self.manager.record_failure(addr);
@@ -2269,6 +2291,9 @@ impl NodePool {
                 }
                 Err(_) => last_error = Some(Error::NoPeers),
             }
+        }
+        if best.is_some() {
+            tasks.abort_all();
         }
         best.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
     }
