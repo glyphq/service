@@ -5,6 +5,7 @@
 //! full tick data and exposes it over HTTPS, so the indexer can recover those
 //! ticks instead of stalling or skipping them.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -17,6 +18,7 @@ use crate::{Error, Result};
 const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const ARCHIVE_INTERVAL: Duration = Duration::from_millis(100);
 const ARCHIVE_ATTEMPTS: u32 = 4;
+const ARCHIVE_MISSING_TTL: Duration = Duration::from_secs(300);
 
 /// The public Query API rate-limits a host. Serialize requests across every
 /// peer and worker so a batch of missing ticks does not turn into a burst of
@@ -30,6 +32,12 @@ fn archive_gate() -> &'static ArchiveGate {
     GATE.get_or_init(|| ArchiveGate {
         next: tokio::sync::Mutex::new(Instant::now()),
     })
+}
+
+fn archive_missing() -> &'static std::sync::Mutex<HashMap<u32, Instant>> {
+    static MISSING: std::sync::OnceLock<std::sync::Mutex<HashMap<u32, Instant>>> =
+        std::sync::OnceLock::new();
+    MISSING.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
 
 #[derive(Clone)]
@@ -48,6 +56,16 @@ impl ArchiveClient {
     }
 
     pub(crate) async fn tick_data(&self, tick: u32) -> Result<TickData> {
+        if let Ok(missing) = archive_missing().lock() {
+            if missing
+                .get(&tick)
+                .is_some_and(|until| *until > Instant::now())
+            {
+                return Err(Error::ArchiveNotAvailable(format!(
+                    "tick {tick} is not archived"
+                )));
+            }
+        }
         let url = format!("{}/getTickData", self.base_url.trim_end_matches('/'));
         let mut last_error = None;
         for attempt in 0..ARCHIVE_ATTEMPTS {
@@ -94,7 +112,19 @@ impl ArchiveClient {
                 .json::<serde_json::Value>()
                 .await
                 .map_err(|error| Error::Archive(format!("decode tick {tick}: {error}")))?;
-            return parse_tick_data(&body, tick);
+            let result = parse_tick_data(&body, tick);
+            if let Ok(mut missing) = archive_missing().lock() {
+                match &result {
+                    Ok(_) => {
+                        missing.remove(&tick);
+                    }
+                    Err(Error::ArchiveNotAvailable(_)) => {
+                        missing.insert(tick, Instant::now() + ARCHIVE_MISSING_TTL);
+                    }
+                    Err(_) => {}
+                }
+            }
+            return result;
         }
         Err(last_error.unwrap_or_else(|| Error::Archive(format!("request tick {tick} failed"))))
     }
