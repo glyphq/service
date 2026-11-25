@@ -2246,6 +2246,7 @@ impl NodePool {
 
     pub fn record_log_success(&self, addr: SocketAddr) {
         self.manager.record_log_success(addr);
+        *self.log_peer.lock().expect("log peer mutex poisoned") = Some(addr);
     }
 
     pub fn peer_has_logs(&self, addr: SocketAddr) -> bool {

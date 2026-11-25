@@ -337,54 +337,41 @@ impl Peer {
             })
             .collect::<Vec<_>>();
         if !incomplete.is_empty() {
-            // A 64-tick batch can overrun the peer's response queue or hit
-            // its log-range timeout. Retry only the affected ticks on a
-            // fresh connection, re-testing the all-ranges request first.
-            self.desynced = true;
-            self.log_ranges_supported = None;
-            for index in incomplete {
-                let Some(tick) = decoded[index].clone() else {
-                    continue;
-                };
-                let (retry_ranges, retry_logs, retry_known, retry_warnings) =
-                    self.prefetch_logs(&[Some(tick)]).await;
-                if retry_known[0]
-                    && !retry_ranges[0].is_pending()
-                    && (retry_logs[0].len() as i64) >= retry_ranges[0].count()
-                {
-                    log_ranges[index] = retry_ranges[0].clone();
-                    logs[index] = retry_logs[0].clone();
-                    known[index] = true;
-                }
-                log_warnings[index].extend(retry_warnings[0].clone());
-            }
-        }
-        let still_incomplete = (0..decoded.len())
-            .filter(|index| {
-                decoded[*index].is_some()
-                    && !(known[*index]
-                        && !log_ranges[*index].is_pending()
-                        && (logs[*index].len() as i64) >= log_ranges[*index].count())
-            })
-            .collect::<Vec<_>>();
-        if !still_incomplete.is_empty() {
             if let Some(pool) = fallback.as_ref() {
-                for index in still_incomplete {
+                // A bad peer can miss logs for many ticks in one batch. Fan
+                // out to peers per affected tick; the pool semaphore bounds
+                // concurrent fallback connections.
+                let mut tasks = tokio::task::JoinSet::new();
+                for index in incomplete {
                     let Some(tick) = decoded[index].as_ref() else {
                         continue;
                     };
-                    match pool.logs(&tick.tick_data).await {
-                        Ok((ranges, tick_logs)) => {
+                    let tick_number = tick.tick;
+                    let tick_data = tick.tick_data.clone();
+                    let pool = pool.clone();
+                    tasks.spawn(async move {
+                        let result =
+                            tokio::time::timeout(Duration::from_secs(20), pool.logs(&tick_data))
+                                .await
+                                .unwrap_or_else(|_| Err(Error::Timeout(Duration::from_secs(20))));
+                        (index, tick_number, result)
+                    });
+                }
+                while let Some(joined) = tasks.join_next().await {
+                    match joined {
+                        Ok((index, _, Ok((ranges, tick_logs)))) => {
                             log_ranges[index] = ranges;
                             logs[index] = tick_logs;
                             known[index] = true;
                             log_warnings[index].clear();
                         }
-                        Err(error) => {
+                        Ok((index, tick_number, Err(error))) => {
                             log_warnings[index].push(format!(
-                                "no peer supplied complete logs for tick {}: {error}",
-                                tick.tick
+                                "no peer supplied complete logs for tick {tick_number}: {error}"
                             ));
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "log fallback task failed");
                         }
                     }
                 }
