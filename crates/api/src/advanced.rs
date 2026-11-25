@@ -193,8 +193,8 @@ async fn entity(
     let identity = identity.to_ascii_uppercase();
     let key = qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
-    let mut peer = connect(&state).await?;
-    let response = peer
+    let response = state
+        .pool
         .entity(key.0)
         .await
         .map_err(|error| ApiError::unavailable(format!("entity lookup failed: {error}")))?;

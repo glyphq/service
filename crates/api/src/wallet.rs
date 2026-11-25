@@ -418,7 +418,7 @@ async fn wallet_snapshot(
     let (identity, key) = parse_identity(&identity)?;
     let mut peer = connect(&state).await?;
     let head = peer.head().await.ok();
-    let entity_response = peer.entity(key.0).await.map_err(|error| {
+    let entity_response = state.pool.entity(key.0).await.map_err(|error| {
         ApiError::unavailable(format!("entity lookup failed for {identity}: {error}"))
     })?;
     let issued = peer
@@ -438,10 +438,7 @@ async fn wallet_snapshot(
     let possessed = possessed_list(&possessed);
     let warning = truncation_warning(&entity_response);
     let epoch = head.as_ref().map(|head| head.epoch);
-    let peer_tick = head
-        .as_ref()
-        .map(|head| head.tick)
-        .unwrap_or(entity_response.tick);
+    let peer_tick = entity_response.tick;
 
     Ok((
         [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
