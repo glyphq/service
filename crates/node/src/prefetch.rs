@@ -13,8 +13,9 @@
 
 use super::*;
 use qubic::messages::{
-    COMPUTOR_COUNT, LogRanges, TX_PER_TICK, Tick, TickData, Transaction, request_all_log_ranges,
-    request_logs, request_quorum_tick, request_tick_data, request_tick_transactions,
+    COMPUTOR_COUNT, EMPTY_TICK_QUORUM, LogRanges, TX_PER_TICK, Tick, TickData, Transaction,
+    request_all_log_ranges, request_logs, request_quorum_tick, request_tick_data,
+    request_tick_transactions,
 };
 use qubic::wire::{MessageType, Packet};
 use std::collections::HashMap;
@@ -160,20 +161,14 @@ impl Peer {
             match state.error.take() {
                 Some(error) => results[index] = Some(Err(error)),
                 None => match decode_main_parts(state) {
-                    Ok(mut part) => {
+                    Ok(part) => {
                         if part.votes.is_empty() {
                             missing_votes.push((index, part.tick));
                         }
                         if part.tick_data.is_none() {
-                            if part.votes.iter().any(|vote| !vote.is_empty_vote())
-                                || part.votes.is_empty()
-                            {
-                                missing.push((index, part.tick));
-                                parts[index] = Some(part);
-                                continue;
-                            } else {
-                                part.tick_data = empty_tick_from_votes(&part.votes, part.tick).ok();
-                            }
+                            missing.push((index, part.tick));
+                            parts[index] = Some(part);
+                            continue;
                         }
                         if part.tick_data.is_some() {
                             parts[index] = Some(part);
@@ -251,13 +246,24 @@ impl Peer {
                         }
                     }
                     Ok((index, tick, Err(_error))) => {
-                        let error = Error::MissingNonEmptyTick { tick };
-                        results[index] = Some(Err(match error {
-                            Error::ArchiveNotAvailable(_) => {
-                                Error::EndResponse(MessageType::RequestTickData)
+                        let empty_votes = parts[index].as_ref().is_some_and(|part| {
+                            !part.votes.is_empty()
+                                && part.votes.iter().all(|vote| vote.is_empty_vote())
+                                && part
+                                    .votes
+                                    .iter()
+                                    .map(|vote| vote.computor_index)
+                                    .collect::<std::collections::HashSet<_>>()
+                                    .len()
+                                    >= EMPTY_TICK_QUORUM
+                        });
+                        if empty_votes {
+                            if let Some(part) = parts[index].as_mut() {
+                                part.tick_data = empty_tick_from_votes(&part.votes, tick).ok();
                             }
-                            error => error,
-                        }));
+                        } else {
+                            results[index] = Some(Err(Error::MissingNonEmptyTick { tick }));
+                        }
                     }
                     Err(error) => {
                         tracing::warn!(%error, "tick-data fallback task failed");

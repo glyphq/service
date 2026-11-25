@@ -1370,14 +1370,10 @@ impl Peer {
             Some(packet) => TickData::decode(&packet.payload)?,
             None => {
                 tracing::debug!(tick, "tick data absent; checking for an empty tick");
-                if votes.iter().any(|vote| !vote.is_empty_vote()) || votes.is_empty() {
-                    if let Some(tick_data) = self.archive_tick_data(tick).await? {
-                        tick_data
-                    } else if votes.is_empty() || votes.iter().any(|vote| !vote.is_empty_vote()) {
-                        return Err(Error::MissingNonEmptyTick { tick });
-                    } else {
-                        empty_tick_from_votes(&votes, tick)?
-                    }
+                if let Some(tick_data) = self.archive_tick_data(tick).await? {
+                    tick_data
+                } else if votes.is_empty() || votes.iter().any(|vote| !vote.is_empty_vote()) {
+                    return Err(Error::MissingNonEmptyTick { tick });
                 } else {
                     empty_tick_from_votes(&votes, tick)?
                 }
