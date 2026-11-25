@@ -184,6 +184,9 @@ pub struct TickBundle {
     pub transactions: Vec<Transaction>,
     pub log_ranges: LogRanges,
     pub logs: Vec<LogEvent>,
+    /// True when every slot's log range was answered and every declared log
+    /// record was fetched. A peer with logging disabled reports false.
+    pub logs_complete: bool,
     /// Non-fatal problems, such as a peer that has logging disabled.
     pub warnings: Vec<String>,
 }
@@ -1355,9 +1358,11 @@ impl Peer {
             "bundle: log ranges"
         );
         let mut warnings = Vec::new();
+        let mut logs_complete = true;
         let (log_ranges, logs) = match self.fetch_log_ranges(tick, &tick_data).await {
             Ok(ranges) => {
                 if ranges.is_pending() {
+                    logs_complete = false;
                     tracing::debug!(
                         peer = %self.config.addr,
                         tick,
@@ -1389,9 +1394,23 @@ impl Peer {
                     }
                     _ => Vec::new(),
                 };
+                if self.log_ranges_supported == Some(false)
+                    && ranges.count() == 0
+                    && tick_data.non_empty_transactions().next().is_some()
+                {
+                    logs_complete = false;
+                    warnings.push(format!(
+                        "log data unavailable from peer {}: fallback returned no log ranges",
+                        self.config.addr
+                    ));
+                }
+                if ranges.is_pending() || (logs.len() as i64) < ranges.count() {
+                    logs_complete = false;
+                }
                 (ranges, logs)
             }
             Err(error) => {
+                logs_complete = false;
                 // A peer that already rejected all-ranges logged that once; do
                 // not repeat the warning for every tick.
                 if self.log_ranges_supported == Some(false) {
@@ -1427,6 +1446,7 @@ impl Peer {
             transactions,
             log_ranges,
             logs,
+            logs_complete,
             warnings,
         })
     }
@@ -1575,21 +1595,27 @@ impl Peer {
         let mut ranges = empty_log_ranges();
         let indices = log_probe_indices(tick_data);
 
-        let answered = self
-            .request_log_range_batch(tick, &indices, self.config.log_fallback_probe_timeout)
-            .await?;
+        let budget = self
+            .config
+            .log_fallback_probe_timeout
+            .saturating_mul((indices.len() / 16).clamp(1, 32) as u32)
+            .max(Duration::from_secs(1))
+            .min(Duration::from_secs(20));
+        let answered = self.request_log_range_batch(tick, &indices, budget).await?;
         for (index, from, length) in &answered {
             ranges.from_log_id[*index] = *from;
             ranges.length[*index] = *length;
         }
 
-        if !answered.is_empty() {
+        if answered.len() == indices.len() {
             Ok(ranges)
         } else {
             Err(Error::LogsUnavailable(format!(
-                "peer {} returned no log ranges for tick {tick} \
-                 (logging disabled or passcode mismatch)",
-                self.config.addr
+                "peer {} returned {}/{} log ranges for tick {tick} \
+                 (logging disabled, passcode mismatch, or response timeout)",
+                self.config.addr,
+                answered.len(),
+                indices.len()
             )))
         }
     }
@@ -1644,8 +1670,11 @@ impl Peer {
                     let (from, length) = decode_log_id_range(&packet.payload)?;
                     answers.push((index, from, length));
                 }
-                // This slot has no range on this peer, or asked us to retry.
-                MessageType::EndResponse | MessageType::TryAgain => {}
+                // This slot has no logs on this peer. Count it as a
+                // definitive answer so a sparse tick is not mistaken for a
+                // truncated fallback response.
+                MessageType::EndResponse => answers.push((index, -1, 0)),
+                MessageType::TryAgain => {}
                 _ => {}
             }
         }
@@ -1992,7 +2021,13 @@ impl NodePool {
         self.manager.record_failure(addr);
     }
 
-    /// Connect to the least-loaded healthy peer and hold a connection lease.
+    /// Record completed fetch throughput for peer ranking.
+    pub fn record_fetch(&self, addr: SocketAddr, ticks: usize, elapsed: Duration) {
+        self.manager.record_fetch(addr, ticks, elapsed);
+    }
+
+    /// Connect to the best healthy peer with a free connection slot and hold a
+    /// connection lease.
     ///
     /// `connect_best` is right for one-shot API reads. A pool of long-lived
     /// indexer workers needs `connect_balanced`, otherwise every worker picks
@@ -2011,7 +2046,7 @@ impl NodePool {
             }
             let mut last_error = None;
             while !candidates.is_empty() {
-                let Some((config, index)) = self.reserve_least_loaded(&candidates) else {
+                let Some((config, index)) = self.reserve_best_available(&candidates) else {
                     break;
                 };
                 let addr = config.addr;
@@ -2170,17 +2205,16 @@ impl NodePool {
         }
     }
 
-    /// Reserve the least-loaded candidate while holding the load lock, so
-    /// simultaneous workers cannot all pick the same peer.
-    fn reserve_least_loaded(&self, candidates: &[PeerConfig]) -> Option<(PeerConfig, usize)> {
+    /// Reserve the best candidate with a free slot while holding the load
+    /// lock, so simultaneous workers cannot all pick the same peer.
+    fn reserve_best_available(&self, candidates: &[PeerConfig]) -> Option<(PeerConfig, usize)> {
         let mut loads = self.load.lock().ok()?;
-        let (index, _) = candidates
-            .iter()
-            .enumerate()
-            .filter(|(_, config)| {
-                loads.get(&config.addr).copied().unwrap_or(0) < self.connection_limit
-            })
-            .min_by_key(|(_, config)| loads.get(&config.addr).copied().unwrap_or(0))?;
+        // `candidates` is already ordered best-first. Preserve that order and
+        // take the first peer with a free connection slot; least-loaded-first
+        // would send work to a slow peer just because it is idle.
+        let (index, _) = candidates.iter().enumerate().find(|(_, config)| {
+            loads.get(&config.addr).copied().unwrap_or(0) < self.connection_limit
+        })?;
         let config = candidates[index].clone();
         *loads.entry(config.addr).or_insert(0) += 1;
         Some((config, index))
@@ -2637,6 +2671,83 @@ impl NodePool {
             }
         }
         Err(last_error.unwrap_or(Error::NoPeers))
+    }
+
+    /// Requests transaction bodies from every configured peer in parallel and
+    /// returns the largest set. A batch response can drop transaction packets
+    /// while another peer still serves them.
+    pub async fn transactions(
+        &self,
+        tick: u32,
+        known: &[bool; TX_PER_TICK],
+    ) -> Result<Vec<Transaction>> {
+        let mut candidates = self.manager.attempt_order(&self.peers);
+        for config in &self.peers {
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.addr == config.addr)
+            {
+                candidates.push(config.clone());
+            }
+        }
+        if candidates.is_empty() {
+            return Err(Error::NoPeers);
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for config in candidates {
+            let known = *known;
+            tasks.spawn(async move {
+                let started = std::time::Instant::now();
+                let addr = config.addr;
+                let mut peer = match Peer::connect(config).await {
+                    Ok(peer) => peer,
+                    Err(error) => return Err((error, addr)),
+                };
+                match peer.transactions(tick, &known).await {
+                    Ok(transactions) => Ok((transactions, addr, started.elapsed())),
+                    Err(error) => Err((error, addr)),
+                }
+            });
+        }
+        let mut best = Vec::new();
+        let mut last_error = None;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok((transactions, addr, latency))) => {
+                    self.manager.record_success(addr, latency);
+                    let best_hashes = best
+                        .iter()
+                        .map(Transaction::hash)
+                        .collect::<std::collections::HashSet<_>>();
+                    let candidate_hashes = transactions
+                        .iter()
+                        .map(Transaction::hash)
+                        .collect::<std::collections::HashSet<_>>();
+                    if candidate_hashes.len() > best_hashes.len() {
+                        best = transactions;
+                    }
+                }
+                Ok(Err((error, addr))) => {
+                    if matches!(
+                        error,
+                        Error::Io(_)
+                            | Error::Wire(_)
+                            | Error::Timeout(_)
+                            | Error::RetriesExhausted { .. }
+                            | Error::TryAgain(_)
+                            | Error::UnexpectedPacket { .. }
+                    ) {
+                        self.manager.record_failure(addr);
+                    }
+                    last_error = Some(error);
+                }
+                Err(_) => last_error = Some(Error::NoPeers),
+            }
+        }
+        if best.is_empty() {
+            return Err(last_error.unwrap_or(Error::NoPeers));
+        }
+        Ok(best)
     }
 }
 
@@ -3587,6 +3698,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pool_caps_connections_per_peer_and_wakes_waiters() {
+        let first = spawn_scripted_peer(vec![(240, 1_000)], Vec::new()).await;
+        let second = spawn_scripted_peer(vec![(240, 1_000)], Vec::new()).await;
+        let pool = NodePool::with_policy(
+            vec![quick_peer(first), quick_peer(second)],
+            fast_health_policy(),
+        )
+        .with_connection_limit(1);
+
+        let held = pool.connect_balanced().await.expect("first slot");
+        let other = pool.connect_balanced().await.expect("second peer slot");
+        assert_ne!(held.addr(), other.addr());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), pool.connect_balanced())
+                .await
+                .is_err(),
+            "a third connection must wait for a released slot"
+        );
+
+        drop(held);
+        let reconnected = tokio::time::timeout(Duration::from_secs(1), pool.connect_balanced())
+            .await
+            .expect("waiter wakes")
+            .expect("released slot reconnects");
+        assert_eq!(reconnected.addr(), first);
+    }
+
+    #[tokio::test]
     async fn peer_rejects_backwards_and_stale_heads() {
         let addr = spawn_scripted_peer(vec![(240, 1_000), (240, 900)], Vec::new()).await;
         let mut peer = Peer::connect(quick_peer(addr)).await.unwrap();
@@ -3977,18 +4116,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundle_soft_fails_when_peer_has_no_logging() {
+    async fn bundle_accepts_empty_tick_from_peer_without_logging() {
         let mut peer = peer_with_optional_logs(false).await;
         let bundle = peer.bundle(TICK).await.unwrap();
         assert_eq!(bundle.tick.tick, TICK);
         assert_eq!(bundle.votes.len(), 1);
         assert!(bundle.logs.is_empty());
         assert_eq!(bundle.log_ranges.count(), 0);
+        assert!(bundle.logs_complete);
         assert!(
-            bundle
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("log data unavailable")),
+            bundle.warnings.is_empty(),
             "warnings: {:?}",
             bundle.warnings
         );
@@ -4108,9 +4245,51 @@ mod tests {
         assert_eq!(bundle.tick.tick, tick_number);
         assert_eq!(bundle.tick_data.tick, tick_number);
         eprintln!(
-            "live tick {tick_number}: votes={} transactions={} logs={} warnings={:?}",
+            "live tick {tick_number}: votes={} transactions={} slots={} digest={} logs={} warnings={:?}",
             bundle.votes.len(),
             bundle.transactions.len(),
+            bundle.tick_data.non_empty_transactions().count(),
+            hex::encode(bundle.tick_data.digest()),
+            bundle.logs.len(),
+            bundle.warnings
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GLYPH_LIVE_TICK and a reachable Qubic peer"]
+    async fn live_prefetch_completeness_smoke() {
+        let tick_number = std::env::var("GLYPH_LIVE_TICK")
+            .ok()
+            .and_then(|tick| tick.parse().ok())
+            .unwrap_or(92_264_150u32);
+        let mut peer = live_peer().await;
+        let head = peer.head().await.expect("live head");
+        let computors = peer.computors().await.expect("live computors");
+        let mut bundles = peer
+            .prefetch_bundles(&[tick_number], head, computors, None)
+            .await
+            .expect("live prefetch");
+        let bundle = bundles.pop().expect("one bundle").expect("prefetch result");
+        let expected = bundle.tick_data.non_empty_transactions().count();
+        let fetched = bundle
+            .transactions
+            .iter()
+            .map(Transaction::hash)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        eprintln!(
+            "live prefetch raw tick {tick_number}: transactions={} unique={fetched} \
+             expected={expected} logs={} ranges={} complete={} warnings={:?}",
+            bundle.transactions.len(),
+            bundle.logs.len(),
+            bundle.log_ranges.count(),
+            bundle.logs_complete,
+            bundle.warnings
+        );
+        assert_eq!(fetched, expected, "prefetch transaction completeness");
+        assert!(bundle.logs_complete, "prefetch log completeness");
+        eprintln!(
+            "live prefetch tick {tick_number}: transactions={fetched}/{expected} logs={} warnings={:?}",
             bundle.logs.len(),
             bundle.warnings
         );

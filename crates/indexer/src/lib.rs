@@ -33,6 +33,8 @@ pub enum Error {
     Store(#[from] store::Error),
     #[error("verification: {0}")]
     Verification(String),
+    #[error("tick {tick} is incomplete: {detail}")]
+    IncompleteTick { tick: u32, detail: String },
     #[error("configuration: {0}")]
     Config(String),
     #[error("archive: {0}")]
@@ -112,6 +114,8 @@ pub struct VerifiedTick {
     pub head: Head,
     pub tick: Tick,
     pub tick_data: TickData,
+    /// Designated computor for this tick (`tick % COMPUTOR_COUNT`).
+    pub proposer_index: u16,
     /// Quorum digest: the tick-data hash for a non-empty tick, zero for an
     /// empty tick.
     pub tick_digest: [u8; 32],
@@ -1180,6 +1184,20 @@ impl<S: Store + 'static> Indexer<S> {
             return FetchAction::Retry;
         }
 
+        if let Error::IncompleteTick { tick, detail } = &error {
+            tracing::warn!(tick = *tick, %detail, "tick data is incomplete; retrying");
+            retry
+                .send(RetryRequest {
+                    start: next,
+                    count: 1,
+                    attempt: attempt.saturating_add(1),
+                    delay: Duration::from_millis(250),
+                })
+                .await
+                .ok();
+            return FetchAction::Retry;
+        }
+
         if let Error::Node(node::Error::Verification(message)) = &error {
             if message.starts_with("unknown epoch boundary") {
                 tracing::warn!(tick = next, %message, "skipping a tick with no known epoch");
@@ -1299,7 +1317,7 @@ impl<S: Store + 'static> Indexer<S> {
             verified.tick.epoch,
             verified.tick.tick,
             timestamp,
-            verified.tick.computor_index,
+            verified.proposer_index,
             verified.verification.as_str(),
         );
         batch.signature = verified.tick_data.signature;
@@ -1532,11 +1550,8 @@ fn quorum_evidence(
 ) -> QuorumEvidenceRow {
     let tick = verified.tick.tick;
     let tick_data_digest = verified.tick_data.digest();
-    let quorum_digest = if tick_data_digest == ZERO_DIGEST {
-        ZERO_DIGEST
-    } else {
-        tick_data_digest
-    };
+    let quorum_digest = verified.tick_digest;
+    let canonical_alignment = verified.tick.alignment();
     let mut unique = HashSet::new();
     let mut aligned = HashSet::new();
     for vote in &verified.votes {
@@ -1544,7 +1559,7 @@ fn quorum_evidence(
             continue;
         }
         unique.insert(vote.computor_index);
-        if vote.transaction_digest == quorum_digest {
+        if vote.alignment() == canonical_alignment {
             aligned.insert(vote.computor_index);
         }
     }
@@ -1625,6 +1640,12 @@ fn verify_bundle_with(
             bundle.computors.epoch
         )));
     }
+    if !bundle.logs_complete {
+        return Err(Error::IncompleteTick {
+            tick: tick_number,
+            detail: "log ranges or records were not fully fetched".into(),
+        });
+    }
 
     let vote_started = Instant::now();
 
@@ -1704,7 +1725,6 @@ fn verify_bundle_with(
     // The stored header is the requested candidate, not one computor's vote.
     // Votes carry per-computor salted fields that are not chain state.
     let mut candidate = canonical_vote;
-    candidate.computor_index = tick_data.computor_index;
     candidate.epoch = tick_data.epoch;
     candidate.tick = tick_number;
     debug_assert!(consensus_count >= required);
@@ -1713,8 +1733,14 @@ fn verify_bundle_with(
         .non_empty_transactions()
         .map(|(index, digest)| (*digest, index as u16))
         .collect();
+    if digest_to_index.len() != tick_data.non_empty_transactions().count() {
+        return Err(Error::Verification(format!(
+            "tick {tick_number} repeats a transaction digest"
+        )));
+    }
     let tx_started = Instant::now();
-    let mut seen = 0usize;
+    let mut resolved = HashSet::new();
+    let mut unexpected = 0usize;
     for transaction in &bundle.transactions {
         if transaction.tick != tick_number {
             return Err(Error::Verification(format!(
@@ -1727,14 +1753,12 @@ fn verify_bundle_with(
         let bytes = transaction.encode();
         let hash = k12_32(&bytes);
         if !digest_to_index.contains_key(&hash) {
-            complete = false;
-            warnings.push(format!(
-                "tick {tick_number}: transaction {} is not in the tick data digest set",
-                qubic::encode_tx_hash(&hash)
-            ));
+            // Peers also return pending transactions targeted at this tick.
+            // They are not part of the finalized tick data, so drop them.
+            unexpected += 1;
             continue;
         }
-        seen += 1;
+        resolved.insert(digest_to_index[&hash]);
         if verify_signatures
             && !verify_transaction_signature_bytes(
                 &bytes,
@@ -1748,13 +1772,33 @@ fn verify_bundle_with(
             )));
         }
     }
-    if seen != digest_to_index.len() {
+    if resolved.len() != digest_to_index.len() {
+        return Err(Error::IncompleteTick {
+            tick: tick_number,
+            detail: format!(
+                "fetched {}/{} transaction bodies",
+                resolved.len(),
+                digest_to_index.len()
+            ),
+        });
+    }
+    if unexpected > 0 {
         complete = false;
         warnings.push(format!(
-            "tick {tick_number}: fetched {seen}/{} transactions",
-            digest_to_index.len()
+            "tick {tick_number}: ignored {unexpected} transactions not in the tick data digest set"
         ));
     }
+    // A retry or a peer can return the same body twice. Store exactly one
+    // transaction per non-empty tick-data slot, in digest order.
+    let mut by_hash = bundle
+        .transactions
+        .drain(..)
+        .map(|transaction| (transaction.hash(), transaction))
+        .collect::<HashMap<_, _>>();
+    bundle.transactions = tick_data
+        .non_empty_transactions()
+        .filter_map(|(_, digest)| by_hash.remove(digest))
+        .collect();
     tracing::debug!(
         tick = tick_number,
         transactions = bundle.transactions.len(),
@@ -1789,27 +1833,21 @@ fn verify_bundle_with(
         }
         last_log_id = Some(event.log_id);
         if log_slots.slot(event.log_id).is_none() {
-            // Peers occasionally return a log that their own range table does
-            // not cover (truncated fallback answers, stale ranges). The log
-            // still has to carry this tick and a matching K12 digest, so keep
-            // it and downgrade the tick instead of stalling the pipeline on a
-            // peer bookkeeping mismatch. The slot is unknown, so the writer
-            // stores an empty transaction link for this event.
-            complete = false;
-            warnings.push(format!(
-                "tick {tick_number}: log {} lies outside the peer's declared log ranges",
-                event.log_id
-            ));
+            return Err(Error::IncompleteTick {
+                tick: tick_number,
+                detail: format!(
+                    "log {} lies outside the peer's declared log ranges",
+                    event.log_id
+                ),
+            });
         }
     }
     let expected_logs = bundle.log_ranges.count();
     if (bundle.logs.len() as i64) != expected_logs {
-        complete = false;
-        warnings.push(format!(
-            "tick {tick_number}: fetched {}/{} logs",
-            bundle.logs.len(),
-            expected_logs
-        ));
+        return Err(Error::IncompleteTick {
+            tick: tick_number,
+            detail: format!("fetched {}/{} logs", bundle.logs.len(), expected_logs),
+        });
     }
     tracing::debug!(
         tick = tick_number,
@@ -1828,6 +1866,7 @@ fn verify_bundle_with(
         head: bundle.head,
         tick: candidate,
         tick_data,
+        proposer_index: (tick_number % COMPUTOR_COUNT as u32) as u16,
         tick_digest: consensus_digest,
         votes: bundle.votes,
         transactions: bundle.transactions,
@@ -2337,6 +2376,7 @@ async fn fetch_worker(
                 }
                 continue;
             };
+            let fetch_started = Instant::now();
             let fetched = tokio::select! {
                 _ = cancel.cancelled() => return,
                 outcome = peer.as_mut().expect("worker peer").prefetch_bundles(
@@ -2367,6 +2407,9 @@ async fn fetch_worker(
                 )));
                 break;
             }
+            if let Some(connection) = peer.as_ref() {
+                pool.record_fetch(connection.addr(), run.ticks.len(), fetch_started.elapsed());
+            }
 
             for (offset, bundle) in fetched.into_iter().enumerate() {
                 let position = run.positions[offset];
@@ -2386,6 +2429,9 @@ async fn fetch_worker(
                         Err(Error::Node(error))
                     }
                 };
+                if matches!(outcome, Err(Error::IncompleteTick { .. })) {
+                    peer_failed = true;
+                }
                 outcomes[position] = Some(outcome);
             }
             if peer_failed {
@@ -2516,7 +2562,9 @@ fn node_error_is_peer_specific(error: &node::Error) -> bool {
         || matches!(error, node::Error::MissingNonEmptyTick { .. })
         || matches!(
             error,
-            node::Error::Verification(message) if message.starts_with("no votes for tick")
+            node::Error::Verification(message)
+                if message.starts_with("no votes for tick")
+                    || (message.contains("missing") && message.contains("transaction bodies"))
         )
 }
 
@@ -2965,6 +3013,7 @@ mod tests {
                 length: vec![0; LOG_TX_PER_TICK],
             },
             logs: Vec::new(),
+            logs_complete: true,
             warnings: Vec::new(),
         };
         verify_tick_data_signature(&bundle, &computors).expect("tick data signature");

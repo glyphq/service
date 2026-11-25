@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 
 pub const COMPUTOR_COUNT: usize = 676;
 pub const QUORUM: usize = 451;
-pub const EMPTY_TICK_QUORUM: usize = 226;
 pub const TX_PER_TICK: usize = 4096;
 /// Slots available to user transactions. Four of the 4,096 tick slots are
 /// reserved for protocol transactions.

@@ -69,6 +69,8 @@ pub struct PeerHealth {
     pub failures: u64,
     pub consecutive_failures: u32,
     pub last_latency_ms: Option<u64>,
+    /// EWMA of observed fetch throughput in milliseconds per tick.
+    pub fetch_ms_per_tick: Option<f64>,
     /// Milliseconds until the quarantine ends, or `None` when available.
     pub quarantine_remaining_ms: Option<u64>,
 }
@@ -79,6 +81,7 @@ struct PeerState {
     failures: u64,
     consecutive_failures: u32,
     ewma_ms: Option<f64>,
+    fetch_ms_per_tick: Option<f64>,
     last_latency: Option<Duration>,
     last_attempt: Option<tokio::time::Instant>,
     quarantined_until: Option<tokio::time::Instant>,
@@ -166,6 +169,24 @@ impl PeerManager {
         entry.quarantined_until = None;
     }
 
+    /// Records a completed fetch batch. Handshake latency alone cannot rank
+    /// peers: a low-RTT peer can still deliver votes slowly because of packet
+    /// loss or a narrow uplink.
+    pub fn record_fetch(&self, addr: SocketAddr, ticks: usize, elapsed: Duration) {
+        if ticks == 0 || elapsed.is_zero() {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        let mut state = self.state.lock().expect("peer health mutex poisoned");
+        let entry = state.entry(addr).or_default();
+        let sample = elapsed.as_secs_f64() * 1_000.0 / ticks as f64;
+        entry.fetch_ms_per_tick = Some(match entry.fetch_ms_per_tick {
+            Some(previous) => previous * 0.7 + sample * 0.3,
+            None => sample,
+        });
+        entry.last_attempt = Some(now);
+    }
+
     /// Whether `addr` is currently skipped. Expired quarantines are cleared.
     pub fn is_quarantined(&self, addr: SocketAddr) -> bool {
         let now = tokio::time::Instant::now();
@@ -240,6 +261,7 @@ impl PeerManager {
                     last_latency_ms: entry
                         .and_then(|entry| entry.last_latency)
                         .map(|latency| latency.as_millis() as u64),
+                    fetch_ms_per_tick: entry.and_then(|entry| entry.fetch_ms_per_tick),
                     quarantine_remaining_ms: quarantine_remaining,
                 }
             })
@@ -267,7 +289,8 @@ impl PeerManager {
             .max(f64::EPSILON);
         let fraction = (age.as_secs_f64() / window).min(1.0);
         let bonus = self.policy.exploration_bonus.as_secs_f64() * 1_000.0 * fraction;
-        (latency + penalty - bonus).max(0.0)
+        let fetch = entry.fetch_ms_per_tick.unwrap_or(0.0);
+        (latency + fetch + penalty - bonus).max(0.0)
     }
 }
 

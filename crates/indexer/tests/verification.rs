@@ -110,6 +110,7 @@ fn bundle(
         transactions,
         log_ranges,
         logs,
+        logs_complete: true,
         warnings: Vec::new(),
     }
 }
@@ -251,7 +252,7 @@ fn tampered_log_body_is_rejected() {
 }
 
 #[test]
-fn log_outside_declared_ranges_is_kept_with_a_warning() {
+fn log_outside_declared_ranges_is_incomplete() {
     let data = tick_data(&[]);
     let votes = (0..451)
         .map(|index| vote(index, ZERO_DIGEST))
@@ -265,19 +266,12 @@ fn log_outside_declared_ranges_is_kept_with_a_warning() {
         log_digest: u64::from_le_bytes(qubic::crypto::k12::k12_8(&body)),
         body,
     };
-    let verified = verify_bundle(
+    let error = verify_bundle(
         bundle(data, votes, Vec::new(), empty_ranges(), vec![event]),
         false,
     )
-    .expect("peer range inconsistency must not stall ingestion");
-    assert_eq!(verified.verification, Verification::Quorum);
-    assert_eq!(verified.logs.len(), 1);
-    assert!(
-        verified
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("lies outside the peer's declared log ranges"))
-    );
+    .expect_err("an out-of-range log means the range table is incomplete");
+    assert!(matches!(error, Error::IncompleteTick { .. }));
 }
 
 #[test]
@@ -302,6 +296,34 @@ fn extra_transaction_downgrades_but_does_not_reject() {
             .iter()
             .any(|warning| warning.contains("not in the tick data digest set"))
     );
+}
+
+#[test]
+fn missing_transaction_body_is_incomplete_not_empty() {
+    let tx = transaction();
+    let data = tick_data(&[(0, tx.hash())]);
+    let digest = data.digest();
+    let votes = (0..451)
+        .map(|index| vote(index, digest))
+        .collect::<Vec<_>>();
+    let error = verify_bundle(
+        bundle(data, votes, Vec::new(), empty_ranges(), Vec::new()),
+        false,
+    )
+    .expect_err("a non-empty tick without its body must not verify");
+    assert!(matches!(error, Error::IncompleteTick { .. }));
+}
+
+#[test]
+fn unverified_logs_are_incomplete() {
+    let data = tick_data(&[]);
+    let votes = (0..451)
+        .map(|index| vote(index, ZERO_DIGEST))
+        .collect::<Vec<_>>();
+    let mut tick = bundle(data, votes, Vec::new(), empty_ranges(), Vec::new());
+    tick.logs_complete = false;
+    let error = verify_bundle(tick, false).expect_err("missing log proof must not verify");
+    assert!(matches!(error, Error::IncompleteTick { .. }));
 }
 
 #[test]

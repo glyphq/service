@@ -53,6 +53,7 @@ struct MainState {
     error: Option<Error>,
 }
 
+#[derive(Clone)]
 struct DecodedTick {
     tick: u32,
     tick_data: TickData,
@@ -294,13 +295,60 @@ impl Peer {
             }
         }
 
-        let (log_ranges, logs, log_warnings) = self.prefetch_logs(&decoded).await;
+        for (index, entry) in decoded.iter_mut().enumerate() {
+            if results[index].is_some() {
+                continue;
+            }
+            let Some(tick) = entry.as_mut() else {
+                continue;
+            };
+            if let Err(error) = self.complete_transactions(tick, fallback.as_ref()).await {
+                results[index] = Some(Err(error));
+                *entry = None;
+            }
+        }
+
+        let (mut log_ranges, mut logs, mut known, mut log_warnings) =
+            self.prefetch_logs(&decoded).await;
+        let incomplete = (0..decoded.len())
+            .filter(|index| {
+                decoded[*index].is_some()
+                    && !(known[*index]
+                        && !log_ranges[*index].is_pending()
+                        && (logs[*index].len() as i64) >= log_ranges[*index].count())
+            })
+            .collect::<Vec<_>>();
+        if !incomplete.is_empty() {
+            // A 64-tick batch can overrun the peer's response queue or hit
+            // its log-range timeout. Retry only the affected ticks on a
+            // fresh connection, re-testing the all-ranges request first.
+            self.desynced = true;
+            self.log_ranges_supported = None;
+            for index in incomplete {
+                let Some(tick) = decoded[index].clone() else {
+                    continue;
+                };
+                let (retry_ranges, retry_logs, retry_known, retry_warnings) =
+                    self.prefetch_logs(&[Some(tick)]).await;
+                if retry_known[0]
+                    && !retry_ranges[0].is_pending()
+                    && (retry_logs[0].len() as i64) >= retry_ranges[0].count()
+                {
+                    log_ranges[index] = retry_ranges[0].clone();
+                    logs[index] = retry_logs[0].clone();
+                    known[index] = true;
+                }
+                log_warnings[index].extend(retry_warnings[0].clone());
+            }
+        }
         let mut log_ranges = log_ranges.into_iter();
         let mut logs = logs.into_iter();
+        let mut known = known.into_iter();
         let mut log_warnings = log_warnings.into_iter();
         for (index, decoded) in decoded.into_iter().enumerate() {
             let ranges = log_ranges.next().expect("one range entry per tick");
             let tick_logs = logs.next().expect("one log entry per tick");
+            let ranges_known = known.next().expect("one known entry per tick");
             let tick_warnings = log_warnings.next().expect("one warning entry per tick");
             if results[index].is_some() {
                 continue;
@@ -322,6 +370,8 @@ impl Peer {
                     continue;
                 }
             };
+            let logs_complete =
+                ranges_known && !ranges.is_pending() && (tick_logs.len() as i64) >= ranges.count();
             decoded_warnings.extend(tick_warnings);
             results[index] = Some(Ok(TickBundle {
                 head: head.clone(),
@@ -332,6 +382,7 @@ impl Peer {
                 transactions,
                 log_ranges: ranges,
                 logs: tick_logs,
+                logs_complete,
                 warnings: decoded_warnings,
             }));
         }
@@ -510,13 +561,74 @@ impl Peer {
         Ok(())
     }
 
+    /// Fetches transaction bodies that were dropped from the batch response.
+    /// A large prefetch can overrun a peer's response queue; the missing-slot
+    /// bitmap lets the same connection recover only the lost packets.
+    async fn complete_transactions(
+        &mut self,
+        tick: &mut DecodedTick,
+        fallback: Option<&NodePool>,
+    ) -> Result<()> {
+        let (known, missing) = missing_transaction_flags(&tick.tick_data, &tick.transactions);
+        if missing == 0 {
+            return Ok(());
+        }
+        let fetched = self.transactions(tick.tick, &known).await?;
+        for transaction in fetched {
+            let hash = transaction.hash();
+            if !tick
+                .transactions
+                .iter()
+                .any(|existing| existing.hash() == hash)
+            {
+                tick.transactions.push(transaction);
+            }
+        }
+        let (_, missing) = missing_transaction_flags(&tick.tick_data, &tick.transactions);
+        if missing == 0 {
+            return Ok(());
+        }
+        let Some(pool) = fallback else {
+            return Err(Error::Verification(format!(
+                "tick {} is missing {missing} transaction bodies",
+                tick.tick
+            )));
+        };
+        let (known, _) = missing_transaction_flags(&tick.tick_data, &tick.transactions);
+        let fetched = pool.transactions(tick.tick, &known).await?;
+        for transaction in fetched {
+            let hash = transaction.hash();
+            if !tick
+                .transactions
+                .iter()
+                .any(|existing| existing.hash() == hash)
+            {
+                tick.transactions.push(transaction);
+            }
+        }
+        let (_, missing) = missing_transaction_flags(&tick.tick_data, &tick.transactions);
+        if missing == 0 {
+            return Ok(());
+        }
+        Err(Error::Verification(format!(
+            "tick {} is missing {missing} transaction bodies",
+            tick.tick
+        )))
+    }
+
     async fn prefetch_logs(
         &mut self,
         decoded: &[Option<DecodedTick>],
-    ) -> (Vec<LogRanges>, Vec<Vec<LogEvent>>, Vec<Vec<String>>) {
+    ) -> (
+        Vec<LogRanges>,
+        Vec<Vec<LogEvent>>,
+        Vec<bool>,
+        Vec<Vec<String>>,
+    ) {
         let count = decoded.len();
         let mut ranges = vec![empty_log_ranges(); count];
         let mut logs = (0..count).map(|_| Vec::new()).collect::<Vec<_>>();
+        let mut known = vec![false; count];
         let mut warnings = (0..count).map(|_| Vec::new()).collect::<Vec<_>>();
 
         let mut need_fallback = vec![false; count];
@@ -606,6 +718,7 @@ impl Peer {
                             match LogRanges::decode(&packet.payload) {
                                 Ok(decoded_ranges) => {
                                     ranges[index] = decoded_ranges;
+                                    known[index] = true;
                                     successes += 1;
                                 }
                                 Err(error) => {
@@ -640,6 +753,7 @@ impl Peer {
         }
 
         let mut probes = Vec::new();
+        let mut expected = vec![0usize; count];
         for (index, tick) in decoded.iter().enumerate() {
             if !need_fallback[index] {
                 continue;
@@ -647,11 +761,17 @@ impl Peer {
             let Some(tick) = tick else { continue };
             for probe in log_probe_indices(&tick.tick_data) {
                 probes.push((index, probe));
+                expected[index] += 1;
+            }
+        }
+        for index in 0..count {
+            if need_fallback[index] && expected[index] == 0 {
+                known[index] = true;
             }
         }
         if !probes.is_empty() {
             let mut awaiting = HashMap::with_capacity(probes.len());
-            let mut answered = vec![false; count];
+            let mut answered = vec![0usize; count];
             let mut send_failed = false;
             for &(index, probe) in &probes {
                 let tick = decoded[index].as_ref().expect("decoded tick").tick;
@@ -719,7 +839,7 @@ impl Peer {
                                 Ok((from, length)) => {
                                     ranges[index].from_log_id[probe] = from;
                                     ranges[index].length[probe] = length;
-                                    answered[index] = true;
+                                    answered[index] += 1;
                                 }
                                 Err(error) => warnings[index].push(format!(
                                     "peer {} returned invalid log range: {error}",
@@ -727,15 +847,54 @@ impl Peer {
                                 )),
                             }
                         }
-                        MessageType::EndResponse | MessageType::TryAgain => {}
+                        MessageType::EndResponse => {
+                            answered[index] += 1;
+                        }
+                        MessageType::TryAgain => {}
                         _ => {}
                     }
                 }
             }
             for index in 0..count {
-                if need_fallback[index] && !answered[index] {
+                if need_fallback[index] && expected[index] > 0 && answered[index] == 0 {
                     warnings[index].push(format!(
                         "peer {} returned no log ranges for tick {}",
+                        self.config.addr,
+                        decoded[index]
+                            .as_ref()
+                            .map(|tick| tick.tick.to_string())
+                            .unwrap_or_default()
+                    ));
+                }
+                if need_fallback[index] && answered[index] > 0 && answered[index] < expected[index]
+                {
+                    warnings[index].push(format!(
+                        "peer {} answered {}/{} log range probes for tick {}",
+                        self.config.addr,
+                        answered[index],
+                        expected[index],
+                        decoded[index]
+                            .as_ref()
+                            .map(|tick| tick.tick.to_string())
+                            .unwrap_or_default()
+                    ));
+                }
+                if expected[index] == 0 || answered[index] >= expected[index] {
+                    known[index] = true;
+                }
+            }
+        }
+        if self.log_ranges_supported == Some(false) {
+            for index in 0..count {
+                if decoded[index]
+                    .as_ref()
+                    .is_some_and(|tick| tick.tick_data.non_empty_transactions().next().is_some())
+                    && ranges[index].count() == 0
+                {
+                    known[index] = false;
+                    warnings[index].push(format!(
+                        "log data unavailable from peer {} for tick {}: \
+                         fallback returned no log ranges",
                         self.config.addr,
                         decoded[index]
                             .as_ref()
@@ -898,7 +1057,7 @@ impl Peer {
             }
         }
 
-        (ranges, logs, warnings)
+        (ranges, logs, known, warnings)
     }
 
     fn prefetch_timeout(&self, ticks: usize) -> Duration {
@@ -987,4 +1146,25 @@ fn finish_decoded(part: MainParts) -> Result<DecodedTick> {
         transactions: part.transactions,
         warnings: Vec::new(),
     })
+}
+
+/// Builds the `known` bitmap for `RequestTickTransactions` and counts the
+/// non-empty tick-data slots whose body is still missing.
+fn missing_transaction_flags(
+    tick_data: &TickData,
+    transactions: &[Transaction],
+) -> ([bool; TX_PER_TICK], usize) {
+    let hashes = transactions
+        .iter()
+        .map(Transaction::hash)
+        .collect::<std::collections::HashSet<_>>();
+    let mut known = [true; TX_PER_TICK];
+    let mut missing = 0usize;
+    for (index, digest) in tick_data.non_empty_transactions() {
+        if !hashes.contains(digest) {
+            known[index] = false;
+            missing += 1;
+        }
+    }
+    (known, missing)
 }
