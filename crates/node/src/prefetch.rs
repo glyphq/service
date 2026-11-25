@@ -323,46 +323,40 @@ impl Peer {
         }
 
         let main_elapsed = fetch_started.elapsed();
-        let mut log_fetches = self.prefetch_logs(&decoded).await;
-        let log_elapsed = fetch_started.elapsed().saturating_sub(main_elapsed);
-        let incomplete = (0..decoded.len())
-            .filter(|index| decoded[*index].is_some() && !log_fetches[*index].complete)
+        // A single peer can take tens of seconds to return every log range for
+        // a busy batch. Use the pool's raced log path when one is available so
+        // a slow primary cannot hold the batch, and only fall back to this
+        // peer's connection for direct single-peer use.
+        let mut log_fetches = (0..decoded.len())
+            .map(|_| FetchedLogs::incomplete("tick data unavailable"))
             .collect::<Vec<_>>();
-        if !incomplete.is_empty() {
-            if let Some(pool) = fallback.as_ref() {
-                // Repair the whole affected set over one connection. Opening
-                // a socket per tick turns an empty-tick run into a connection
-                // storm against every peer.
-                let indices = incomplete
-                    .iter()
-                    .copied()
-                    .filter(|index| decoded[*index].is_some())
-                    .collect::<Vec<_>>();
-                let data = indices
-                    .iter()
-                    .filter_map(|index| decoded[*index].as_ref())
-                    .map(|tick| tick.tick_data.clone())
-                    .collect::<Vec<_>>();
-                match pool.log_batch(&data).await {
-                    Ok(repaired) => {
-                        for (index, fetched) in indices.into_iter().zip(repaired) {
-                            if fetched.complete {
-                                log_fetches[index] = fetched;
-                            } else {
-                                log_fetches[index].warnings.extend(fetched.warnings);
-                            }
-                        }
+        let indices = (0..decoded.len())
+            .filter(|index| decoded[*index].is_some())
+            .collect::<Vec<_>>();
+        let data = indices
+            .iter()
+            .filter_map(|index| decoded[*index].as_ref())
+            .map(|tick| tick.tick_data.clone())
+            .collect::<Vec<_>>();
+        if let Some(pool) = fallback.as_ref() {
+            match pool.log_batch(&data).await {
+                Ok(repaired) => {
+                    for (index, fetched) in indices.into_iter().zip(repaired) {
+                        log_fetches[index] = fetched;
                     }
-                    Err(error) => {
-                        for index in indices {
-                            log_fetches[index].warnings.push(format!(
-                                "no peer supplied complete logs for the batch: {error}"
-                            ));
-                        }
+                }
+                Err(error) => {
+                    for index in indices {
+                        log_fetches[index].warnings.push(format!(
+                            "no peer supplied complete logs for the batch: {error}"
+                        ));
                     }
                 }
             }
+        } else {
+            log_fetches = self.prefetch_logs(&decoded).await;
         }
+        let log_elapsed = fetch_started.elapsed().saturating_sub(main_elapsed);
         let mut log_fetches = log_fetches.into_iter();
         for (index, decoded) in decoded.into_iter().enumerate() {
             let fetched_logs = log_fetches.next().expect("one log result per tick");
