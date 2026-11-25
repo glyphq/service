@@ -2316,6 +2316,7 @@ async fn fetch_worker(
                     &run.ticks,
                     head_snapshot.clone(),
                     cached,
+                    Some(&pool),
                 ) => outcome,
             };
             let fetched = match fetched {

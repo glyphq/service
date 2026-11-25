@@ -70,6 +70,7 @@ impl Peer {
         ticks: &[u32],
         head: Head,
         computors: Computors,
+        fallback: Option<&NodePool>,
     ) -> Result<Vec<Result<TickBundle>>> {
         if ticks.is_empty() {
             return Ok(Vec::new());
@@ -180,50 +181,79 @@ impl Peer {
         }
 
         if !missing.is_empty() {
-            if let Some(archive) = self.archive.clone() {
-                let head = match archive.head().await {
+            let archive = self.archive.clone();
+            let head = match archive.as_ref() {
+                Some(archive) => match archive.head().await {
                     Ok(head) => Some(head),
                     Err(error) => {
                         tracing::warn!(%error, "public archive head is unavailable");
                         None
                     }
-                };
-                let mut tasks = tokio::task::JoinSet::new();
-                for (index, tick) in missing {
-                    let archive = archive.clone();
-                    tasks.spawn(async move {
-                        let result = match head {
+                },
+                None => None,
+            };
+            let fallback = fallback.cloned();
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+            let mut tasks = tokio::task::JoinSet::new();
+            for (index, tick) in missing {
+                let archive = archive.clone();
+                let fallback = fallback.clone();
+                let semaphore = semaphore.clone();
+                tasks.spawn(async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .expect("tick-data semaphore is never closed");
+                    let archived = match archive.as_ref() {
+                        Some(archive) => match head {
                             Some(head) => archive.tick_data_at(tick, head).await,
                             None => {
                                 Err(Error::ArchiveNotReady("archive head is unavailable".into()))
                             }
-                        };
-                        (index, tick, result)
-                    });
-                }
-                while let Some(joined) = tasks.join_next().await {
-                    match joined {
-                        Ok((index, _tick, Ok(tick_data))) => {
-                            if let Some(part) = parts[index].as_mut() {
-                                part.tick_data = Some(tick_data);
+                        },
+                        None => Err(Error::ArchiveNotAvailable(
+                            "archive is not configured".into(),
+                        )),
+                    };
+                    match archived {
+                        Ok(data) => (index, tick, Ok(data)),
+                        Err(archive_error) => {
+                            let Some(fallback) = fallback.as_ref() else {
+                                return (index, tick, Err(archive_error));
+                            };
+                            match fallback.tick_data(tick).await {
+                                Ok(data) => (index, tick, Ok(data)),
+                                Err(peer_error) => {
+                                    tracing::warn!(
+                                        tick,
+                                        archive = %archive_error,
+                                        peers = %peer_error,
+                                        "no source supplied missing tick data"
+                                    );
+                                    (index, tick, Err(peer_error))
+                                }
                             }
                         }
-                        Ok((index, tick, Err(error))) => {
-                            tracing::warn!(
-                                tick,
-                                %error,
-                                "public archive could not supply missing tick data"
-                            );
-                            results[index] = Some(Err(match error {
-                                Error::ArchiveNotAvailable(_) => {
-                                    Error::EndResponse(MessageType::RequestTickData)
-                                }
-                                error => error,
-                            }));
+                    }
+                });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                match joined {
+                    Ok((index, _tick, Ok(tick_data))) => {
+                        if let Some(part) = parts[index].as_mut() {
+                            part.tick_data = Some(tick_data);
                         }
-                        Err(error) => {
-                            tracing::warn!(%error, "archive tick-data task failed");
-                        }
+                    }
+                    Ok((index, _tick, Err(error))) => {
+                        results[index] = Some(Err(match error {
+                            Error::ArchiveNotAvailable(_) => {
+                                Error::EndResponse(MessageType::RequestTickData)
+                            }
+                            error => error,
+                        }));
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "tick-data fallback task failed");
                     }
                 }
             }
@@ -953,7 +983,7 @@ mod tests {
         let head = peer.head().await.expect("head");
         let computors = peer.computors().await.expect("computors");
         let bundles = peer
-            .prefetch_bundles(&[92_261_883], head, computors)
+            .prefetch_bundles(&[92_261_883], head, computors, None)
             .await
             .expect("prefetch");
         let bundle = bundles

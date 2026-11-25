@@ -2065,6 +2065,55 @@ impl NodePool {
         Err(last_error.unwrap_or(Error::NoPeers))
     }
 
+    /// Requests one tick's data from every configured peer in parallel and
+    /// returns the first copy. Used when a single peer and the public archive
+    /// cannot supply tick data that another peer still retains.
+    pub async fn tick_data(&self, tick: u32) -> Result<TickData> {
+        let mut candidates = self.manager.attempt_order(&self.peers);
+        for config in &self.peers {
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.addr == config.addr)
+            {
+                candidates.push(config.clone());
+            }
+        }
+        if candidates.is_empty() {
+            return Err(Error::NoPeers);
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for config in candidates {
+            tasks.spawn(async move {
+                let started = std::time::Instant::now();
+                let addr = config.addr;
+                let mut peer = match Peer::connect(config).await {
+                    Ok(peer) => peer,
+                    Err(error) => return Err((error, addr)),
+                };
+                match peer.tick_data(tick).await {
+                    Ok(data) => Ok((data, addr, started.elapsed())),
+                    Err(error) => Err((error, addr)),
+                }
+            });
+        }
+        let mut last_error = None;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok((data, addr, latency))) => {
+                    self.manager.record_success(addr, latency);
+                    tasks.abort_all();
+                    return Ok(data);
+                }
+                Ok(Err((error, addr))) => {
+                    self.manager.record_failure(addr);
+                    last_error = Some(error);
+                }
+                Err(_) => last_error = Some(Error::NoPeers),
+            }
+        }
+        Err(last_error.unwrap_or(Error::NoPeers))
+    }
+
     /// Reserve the least-loaded candidate while holding the load lock, so
     /// simultaneous workers cannot all pick the same peer.
     fn reserve_least_loaded(&self, candidates: &[PeerConfig]) -> Option<(PeerConfig, usize)> {
@@ -3528,7 +3577,7 @@ mod tests {
         let head = peer.head().await.unwrap();
         let computors = peer.computors().await.unwrap();
         let bundles = peer
-            .prefetch_bundles(&[TICK, TICK + 1], head, computors)
+            .prefetch_bundles(&[TICK, TICK + 1], head, computors, None)
             .await
             .unwrap();
 
