@@ -881,7 +881,18 @@ impl<S: Store + 'static> Indexer<S> {
                         .ok();
                     continue 'writer;
                 }
-                adaptive.on_success(result.count as usize);
+                let failed = result
+                    .outcomes
+                    .iter()
+                    .filter(|tick| tick.outcome.is_err())
+                    .count();
+                if failed == 0 {
+                    adaptive.on_success(result.count as usize);
+                } else if failed * 4 >= result.outcomes.len().max(1) {
+                    // A batch whose outcomes mostly failed is a failed batch
+                    // even when the peer answered at the stream level.
+                    adaptive.on_failure(result.count as usize);
+                }
                 for tick in result.outcomes {
                     if tick.tick < consume_next {
                         pending.fetch_sub(1, Ordering::Release);
