@@ -44,6 +44,12 @@ enum Command {
         #[arg(long)]
         no_verify_signatures: bool,
     },
+    /// Inspect the raw log proof one peer returns for a tick.
+    Logs {
+        tick: u32,
+        #[arg(long, default_value = "157.180.10.49:21841")]
+        peer: SocketAddr,
+    },
     /// Read QUBIC/USDT from a peer, falling back to exchange prices.
     Price {
         #[arg(long, default_value = "157.180.10.49:21841")]
@@ -80,6 +86,33 @@ enum Command {
         #[arg(long, env = "INDEXER_MAX_TICK_ATTEMPTS", default_value_t = 4)]
         max_tick_attempts: u32,
     },
+    /// Fetch and verify ticks, publishing them to NATS JetStream.
+    Fetcher {
+        #[arg(
+            long = "peer",
+            env = "QUBIC_PEERS",
+            value_delimiter = ',',
+            default_value = "157.180.10.49:21841"
+        )]
+        peers: Vec<SocketAddr>,
+        #[arg(long)]
+        from: Option<u32>,
+        #[arg(long, default_value_t = 250)]
+        poll_ms: u64,
+        #[arg(long)]
+        verify_signatures: bool,
+        #[arg(long)]
+        no_verify_signatures: bool,
+        #[arg(long, default_value_t = 100)]
+        progress_every: u64,
+        #[arg(long, env = "INDEXER_MAX_TICK_ATTEMPTS", default_value_t = 4)]
+        max_tick_attempts: u32,
+    },
+    /// Consume verified ticks from NATS JetStream and write them to ClickHouse.
+    Writer {
+        #[arg(long, env = "WRITER_BATCH", default_value_t = 64)]
+        batch: usize,
+    },
     /// Initialize ClickHouse tables.
     DbInit,
     /// Drop partitions and metadata for old epochs.
@@ -88,6 +121,15 @@ enum Command {
         #[arg(long, default_value_t = 54)]
         keep: u16,
         /// Print the epochs that would be dropped without modifying ClickHouse.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Recompute identity QU totals from the stored events table.
+    RebuildIdentities {
+        /// Snapshot version. Defaults to the current head tick.
+        #[arg(long)]
+        version: Option<u64>,
+        /// Print the aggregate without replacing the identities table.
         #[arg(long)]
         dry_run: bool,
     },
@@ -178,6 +220,38 @@ async fn main() -> anyhow::Result<()> {
                     "logs": verified.logs.len(),
                     "warnings": verified.warnings,
                     "transaction_list": transactions,
+                }))?
+            );
+        }
+        Command::Logs { tick, peer } => {
+            let mut connection = node::Peer::connect(PeerConfig::new(peer)).await?;
+            let tick_data = connection.tick_data(tick).await?;
+            let fetched = connection.complete_logs(&tick_data).await?;
+            let slots = fetched
+                .ranges
+                .from_log_id
+                .iter()
+                .zip(fetched.ranges.length.iter())
+                .enumerate()
+                .filter(|(_, (from, length))| **from >= 0 || **length >= 0)
+                .map(|(slot, (from, length))| {
+                    serde_json::json!({
+                        "slot": slot,
+                        "from": from,
+                        "length": length,
+                    })
+                })
+                .collect::<Vec<_>>();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "tick": tick,
+                    "peer": peer.to_string(),
+                    "complete": fetched.complete,
+                    "ranges_count": fetched.ranges.count(),
+                    "logs": fetched.logs.len(),
+                    "slots": slots,
+                    "warnings": fetched.warnings,
                 }))?
             );
         }
@@ -283,6 +357,133 @@ async fn main() -> anyhow::Result<()> {
             indexer.run(cancel).await?;
             println!("indexer stopped");
         }
+        Command::Fetcher {
+            peers,
+            from,
+            poll_ms,
+            verify_signatures,
+            no_verify_signatures,
+            progress_every,
+            max_tick_attempts,
+        } => {
+            if peers.is_empty() {
+                bail!("at least one --peer or QUBIC_PEERS entry is required");
+            }
+            let verify = verify_signatures && !no_verify_signatures;
+            let config = IndexerConfig {
+                peers: peers.iter().copied().map(PeerConfig::new).collect(),
+                start_tick: from,
+                poll_interval: std::time::Duration::from_millis(poll_ms),
+                verify_signatures: verify,
+                progress_every: progress_every.max(1),
+                max_tick_attempts: max_tick_attempts.max(1),
+                archive: archive_from_env()?,
+                archive_fail_closed: std::env::var("ARCHIVE_FAIL_CLOSED")
+                    .is_ok_and(|value| value == "true"),
+            };
+            let url =
+                std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
+            let db = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "glyph".into());
+            let store = ClickHouseStore::new(&url, &db)?;
+            let bus = connect_bus().await?;
+            let mut indexer = indexer::Indexer::new(Arc::new(store), config)
+                .context("configure fetcher")?
+                .with_sink(Arc::new(NatsSink { bus }));
+            let cancel = CancellationToken::new();
+            let signal = cancel.clone();
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                signal.cancel();
+            });
+            println!(
+                "fetcher started: {} peer(s), db {db}, NATS {}",
+                peers.len(),
+                std::env::var("NATS_URL").unwrap_or_default()
+            );
+            indexer.run(cancel).await?;
+            println!("fetcher stopped");
+        }
+        Command::Writer { batch } => {
+            let url =
+                std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
+            let db = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "glyph".into());
+            let store: Arc<dyn Store> = Arc::new(ClickHouseStore::new(&url, &db)?);
+            store.init().await.context("initialize ClickHouse")?;
+            let bus = connect_bus().await?;
+            let consumer = bus.writer_consumer().await?;
+            let mut messages = consumer.messages().await?;
+            let batch = batch.clamp(1, 1024);
+            let cancel = CancellationToken::new();
+            let signal = cancel.clone();
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                signal.cancel();
+            });
+            println!("writer started: db {db}, batch {batch}");
+            let mut written = 0u64;
+            loop {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let mut pending = Vec::with_capacity(batch);
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+                while pending.len() < batch {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match tokio::time::timeout(remaining, messages.next()).await {
+                        Ok(Some(Ok(message))) => pending.push(message),
+                        Ok(Some(Err(error))) => {
+                            tracing::warn!(%error, "NATS writer message error");
+                            break;
+                        }
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+                if pending.is_empty() {
+                    continue;
+                }
+                pending.sort_by_key(|message| message.batch.tick);
+                let batches = pending
+                    .iter()
+                    .map(|message| message.batch.clone())
+                    .collect::<Vec<_>>();
+                let events = batches
+                    .iter()
+                    .map(bus::TickEvent::from_batch)
+                    .collect::<Vec<_>>();
+                match store.write_ticks(&batches).await {
+                    Ok(outcomes) => {
+                        written += outcomes.len() as u64;
+                        for (message, event) in pending.into_iter().zip(events) {
+                            if let Err(error) = message.ack().await {
+                                tracing::warn!(%error, "NATS writer ack failed");
+                            }
+                            if let Err(error) = bus.publish_committed(&event).await {
+                                tracing::debug!(%error, "committed event publish failed");
+                            }
+                        }
+                        if written % 1_000 < batches.len() as u64 {
+                            tracing::info!(
+                                tick = batches.last().map(|batch| batch.tick).unwrap_or_default(),
+                                written,
+                                "writer committed ticks"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "ClickHouse batch write failed; retrying");
+                        for message in pending {
+                            let _ = message.nak().await;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                }
+            }
+            println!("writer stopped after {written} ticks");
+        }
         Command::DbInit => {
             let url =
                 std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
@@ -318,6 +519,61 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         }
+        Command::RebuildIdentities { version, dry_run } => {
+            let url =
+                std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
+            let db = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "glyph".into());
+            let store = ClickHouseStore::new(&url, &db)?;
+            let version = match version {
+                Some(version) => version,
+                None => store
+                    .head()
+                    .await
+                    .context("read head")?
+                    .map_or(0, |head| u64::from(head.tick)),
+            };
+            let totals = store
+                .identity_totals_from_events()
+                .await
+                .context("aggregate identity events")?;
+            let zero = qubic::PublicKey([0u8; 32]).to_identity();
+            let mut rows = Vec::with_capacity(totals.len());
+            let mut skipped = 0u64;
+            for total in totals {
+                if total.identity == zero {
+                    continue;
+                }
+                let Ok(key) = qubic::PublicKey::from_identity(&total.identity) else {
+                    skipped += 1;
+                    continue;
+                };
+                rows.push(store::IdentityRow {
+                    identity: total.identity,
+                    public_key: key.to_hex(),
+                    balance: total.incoming_amount.saturating_sub(total.outgoing_amount),
+                    incoming_amount: total.incoming_amount,
+                    outgoing_amount: total.outgoing_amount,
+                    transfer_count: total.transfer_count,
+                    first_seen_tick: total.first_seen_tick,
+                    last_seen_tick: total.last_seen_tick,
+                });
+            }
+            if !dry_run {
+                store
+                    .replace_identities(&rows, version)
+                    .await
+                    .context("replace identities")?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "identities": rows.len(),
+                    "skipped": skipped,
+                    "version": version,
+                    "dry_run": dry_run,
+                }))?
+            );
+        }
         Command::Serve { bind } => {
             let url =
                 std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
@@ -329,6 +585,30 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+async fn connect_bus() -> anyhow::Result<bus::Bus> {
+    let config =
+        bus::BusConfig::from_env().context("NATS_URL must be set for fetcher/writer roles")?;
+    let bus = bus::Bus::connect(config).await.context("connect NATS")?;
+    bus.ensure_stream()
+        .await
+        .context("ensure JetStream stream")?;
+    Ok(bus)
+}
+
+struct NatsSink {
+    bus: bus::Bus,
+}
+
+#[async_trait::async_trait]
+impl indexer::BatchSink for NatsSink {
+    async fn publish(&self, batch: &store::TickBatch) -> indexer::Result<()> {
+        self.bus
+            .publish_tick(batch)
+            .await
+            .map_err(|error| indexer::Error::Config(format!("NATS publish failed: {error}")))
+    }
 }
 
 fn archive_from_env() -> anyhow::Result<Option<SharedArchive>> {

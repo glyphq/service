@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 node = { path = "../node" }
 qubic = { path = "../qubic" }
 store = { path = "../store" }

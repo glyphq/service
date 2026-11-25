@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+bus = { path = "../bus" }
 api = { path = "../api" }
 archive = { path = "../archive" }
 indexer = { path = "../indexer" }

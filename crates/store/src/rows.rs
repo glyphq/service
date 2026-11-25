@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ActivityBucket, AssetRow, AssetTransferRow, ComputorRow, CounterpartyRow, EpochMetadata,
     EpochRow, EventParticipantRow, EventRow, EventTypeCount, FlowBucket, IdentityActivityRow,
-    IdentityRow, PricePointRow, QuorumEvidenceRow, Result, TickRow, TransactionRow,
+    IdentityRow, IdentityTotals, PricePointRow, QuorumEvidenceRow, Result, TickRow, TransactionRow,
 };
 
 /// RowBinary encodes `FixedString(N)` as N raw bytes. Serde's array impl only
@@ -461,6 +461,29 @@ pub(crate) struct IdentitySelect {
     pub transfer_count: u64,
     pub first_seen_tick: u32,
     pub last_seen_tick: u32,
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct IdentityTotalsSelect {
+    pub identity: String,
+    pub incoming: i64,
+    pub outgoing: i64,
+    pub transfer_count: u64,
+    pub first_seen_tick: u32,
+    pub last_seen_tick: u32,
+}
+
+impl From<IdentityTotalsSelect> for IdentityTotals {
+    fn from(row: IdentityTotalsSelect) -> Self {
+        Self {
+            identity: row.identity,
+            incoming_amount: row.incoming,
+            outgoing_amount: row.outgoing,
+            transfer_count: row.transfer_count,
+            first_seen_tick: row.first_seen_tick,
+            last_seen_tick: row.last_seen_tick,
+        }
+    }
 }
 
 impl From<IdentitySelect> for IdentityRow {

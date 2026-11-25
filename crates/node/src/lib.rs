@@ -1233,7 +1233,8 @@ impl Peer {
                 Ok(LogProtocol::TxRanges)
             }
             Err(Error::EndResponse(_)) => {
-                self.set_log_protocol(LogProtocol::NoLogging);
+                // Do not cache this: a peer that has not generated logs for
+                // this particular tick may still serve a later tick.
                 Ok(LogProtocol::NoLogging)
             }
             Err(Error::TryAgain(_)) | Err(Error::Timeout(_)) => {
@@ -3964,7 +3965,8 @@ mod tests {
     /// logging at all.
     async fn fake_peer_optional_logs(
         listener: TcpListener,
-        fallback: bool,
+        all_ranges: bool,
+        tx_ranges: bool,
         requests: Option<tokio::sync::mpsc::UnboundedSender<MessageType>>,
     ) {
         let (mut stream, _) = listener.accept().await.unwrap();
@@ -4036,7 +4038,7 @@ mod tests {
                     send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
                 }
                 MessageType::RequestAllLogIdRangesFromTx => {
-                    if fallback {
+                    if all_ranges {
                         send(
                             &mut stream,
                             MessageType::RespondAllLogIdRangesFromTx,
@@ -4048,10 +4050,32 @@ mod tests {
                         send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
                     }
                 }
+                MessageType::RequestLogIdRangeFromTx => {
+                    if tx_ranges {
+                        let tx_id = u32::from_le_bytes(payload[36..40].try_into().unwrap());
+                        let (from, length) = if tx_id == TX_PER_TICK as u32 {
+                            (5i64, 2i64)
+                        } else {
+                            (-1i64, -1i64)
+                        };
+                        let mut range = Vec::with_capacity(16);
+                        range.extend_from_slice(&from.to_le_bytes());
+                        range.extend_from_slice(&length.to_le_bytes());
+                        send(
+                            &mut stream,
+                            MessageType::RespondLogIdRangeFromTx,
+                            dejavu,
+                            range,
+                        )
+                        .await;
+                    } else {
+                        send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
+                    }
+                }
                 MessageType::RequestLog => {
                     let from = u64::from_le_bytes(payload[32..40].try_into().unwrap());
                     let to = u64::from_le_bytes(payload[40..48].try_into().unwrap());
-                    if fallback && from <= to {
+                    if (all_ranges || tx_ranges) && from <= to {
                         let mut page = Vec::new();
                         for log_id in from..=to {
                             page.extend_from_slice(&log_event(log_id));
@@ -4070,13 +4094,31 @@ mod tests {
         peer_with_optional_logs_counted(fallback).await.0
     }
 
+    async fn peer_with_tx_logs() -> Peer {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(fake_peer_optional_logs(listener, false, true, None));
+        Peer::connect(
+            PeerConfig::new(addr)
+                .with_timeout(Duration::from_secs(2))
+                .with_connect_timeout(Duration::from_secs(2)),
+        )
+        .await
+        .unwrap()
+    }
+
     async fn peer_with_optional_logs_counted(
         fallback: bool,
     ) -> (Peer, tokio::sync::mpsc::UnboundedReceiver<MessageType>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (requests, received) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(fake_peer_optional_logs(listener, fallback, Some(requests)));
+        tokio::spawn(fake_peer_optional_logs(
+            listener,
+            fallback,
+            false,
+            Some(requests),
+        ));
         let peer = Peer::connect(
             PeerConfig::new(addr)
                 .with_timeout(Duration::from_secs(2))
@@ -4117,6 +4159,23 @@ mod tests {
         assert_eq!(bundle.log_ranges.count(), 0);
         assert!(!bundle.logs_complete);
         assert!(!bundle.warnings.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bundle_fetches_logs_from_per_transaction_ranges() {
+        let mut peer = peer_with_tx_logs().await;
+        let bundle = peer.bundle(TICK).await.unwrap();
+        assert_eq!(bundle.log_ranges.range(), Some((5, 6)));
+        assert_eq!(
+            bundle
+                .logs
+                .iter()
+                .map(|event| event.log_id)
+                .collect::<Vec<_>>(),
+            [5, 6]
+        );
+        assert!(bundle.logs_complete);
+        assert!(bundle.warnings.is_empty(), "{:?}", bundle.warnings);
     }
 
     #[tokio::test]
@@ -4221,7 +4280,11 @@ mod tests {
             .ok()
             .and_then(|tick| tick.parse().ok())
             .unwrap_or(92_273_000u32);
-        for addr in peers.split(',').map(str::trim).filter(|addr| !addr.is_empty()) {
+        for addr in peers
+            .split(',')
+            .map(str::trim)
+            .filter(|addr| !addr.is_empty())
+        {
             let started = std::time::Instant::now();
             let config = PeerConfig::new(addr.parse().expect("peer address"))
                 .with_timeout(Duration::from_secs(10));

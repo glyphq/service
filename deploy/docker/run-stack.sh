@@ -52,6 +52,7 @@ s3_user="${S3_ACCESS_KEY:-glyph}"
 s3_password="${S3_SECRET_KEY:-glyph-dev-secret}"
 s3_bucket="${S3_BUCKET:-glyph-archive}"
 s3_config="$repo_root/.data/seaweedfs/s3.json"
+nats_url="${NATS_URL:-nats://glyph-nats:4222}"
 log_opts=(--log-opt max-size=10m --log-opt max-file=3)
 
 app_env=(
@@ -83,6 +84,7 @@ app_env=(
   -e "PRICE_POLL_MS=${PRICE_POLL_MS:-60000}"
   -e "MARKET_ENABLED=${MARKET_ENABLED:-true}"
   -e "MARKET_POLL_MS=${MARKET_POLL_MS:-5000}"
+  -e "NATS_URL=$nats_url"
 )
 
 ensure_network() {
@@ -148,6 +150,15 @@ EOF
     docker start glyph-seaweedfs >/dev/null
   fi
 
+  if ! docker container inspect glyph-nats >/dev/null 2>&1; then
+    docker run -d --name glyph-nats --network "$network" \
+      --restart unless-stopped "${log_opts[@]}" \
+      -v glyph-nats-data:/data \
+      nats:2.10 -js -sd /data -m 8222 --max_payload 16777216 >/dev/null
+  else
+    docker start glyph-nats >/dev/null
+  fi
+
   for _ in $(seq 1 60); do
     if docker exec glyph-clickhouse clickhouse-client "${clickhouse_auth[@]}" \
       --query 'SELECT 1' \
@@ -176,6 +187,8 @@ EOF
   remove_container glyph-caddy
   remove_container glyph-api
   remove_container glyph-indexer
+  remove_container glyph-fetcher
+  remove_container glyph-writer
 
   for _ in $(seq 1 60); do
     if docker run --rm --network "$network" \
@@ -206,19 +219,30 @@ EOF
     --endpoint-url http://glyph-seaweedfs:8333 \
     s3api head-bucket --bucket "$s3_bucket" >/dev/null
 
-  docker run -d --name glyph-indexer --network "$network" \
+  docker run -d --name glyph-writer --network "$network" \
     --restart unless-stopped "${log_opts[@]}" \
     --stop-signal SIGINT --stop-timeout 30 \
     "${app_env[@]}" \
-    -e "RUST_LOG=${GLYPH_INDEXER_LOG:-info}" \
+    -e "RUST_LOG=${GLYPH_WRITER_LOG:-info}" \
+    -e "WRITER_BATCH=${WRITER_BATCH:-256}" \
+    "$image" writer >/dev/null
+
+  docker run -d --name glyph-fetcher --network "$network" \
+    --restart unless-stopped "${log_opts[@]}" \
+    --stop-signal SIGINT --stop-timeout 30 \
+    "${app_env[@]}" \
+    -e "RUST_LOG=${GLYPH_FETCHER_LOG:-info}" \
     -e "GLYPH_FROM_TICK=${GLYPH_FROM_TICK:-}" \
     -e "INDEXER_FETCH_CONCURRENCY=${INDEXER_FETCH_CONCURRENCY:-32}" \
     -e "INDEXER_FETCH_WINDOW=${INDEXER_FETCH_WINDOW:-512}" \
-    -e "INDEXER_WRITE_BATCH=${INDEXER_WRITE_BATCH:-128}" \
-    -e "INDEXER_WRITE_FLUSH_MS=${INDEXER_WRITE_FLUSH_MS:-250}" \
-    -e "INDEXER_DISCOVER_PEERS=${INDEXER_DISCOVER_PEERS:-false}" \
+    -e "INDEXER_FETCH_BATCH=${INDEXER_FETCH_BATCH:-32}" \
+    -e "INDEXER_BATCH_MIN_LAG=${INDEXER_BATCH_MIN_LAG:-2}" \
+    -e "INDEXER_VERIFY_CONCURRENCY=${INDEXER_VERIFY_CONCURRENCY:-3}" \
+    -e "INDEXER_WRITE_BATCH=${INDEXER_WRITE_BATCH:-64}" \
+    -e "INDEXER_WRITE_FLUSH_MS=${INDEXER_WRITE_FLUSH_MS:-100}" \
+    -e "INDEXER_DISCOVER_PEERS=${INDEXER_DISCOVER_PEERS:-true}" \
     -e "GLYPH_VERIFY_SIGNATURES=${GLYPH_VERIFY_SIGNATURES:-false}" \
-    "$image" indexer >/dev/null
+    "$image" fetcher >/dev/null
 
   docker run -d --name glyph-api --network "$network" \
     --restart unless-stopped "${log_opts[@]}" \
@@ -251,6 +275,9 @@ down() {
   remove_container glyph-caddy
   remove_container glyph-api
   remove_container glyph-indexer
+  remove_container glyph-fetcher
+  remove_container glyph-writer
+  remove_container glyph-nats
   remove_container glyph-seaweedfs
   remove_container glyph-clickhouse
 }

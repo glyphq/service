@@ -12,6 +12,27 @@ pub mod rows;
 pub mod schema;
 pub mod writer;
 
+mod serde_signature {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_bytes(bytes)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        bytes.try_into().map_err(|bytes: Vec<u8>| {
+            D::Error::custom(format!("signature needs 64 bytes, got {}", bytes.len()))
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("clickhouse: {0}")]
@@ -97,6 +118,18 @@ pub struct IdentityRow {
     pub identity: String,
     pub public_key: String,
     pub balance: i64,
+    pub incoming_amount: i64,
+    pub outgoing_amount: i64,
+    pub transfer_count: u64,
+    pub first_seen_tick: u32,
+    pub last_seen_tick: u32,
+}
+
+/// Aggregated QU activity derived from the stored log events. Rebuilding from
+/// events avoids replaying the chain when an epoch is re-indexed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdentityTotals {
+    pub identity: String,
     pub incoming_amount: i64,
     pub outgoing_amount: i64,
     pub transfer_count: u64,
@@ -411,7 +444,7 @@ pub struct EventFilter {
 /// Identity rows are absolute snapshots as of `tick`, not deltas, so replaying
 /// the same batch is a no-op. Transaction and event rows must carry the same
 /// tick as the batch; the writer uses the batch version for all of them.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TickBatch {
     pub epoch: u16,
     pub tick: u32,
@@ -422,6 +455,7 @@ pub struct TickBatch {
     /// replacing a tick whose contents changed (for example after a reorg).
     pub version: u64,
     /// Raw SchnorrQ signature over the tick.
+    #[serde(with = "serde_signature")]
     pub signature: [u8; 64],
     /// K12 digest of the tick.
     pub tick_digest: [u8; 32],
@@ -623,6 +657,19 @@ pub trait Store: Send + Sync {
             }
         }
         Ok(rows)
+    }
+    /// Recomputes per-identity QU totals from the `events` table.
+    async fn identity_totals_from_events(&self) -> Result<Vec<IdentityTotals>> {
+        Err(Error::Config(
+            "identity event aggregation is not supported by this store".into(),
+        ))
+    }
+    /// Replaces the global identity table with snapshots written at `version`.
+    async fn replace_identities(&self, rows: &[IdentityRow], version: u64) -> Result<()> {
+        let _ = (rows, version);
+        Err(Error::Config(
+            "identity replacement is not supported by this store".into(),
+        ))
     }
     /// Identities with the highest transfer counts, then highest balance,
     /// then canonical identity.
@@ -1731,6 +1778,72 @@ LIMIT ? OFFSET ?
                 (row.identity.clone(), row)
             })
             .collect())
+    }
+
+    async fn identity_totals_from_events(&self) -> Result<Vec<IdentityTotals>> {
+        // QU transfers touch both sides exactly as `apply_transfer` does.
+        // Burns only add to the outgoing side and do not bump the count.
+        let rows = self
+            .client
+            .query(
+                "SELECT identity, \
+                        toInt64(sum(incoming)) AS incoming, \
+                        toInt64(sum(outgoing)) AS outgoing, \
+                        toUInt64(sum(transfers)) AS transfer_count, \
+                        toUInt32(min(tick)) AS first_seen_tick, \
+                        toUInt32(max(tick)) AS last_seen_tick \
+                 FROM (\
+                     SELECT JSONExtractString(body, 'to') AS identity, \
+                            JSONExtractInt(body, 'amount') AS incoming, \
+                            0 AS outgoing, 1 AS transfers, tick \
+                     FROM events WHERE type_name = 'qu_transfer' \
+                     UNION ALL \
+                     SELECT JSONExtractString(body, 'from') AS identity, \
+                            0 AS incoming, JSONExtractInt(body, 'amount') AS outgoing, \
+                            1 AS transfers, tick \
+                     FROM events WHERE type_name = 'qu_transfer' \
+                     UNION ALL \
+                     SELECT JSONExtractString(body, 'from') AS identity, \
+                            0 AS incoming, JSONExtractInt(body, 'amount') AS outgoing, \
+                            0 AS transfers, tick \
+                     FROM events WHERE type_name = 'burning' \
+                     UNION ALL \
+                     SELECT JSONExtractString(burn, 'identity') AS identity, \
+                            0 AS incoming, JSONExtractInt(burn, 'amount') AS outgoing, \
+                            0 AS transfers, tick \
+                     FROM (\
+                         SELECT arrayJoin(JSONExtractArrayRaw(body, 'burns')) AS burn, tick \
+                         FROM events WHERE type_name = 'dust_burning'\
+                     )\
+                 ) \
+                 WHERE identity != '' \
+                 GROUP BY identity",
+            )
+            .fetch_all::<rows::IdentityTotalsSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn replace_identities(&self, rows: &[IdentityRow], version: u64) -> Result<()> {
+        self.client
+            .query("TRUNCATE TABLE identities")
+            .execute()
+            .await?;
+        let inserts = rows
+            .iter()
+            .map(|row| rows::IdentityInsert {
+                identity: row.identity.clone(),
+                public_key: row.public_key.clone(),
+                balance: row.balance,
+                incoming_amount: row.incoming_amount,
+                outgoing_amount: row.outgoing_amount,
+                transfer_count: row.transfer_count,
+                first_seen_tick: row.first_seen_tick,
+                last_seen_tick: row.last_seen_tick,
+                version,
+            })
+            .collect::<Vec<_>>();
+        writer::insert_all(&self.client, "identities", &inserts).await
     }
 
     async fn top_identities(&self, limit: u32) -> Result<Vec<IdentityRow>> {

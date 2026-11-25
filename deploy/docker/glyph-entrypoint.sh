@@ -6,6 +6,8 @@
 #
 #   api       Run glyph-api (default; the Dockerfile CMD is "api").
 #   indexer   Run `glyph sync` with peers from QUBIC_PEERS.
+#   fetcher   Run `glyph fetcher`, publishing verified ticks to NATS.
+#   writer    Run `glyph writer`, consuming NATS into ClickHouse.
 #   glyph     Run the glyph CLI verbatim (for example: glyph head --peer ...).
 #   <cmd>     Exec any other command, which keeps `docker run image bash` useful.
 #
@@ -31,11 +33,15 @@ case "$role" in
   api | glyph-api)
     exec /usr/local/bin/glyph-api "$@"
     ;;
-  indexer)
+  indexer | fetcher)
     peers="${QUBIC_PEERS:-157.180.10.49:21841}"
     read -r -a peer_list <<<"${peers//,/ }"
 
-    args=(sync)
+    if [[ "$role" == "fetcher" ]]; then
+      args=(fetcher)
+    else
+      args=(sync)
+    fi
     for peer in "${peer_list[@]}"; do
       if [[ -n "$peer" ]]; then
         args+=(--peer "$peer")
@@ -62,7 +68,15 @@ case "$role" in
         ;;
     esac
 
-    log "starting indexer for peers: ${peer_list[*]}"
+    log "starting $role for peers: ${peer_list[*]}"
+    exec /usr/local/bin/glyph "${args[@]}"
+    ;;
+  writer)
+    args=(writer)
+    if [[ -n "${WRITER_BATCH:-}" ]]; then
+      args+=(--batch "$WRITER_BATCH")
+    fi
+    log "starting NATS writer"
     exec /usr/local/bin/glyph "${args[@]}"
     ;;
   glyph)

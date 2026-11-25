@@ -478,8 +478,18 @@ pub struct Indexer<S: Store + 'static> {
     pool: NodePool,
     config: IndexerConfig,
     archive_policy: ArchivePolicy,
+    sink: Option<Arc<dyn BatchSink>>,
     /// Absolute identity snapshots as of the last persisted tick.
     identities: HashMap<[u8; 32], IdentityRow>,
+}
+
+/// Destination for verified tick batches.
+///
+/// The combined indexer writes directly to ClickHouse. A microservice fetcher
+/// installs a JetStream sink and leaves persistence to the writer service.
+#[async_trait::async_trait]
+pub trait BatchSink: Send + Sync {
+    async fn publish(&self, batch: &TickBatch) -> Result<()>;
 }
 
 impl<S: Store + 'static> Indexer<S> {
@@ -506,8 +516,15 @@ impl<S: Store + 'static> Indexer<S> {
             pool,
             config,
             archive_policy: ArchivePolicy::from_env(),
+            sink: None,
             identities: HashMap::new(),
         })
+    }
+
+    /// Routes verified batches to `sink` instead of ClickHouse.
+    pub fn with_sink(mut self, sink: Arc<dyn BatchSink>) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     /// Runs until `cancel` is triggered.
@@ -1084,16 +1101,24 @@ impl<S: Store + 'static> Indexer<S> {
             }
         }
         let started = Instant::now();
-        let outcomes = self.store.write_ticks(batches).await?;
         let stored = batches.len();
-        *next = next_after_flush(*next, outcomes.iter().map(|outcome| outcome.tick).max());
+        if let Some(sink) = &self.sink {
+            for batch in batches.iter() {
+                sink.publish(batch).await?;
+            }
+            *next = next_after_flush(*next, batches.iter().map(|batch| batch.tick).max());
+        } else {
+            let outcomes = self.store.write_ticks(batches).await?;
+            *next = next_after_flush(*next, outcomes.iter().map(|outcome| outcome.tick).max());
+        }
         batches.clear();
         archives.clear();
         tracing::debug!(
             ticks = stored,
             next = *next,
             elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
-            "tick batches stored"
+            sink = self.sink.is_some(),
+            "tick batches delivered"
         );
         Ok(stored)
     }
@@ -2160,12 +2185,38 @@ async fn dispatch_loop(
 ) {
     let mut retries = std::collections::VecDeque::<(Instant, u32, u32, u32)>::new();
     let mut assigned_upto = None;
+    let mut last_write = next_write.load(Ordering::Acquire);
+    let mut stalled_since = Instant::now();
+    let mut last_anchor = Instant::now();
 
     loop {
         if cancel.is_cancelled() {
             return;
         }
         let now = Instant::now();
+
+        let write_tick = next_write.load(Ordering::Acquire);
+        if write_tick != last_write {
+            last_write = write_tick;
+            stalled_since = now;
+        }
+        // A dropped result or a retry removed while the window was full would
+        // otherwise leave a permanent hole below `assigned_upto` while the
+        // dispatcher keeps assigning newer ticks. Re-anchor at the write
+        // cursor when it has not moved for a couple of seconds.
+        if assigned_upto.is_some_and(|upto| upto >= write_tick)
+            && now.duration_since(stalled_since) >= Duration::from_secs(2)
+            && now.duration_since(last_anchor) >= Duration::from_secs(2)
+        {
+            tracing::warn!(
+                next = write_tick,
+                assigned_upto,
+                pending = pending.load(Ordering::Acquire),
+                "dispatcher did not advance; re-anchoring at the write cursor"
+            );
+            assigned_upto = Some(write_tick.saturating_sub(1));
+            last_anchor = now;
+        }
 
         if let Some(position) = retries.iter().position(|(at, _, _, _)| *at <= now) {
             let (_, mut start, mut count, attempt) = retries.remove(position).expect("retry entry");
@@ -2203,6 +2254,10 @@ async fn dispatch_loop(
                     pending.fetch_sub(count as usize, Ordering::Release);
                     return;
                 }
+                continue;
+            } else {
+                // The window is full. Keep the request instead of dropping it.
+                retries.push_back((now + Duration::from_millis(20), start, count, attempt));
                 continue;
             }
         }
