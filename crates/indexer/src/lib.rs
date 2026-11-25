@@ -44,6 +44,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Ticks this close to the head may not be archived yet. Never skip them;
 /// wait for a peer or the archive to publish the data instead.
 const LIVE_HEAD_MARGIN: u32 = 256;
+/// Quorum votes for tick `N` complete while `N + 1` runs. Stay a few ticks
+/// behind the reported head so live ticks always have their full vote set.
+const LIVE_HEAD_LAG: u32 = 3;
 
 #[derive(Clone)]
 pub struct IndexerConfig {
@@ -316,6 +319,7 @@ impl<T> OrderedBuffer<T> {
 }
 
 fn dispatch_upper_bound(next_write: u32, head_tick: u32, window: usize) -> Option<u32> {
+    let head_tick = head_tick.saturating_sub(LIVE_HEAD_LAG);
     if head_tick < next_write {
         return None;
     }
@@ -3014,11 +3018,17 @@ mod tests {
     #[test]
     fn dispatch_window_never_runs_past_the_head_or_window() {
         assert_eq!(dispatch_upper_bound(100, 1_000, 64), Some(163));
-        assert_eq!(dispatch_upper_bound(100, 120, 64), Some(120));
-        assert_eq!(dispatch_upper_bound(100, 99, 64), None);
+        assert_eq!(dispatch_upper_bound(100, 120, 64), Some(117));
         assert_eq!(
-            dispatch_upper_bound(u32::MAX - 1, u32::MAX, 64),
-            Some(u32::MAX)
+            dispatch_upper_bound(117, 120, 1),
+            Some(117),
+            "the live vote lag is reserved from the head"
+        );
+        assert_eq!(dispatch_upper_bound(100, 99, 64), None);
+        assert_eq!(dispatch_upper_bound(u32::MAX - 1, u32::MAX, 64), None);
+        assert_eq!(
+            dispatch_upper_bound(u32::MAX - 4, u32::MAX, 64),
+            Some(u32::MAX - 3)
         );
     }
 
@@ -3283,7 +3293,7 @@ mod tests {
     async fn dispatcher_uses_single_ticks_at_the_head() {
         let head = Arc::new(AsyncRwLock::new(Head {
             epoch: 1,
-            tick: 100,
+            tick: 103,
             initial_tick: 100,
             tick_duration: 1_000,
         }));
