@@ -1204,10 +1204,12 @@ impl Peer {
     }
 
     fn prefetch_timeout(&self, ticks: usize) -> Duration {
-        self.config
-            .timeout
-            .saturating_mul(ticks.clamp(1, 16) as u32)
-            .min(Duration::from_secs(60))
+        // A batch is a pipelined request, not `ticks` serial requests. Allow
+        // two seconds of headroom plus 100 ms per tick; a peer that cannot
+        // answer in that budget is unhealthy and the batch should rotate.
+        Duration::from_secs(2)
+            .saturating_add(Duration::from_millis(ticks.clamp(1, 64) as u64 * 100))
+            .min(Duration::from_secs(6))
     }
 
     /// Idle budget for a log response. A batch with thousands of pipelined

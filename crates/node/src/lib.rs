@@ -1954,6 +1954,14 @@ impl NodePool {
             if candidates.is_empty() {
                 return Err(Error::NoPeers);
             }
+            if let Some(preferred) = *self.log_peer.lock().expect("log peer mutex poisoned") {
+                if let Some(index) = candidates
+                    .iter()
+                    .position(|config| config.addr == preferred)
+                {
+                    candidates.swap(0, index);
+                }
+            }
             let mut last_error = None;
             while !candidates.is_empty() {
                 let Some((config, index)) = self.reserve_best_available(&candidates) else {

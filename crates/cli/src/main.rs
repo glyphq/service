@@ -324,7 +324,15 @@ async fn main() -> anyhow::Result<()> {
             }
             let verify = verify_signatures && !no_verify_signatures;
             let config = IndexerConfig {
-                peers: peers.iter().copied().map(PeerConfig::new).collect(),
+                peers: peers
+                    .iter()
+                    .copied()
+                    .map(|addr| {
+                        PeerConfig::new(addr)
+                            .with_retries(1)
+                            .with_timeout(std::time::Duration::from_secs(4))
+                    })
+                    .collect(),
                 start_tick: from,
                 poll_interval: std::time::Duration::from_millis(poll_ms),
                 verify_signatures: verify,
@@ -376,7 +384,15 @@ async fn main() -> anyhow::Result<()> {
             }
             let verify = verify_signatures && !no_verify_signatures;
             let config = IndexerConfig {
-                peers: peers.iter().copied().map(PeerConfig::new).collect(),
+                peers: peers
+                    .iter()
+                    .copied()
+                    .map(|addr| {
+                        PeerConfig::new(addr)
+                            .with_retries(1)
+                            .with_timeout(std::time::Duration::from_secs(4))
+                    })
+                    .collect(),
                 start_tick: from,
                 poll_interval: std::time::Duration::from_millis(poll_ms),
                 verify_signatures: verify,
