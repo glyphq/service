@@ -46,7 +46,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 const LIVE_HEAD_MARGIN: u32 = 256;
 /// Quorum votes for tick `N` complete while `N + 1` runs. Stay a few ticks
 /// behind the reported head so live ticks always have their full vote set.
-const LIVE_HEAD_LAG: u32 = 3;
+const LIVE_HEAD_LAG: u32 = 8;
 
 #[derive(Clone)]
 pub struct IndexerConfig {
@@ -1197,12 +1197,13 @@ impl<S: Store + 'static> Indexer<S> {
             if message.starts_with("no votes for tick")
                 || message.starts_with("tick data digest does not match")
             {
+                tracing::debug!(tick = next, "waiting for complete quorum votes");
                 retry
                     .send(RetryRequest {
                         start: next,
                         count: 1,
                         attempt: attempt.saturating_add(1),
-                        delay: Duration::from_millis(250),
+                        delay: Duration::from_secs(1),
                     })
                     .await
                     .ok();
@@ -3018,17 +3019,17 @@ mod tests {
     #[test]
     fn dispatch_window_never_runs_past_the_head_or_window() {
         assert_eq!(dispatch_upper_bound(100, 1_000, 64), Some(163));
-        assert_eq!(dispatch_upper_bound(100, 120, 64), Some(117));
+        assert_eq!(dispatch_upper_bound(100, 120, 64), Some(112));
         assert_eq!(
-            dispatch_upper_bound(117, 120, 1),
+            dispatch_upper_bound(117, 125, 1),
             Some(117),
             "the live vote lag is reserved from the head"
         );
         assert_eq!(dispatch_upper_bound(100, 99, 64), None);
         assert_eq!(dispatch_upper_bound(u32::MAX - 1, u32::MAX, 64), None);
         assert_eq!(
-            dispatch_upper_bound(u32::MAX - 4, u32::MAX, 64),
-            Some(u32::MAX - 3)
+            dispatch_upper_bound(u32::MAX - 9, u32::MAX, 64),
+            Some(u32::MAX - 8)
         );
     }
 
@@ -3293,7 +3294,7 @@ mod tests {
     async fn dispatcher_uses_single_ticks_at_the_head() {
         let head = Arc::new(AsyncRwLock::new(Head {
             epoch: 1,
-            tick: 103,
+            tick: 108,
             initial_tick: 100,
             tick_duration: 1_000,
         }));
