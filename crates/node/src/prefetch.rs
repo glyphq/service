@@ -168,8 +168,7 @@ impl Peer {
                             if part.votes.iter().any(|vote| !vote.is_empty_vote())
                                 || part.votes.is_empty()
                             {
-                                let non_empty = part.votes.iter().any(|vote| !vote.is_empty_vote());
-                                missing.push((index, part.tick, non_empty));
+                                missing.push((index, part.tick));
                                 parts[index] = Some(part);
                                 continue;
                             } else {
@@ -202,7 +201,7 @@ impl Peer {
             };
             let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
             let mut tasks = tokio::task::JoinSet::new();
-            for (index, tick, non_empty) in missing {
+            for (index, tick) in missing {
                 let archive = archive.clone();
                 let fallback = fallback.clone();
                 let semaphore = semaphore.clone();
@@ -223,13 +222,13 @@ impl Peer {
                         )),
                     };
                     match archived {
-                        Ok(data) => (index, tick, non_empty, Ok(data)),
+                        Ok(data) => (index, tick, Ok(data)),
                         Err(archive_error) => {
                             let Some(fallback) = fallback.as_ref() else {
-                                return (index, tick, non_empty, Err(archive_error));
+                                return (index, tick, Err(archive_error));
                             };
                             match fallback.tick_data(tick).await {
-                                Ok(data) => (index, tick, non_empty, Ok(data)),
+                                Ok(data) => (index, tick, Ok(data)),
                                 Err(peer_error) => {
                                     tracing::warn!(
                                         tick,
@@ -237,7 +236,7 @@ impl Peer {
                                         peers = %peer_error,
                                         "no source supplied missing tick data"
                                     );
-                                    (index, tick, non_empty, Err(peer_error))
+                                    (index, tick, Err(peer_error))
                                 }
                             }
                         }
@@ -246,17 +245,13 @@ impl Peer {
             }
             while let Some(joined) = tasks.join_next().await {
                 match joined {
-                    Ok((index, _tick, _non_empty, Ok(tick_data))) => {
+                    Ok((index, _tick, Ok(tick_data))) => {
                         if let Some(part) = parts[index].as_mut() {
                             part.tick_data = Some(tick_data);
                         }
                     }
-                    Ok((index, tick, non_empty, Err(error))) => {
-                        let error = if non_empty {
-                            Error::MissingNonEmptyTick { tick }
-                        } else {
-                            error
-                        };
+                    Ok((index, tick, Err(_error))) => {
+                        let error = Error::MissingNonEmptyTick { tick };
                         results[index] = Some(Err(match error {
                             Error::ArchiveNotAvailable(_) => {
                                 Error::EndResponse(MessageType::RequestTickData)
