@@ -15,8 +15,19 @@ fn peer() -> SocketAddr {
 #[ignore = "connects to a live Qubic peer"]
 async fn verifies_live_bundle() {
     let config = PeerConfig::new(peer()).with_timeout(Duration::from_secs(15));
-    let pool = NodePool::new(vec![config]);
-    let mut connection = pool.connect_best().await.expect("connect");
+    let mut configs = vec![config.clone()];
+    for fallback in std::env::var("QUBIC_FALLBACK_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+    {
+        configs.push(PeerConfig::new(
+            fallback.parse().expect("QUBIC_FALLBACK_PEERS must be addresses"),
+        ));
+    }
+    let pool = NodePool::new(configs);
+    let mut connection = node::Peer::connect(config).await.expect("connect");
     let head = connection.head().await.expect("head");
     let tick = std::env::var("QUBIC_TICK")
         .ok()
@@ -81,8 +92,19 @@ async fn verifies_live_prefetched_batch() {
         .map(|value| value.trim().parse().expect("QUBIC_TICKS must be u32s"))
         .collect::<Vec<u32>>();
     let config = PeerConfig::new(peer()).with_timeout(Duration::from_secs(15));
-    let pool = NodePool::new(vec![config]);
-    let mut connection = pool.connect_best().await.expect("connect");
+    let mut configs = vec![config.clone()];
+    for fallback in std::env::var("QUBIC_FALLBACK_PEERS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+    {
+        configs.push(PeerConfig::new(
+            fallback.parse().expect("QUBIC_FALLBACK_PEERS must be addresses"),
+        ));
+    }
+    let pool = NodePool::new(configs);
+    let mut connection = node::Peer::connect(config).await.expect("connect");
     let head = connection.head().await.expect("head");
     let computors = connection.computors().await.expect("computors");
     let bundles = connection

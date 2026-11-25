@@ -612,6 +612,15 @@ pub struct LogRanges {
 }
 
 impl LogRanges {
+    /// The range blob a fully verified tick with no logs carries: every slot
+    /// is `-1`, never zero.
+    pub fn empty() -> Self {
+        Self {
+            from_log_id: vec![-1; LOG_TX_PER_TICK],
+            length: vec![-1; LOG_TX_PER_TICK],
+        }
+    }
+
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() != LOG_RANGES_SIZE {
             return Err(Error::InvalidPacket(format!(
@@ -673,6 +682,88 @@ impl LogRanges {
             .filter(|(len, from)| **from >= 0 && **len > 0)
             .map(|(len, _)| *len)
             .sum()
+    }
+
+    /// Checks the structural rules Qubic uses when it stores a range blob.
+    ///
+    /// A slot is either unavailable (`from == length == -1`), pending
+    /// (`-3`), or a non-empty range (`from >= 0`, `length > 0`). Anything
+    /// else is not a range the network could have produced.
+    pub fn validate(&self) -> Result<()> {
+        if self.from_log_id.len() != LOG_TX_PER_TICK || self.length.len() != LOG_TX_PER_TICK {
+            return Err(Error::InvalidPacket(format!(
+                "log ranges need {LOG_TX_PER_TICK} slots, got {}/{}",
+                self.from_log_id.len(),
+                self.length.len()
+            )));
+        }
+        let mut intervals = Vec::with_capacity(LOG_TX_PER_TICK);
+        let mut total = 0i64;
+        for (slot, (from, length)) in self.from_log_id.iter().zip(self.length.iter()).enumerate() {
+            if *from == -1 && *length == -1 {
+                continue;
+            }
+            if *from == -3 || *length == -3 {
+                continue;
+            }
+            if *from < 0 || *length <= 0 {
+                return Err(Error::InvalidPacket(format!(
+                    "log range slot {slot} is invalid: from {from}, length {length}"
+                )));
+            }
+            let end = from
+                .checked_add(*length)
+                .ok_or_else(|| Error::InvalidPacket(format!("log range slot {slot} overflows")))?;
+            total = total.saturating_add(*length);
+            if total > 4_194_304 {
+                return Err(Error::InvalidPacket(format!(
+                    "log ranges declare {total} records, more than one tick can hold"
+                )));
+            }
+            intervals.push((*from, end));
+        }
+        intervals.sort_unstable();
+        for pair in intervals.windows(2) {
+            if pair[0].1 > pair[1].0 {
+                return Err(Error::InvalidPacket(
+                    "log ranges overlap or repeat a log id".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// True when `logs` contains exactly the records declared by these ranges.
+    ///
+    /// Count equality alone is not enough: a partial response plus an extra
+    /// record from another slot can have the right length while still missing
+    /// one declared log. This walks the declared ids in order so every one is
+    /// present exactly once.
+    pub fn covers(&self, logs: &[crate::logs::LogEvent]) -> bool {
+        if self.validate().is_err() || self.is_pending() {
+            return false;
+        }
+        if logs.len() as i64 != self.count() {
+            return false;
+        }
+        let mut intervals = self
+            .from_log_id
+            .iter()
+            .zip(self.length.iter())
+            .filter(|(from, length)| **from >= 0 && **length > 0)
+            .map(|(from, length)| (*from, *from + *length))
+            .collect::<Vec<_>>();
+        intervals.sort_unstable();
+        let mut index = 0usize;
+        for (start, end) in intervals {
+            for expected in start..end {
+                if logs[index].log_id as i64 != expected {
+                    return false;
+                }
+                index += 1;
+            }
+        }
+        index == logs.len()
     }
 }
 

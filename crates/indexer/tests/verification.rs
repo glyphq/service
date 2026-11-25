@@ -78,7 +78,7 @@ fn tick_data(digests: &[(usize, [u8; 32])]) -> TickData {
 fn empty_ranges() -> LogRanges {
     LogRanges {
         from_log_id: vec![-1; LOG_TX_PER_TICK],
-        length: vec![0; LOG_TX_PER_TICK],
+        length: vec![-1; LOG_TX_PER_TICK],
     }
 }
 

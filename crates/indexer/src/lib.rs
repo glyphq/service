@@ -1646,6 +1646,12 @@ fn verify_bundle_with(
             detail: "log ranges or records were not fully fetched".into(),
         });
     }
+    if let Err(error) = bundle.log_ranges.validate() {
+        return Err(Error::IncompleteTick {
+            tick: tick_number,
+            detail: format!("invalid log ranges: {error}"),
+        });
+    }
 
     let vote_started = Instant::now();
 
@@ -1842,11 +1848,14 @@ fn verify_bundle_with(
             });
         }
     }
-    let expected_logs = bundle.log_ranges.count();
-    if (bundle.logs.len() as i64) != expected_logs {
+    if !bundle.log_ranges.covers(&bundle.logs) {
         return Err(Error::IncompleteTick {
             tick: tick_number,
-            detail: format!("fetched {}/{} logs", bundle.logs.len(), expected_logs),
+            detail: format!(
+                "fetched {}/{} logs, log ids do not exactly match ranges",
+                bundle.logs.len(),
+                bundle.log_ranges.count()
+            ),
         });
     }
     tracing::debug!(
@@ -3024,10 +3033,7 @@ mod tests {
             tick_data,
             votes: Vec::new(),
             transactions: Vec::new(),
-            log_ranges: qubic::messages::LogRanges {
-                from_log_id: vec![-1; LOG_TX_PER_TICK],
-                length: vec![0; LOG_TX_PER_TICK],
-            },
+            log_ranges: qubic::messages::LogRanges::empty(),
             logs: Vec::new(),
             logs_complete: true,
             warnings: Vec::new(),

@@ -5,12 +5,12 @@ use std::time::Duration;
 use qubic::LogEvent;
 use qubic::crypto::schnorrq;
 use qubic::messages::{
-    ASSET_REQUEST_GET_SIBLINGS, COMPUTOR_COUNT, Computors, CurrentTickInfo, LOG_TX_PER_TICK,
-    LogRanges, MAX_AMOUNT, MAX_INPUT_SIZE, ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS,
-    ORACLE_REQUEST_QUERY_AND_RESPONSE, ORACLE_REQUEST_SUBSCRIPTION, ORACLE_RESPOND_QUERY_DATA,
-    ORACLE_RESPOND_QUERY_METADATA, ORACLE_RESPOND_REPLY_DATA, ORACLE_RESPOND_SUBSCRIPTION,
-    ORACLE_RESPOND_SUBSCRIPTION_IDS, OracleQueryMetadata, OracleQueryStatistics, OracleSubscriber,
-    OracleSubscription, PRICE_SERIES_MAX_POINTS, PeerAddress, QUORUM, RequestAssets, RespondAssets,
+    ASSET_REQUEST_GET_SIBLINGS, COMPUTOR_COUNT, Computors, CurrentTickInfo, LogRanges, MAX_AMOUNT,
+    MAX_INPUT_SIZE, ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS, ORACLE_REQUEST_QUERY_AND_RESPONSE,
+    ORACLE_REQUEST_SUBSCRIPTION, ORACLE_RESPOND_QUERY_DATA, ORACLE_RESPOND_QUERY_METADATA,
+    ORACLE_RESPOND_REPLY_DATA, ORACLE_RESPOND_SUBSCRIPTION, ORACLE_RESPOND_SUBSCRIPTION_IDS,
+    OracleQueryMetadata, OracleQueryStatistics, OracleSubscriber, OracleSubscription,
+    PRICE_SERIES_MAX_POINTS, PeerAddress, QUORUM, RequestAssets, RespondAssets,
     RespondAssetsWithSiblings, RespondContractFunction, RespondEntity, RespondIssuedAssets,
     RespondOracleData, RespondOwnedAssets, RespondPossessedAssets, RespondPriceSeries,
     RespondRevenueData, RespondTxStatus, SystemInfo, TX_PER_TICK, Tick, TickAlignment, TickData,
@@ -29,11 +29,24 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 pub mod health;
 mod prefetch;
 
-/// Capability is a property of the peer, not of one TCP connection. Fetch
-/// workers open short-lived connections, so cache the answer per address to
-/// avoid paying the probe timeout on every tick.
-fn log_ranges_cache() -> &'static std::sync::Mutex<HashMap<SocketAddr, bool>> {
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<SocketAddr, bool>>> =
+/// How a peer exposes per-tick log ranges.
+///
+/// This is a protocol capability, not a completeness claim. A peer can return
+/// `EndResponse` for a tick even when it supports a protocol (for example when
+/// the tick is not verified yet), so the protocol cache must never be used to
+/// decide that a tick has no logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogProtocol {
+    /// One `RequestAllLogIdRangesFromTick` packet for the whole tick.
+    AllRanges,
+    /// One `RequestLogIdRangeFromTx` packet per transaction/special slot.
+    TxRanges,
+    /// The peer answered `EndResponse` to both protocols.
+    NoLogging,
+}
+
+fn log_protocol_cache() -> &'static std::sync::Mutex<HashMap<SocketAddr, LogProtocol>> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<HashMap<SocketAddr, LogProtocol>>> =
         std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
 }
@@ -48,11 +61,10 @@ pub const DEFAULT_RETRIES: u32 = 2;
 /// the next retry, so broadcast connections use a tighter budget.
 const BROADCAST_CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
 const BROADCAST_HANDSHAKE_TIMEOUT: Duration = Duration::from_millis(1_500);
-/// Timeout for the all-ranges log request. Logs are optional, so this must not
-/// dominate a tick fetch on peers without logging.
+/// Idle timeout for one all-ranges log response. Qubic serves this from an
+/// in-memory/Redis lookup, so a slow answer means the peer does not have the
+/// tick's log data.
 pub const DEFAULT_LOG_RANGE_TIMEOUT: Duration = Duration::from_secs(1);
-/// Timeout for one per-transaction log range probe during fallback.
-pub const DEFAULT_LOG_FALLBACK_PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// Guard against a peer that keeps returning a partial log page forever.
 const MAX_LOG_PAGES: u32 = 1024;
@@ -113,10 +125,8 @@ pub struct PeerConfig {
     pub connect_timeout: Duration,
     /// Extra attempts after the first one.
     pub retries: u32,
-    /// Probe timeout for the optional all-ranges log request.
+    /// Idle timeout for the all-ranges log request.
     pub log_range_timeout: Duration,
-    /// Per-probe timeout for the per-transaction log fallback.
-    pub log_fallback_probe_timeout: Duration,
 }
 
 impl PeerConfig {
@@ -129,7 +139,6 @@ impl PeerConfig {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             retries: DEFAULT_RETRIES,
             log_range_timeout: DEFAULT_LOG_RANGE_TIMEOUT,
-            log_fallback_probe_timeout: DEFAULT_LOG_FALLBACK_PROBE_TIMEOUT,
         }
     }
 
@@ -155,11 +164,6 @@ impl PeerConfig {
 
     pub fn with_log_range_timeout(mut self, timeout: Duration) -> Self {
         self.log_range_timeout = timeout;
-        self
-    }
-
-    pub fn with_log_fallback_probe_timeout(mut self, timeout: Duration) -> Self {
-        self.log_fallback_probe_timeout = timeout;
         self
     }
 }
@@ -189,6 +193,31 @@ pub struct TickBundle {
     pub logs_complete: bool,
     /// Non-fatal problems, such as a peer that has logging disabled.
     pub warnings: Vec<String>,
+}
+
+/// Log data fetched for one tick, with an explicit proof flag.
+///
+/// `complete` is true only when a peer returned a decoded range payload and
+/// every declared log record was fetched. An absent or timed-out range request
+/// leaves this false even when the tick has no transaction slots: Qubic ticks
+/// can carry BEGIN_TICK/END_TICK logs without user transactions.
+#[derive(Debug, Clone)]
+pub struct FetchedLogs {
+    pub ranges: LogRanges,
+    pub logs: Vec<LogEvent>,
+    pub complete: bool,
+    pub warnings: Vec<String>,
+}
+
+impl FetchedLogs {
+    pub fn incomplete(reason: impl Into<String>) -> Self {
+        Self {
+            ranges: LogRanges::empty(),
+            logs: Vec::new(),
+            complete: false,
+            warnings: vec![reason.into()],
+        }
+    }
 }
 
 struct BundlePackets {
@@ -352,10 +381,9 @@ pub struct Peer {
     public_peers: Vec<PeerAddress>,
     /// A timed-out read may have consumed part of a packet; reconnect first.
     desynced: bool,
-    /// Whether the peer answers `RequestAllLogIdRangesFromTx` (`None` until the
-    /// first probe). Once `Some(false)`, later ticks skip the probe and go
-    /// straight to the per-transaction fallback.
-    log_ranges_supported: Option<bool>,
+    /// Cached log protocol. Set after the first successful/failed probe and
+    /// shared across short-lived connections through [`log_protocol_cache`].
+    log_protocol: Option<LogProtocol>,
     /// Latest head this connection reported. Used to reject backwards ticks
     /// and cached heads from before an epoch rollover.
     observed_head: Option<Head>,
@@ -366,7 +394,7 @@ impl Peer {
     pub async fn connect(config: PeerConfig) -> Result<Self> {
         let stream = Self::open(&config).await?;
         let (reader, writer) = stream.into_split();
-        let log_ranges_supported = log_ranges_cache()
+        let log_protocol = log_protocol_cache()
             .lock()
             .ok()
             .and_then(|cache| cache.get(&config.addr).copied());
@@ -378,7 +406,7 @@ impl Peer {
             pending: HashMap::new(),
             public_peers: Vec::new(),
             desynced: false,
-            log_ranges_supported,
+            log_protocol,
             observed_head: None,
         };
         peer.handshake().await?;
@@ -1143,19 +1171,12 @@ impl Peer {
 
     /// Requests the log id ranges for every transaction in a tick.
     ///
-    /// Peers without logging either answer `EndResponse` or time out. Both are
-    /// reported as [`Error::LogsUnavailable`] so callers can continue.
-    ///
-    /// The answer is cached per peer: after the first rejection or timeout the
-    /// request is not sent again, so later ticks go straight to the
-    /// per-transaction fallback without paying the probe timeout.
+    /// A decoded [`LogRanges`] response is proof that the peer has finished
+    /// log verification for this tick. It may legitimately contain only `-1`
+    /// slots when the tick emitted no logs. `EndResponse`, `TryAgain`, and
+    /// timeouts mean the peer cannot prove the tick's log state and must be
+    /// treated as unavailable, never as an empty tick.
     pub async fn log_ranges(&mut self, tick: u32) -> Result<LogRanges> {
-        if self.log_ranges_supported == Some(false) {
-            return Err(Error::LogsUnavailable(format!(
-                "peer {} previously rejected the all-ranges log request",
-                self.config.addr
-            )));
-        }
         let result = self
             .request_single_any_bounded(
                 MessageType::RequestAllLogIdRangesFromTx,
@@ -1168,27 +1189,56 @@ impl Peer {
         match result {
             Ok(packet) => {
                 let ranges = LogRanges::decode(&packet.payload)?;
-                self.set_log_ranges_supported(true, "all-ranges request succeeded");
+                ranges.validate()?;
                 Ok(ranges)
             }
-            Err(Error::EndResponse(_)) => {
-                self.set_log_ranges_supported(
-                    false,
-                    "peer answered EndResponse to the all-ranges log request",
-                );
-                Err(Error::LogsUnavailable(format!(
-                    "peer {} does not expose log ranges for tick {tick} \
-                     (logging disabled or passcode mismatch)",
-                    self.config.addr
-                )))
+            Err(Error::EndResponse(_)) => Err(Error::LogsUnavailable(format!(
+                "peer {} has no verified log ranges for tick {tick}",
+                self.config.addr
+            ))),
+            Err(Error::TryAgain(_)) => Err(Error::LogsUnavailable(format!(
+                "peer {} is not ready to serve log ranges for tick {tick}",
+                self.config.addr
+            ))),
+            Err(Error::Timeout(elapsed)) => Err(Error::LogsUnavailable(format!(
+                "peer {} did not answer log range request for tick {tick} after {elapsed:?}",
+                self.config.addr
+            ))),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Detects which log-range request the peer implements.
+    ///
+    /// The answer is cached per address. A peer that supports neither request
+    /// cannot supply log data and will be skipped by the ingestion pipeline.
+    async fn log_protocol(&mut self, tick_data: &TickData) -> Result<LogProtocol> {
+        if let Some(protocol) = self.log_protocol {
+            return Ok(protocol);
+        }
+        let tick = tick_data.tick;
+        match self.log_ranges(tick).await {
+            Ok(_) => {
+                self.set_log_protocol(LogProtocol::AllRanges);
+                return Ok(LogProtocol::AllRanges);
             }
-            Err(Error::Timeout(elapsed)) => {
-                self.set_log_ranges_supported(
-                    false,
-                    "peer timed out on the all-ranges log request",
-                );
+            Err(Error::LogsUnavailable(_)) => {}
+            Err(error) => return Err(error),
+        }
+
+        let first = log_probe_indices(tick_data).into_iter().next().unwrap_or(0);
+        match self.tx_log_range(tick, first).await {
+            Ok(_) => {
+                self.set_log_protocol(LogProtocol::TxRanges);
+                Ok(LogProtocol::TxRanges)
+            }
+            Err(Error::EndResponse(_)) => {
+                self.set_log_protocol(LogProtocol::NoLogging);
+                Ok(LogProtocol::NoLogging)
+            }
+            Err(Error::TryAgain(_)) | Err(Error::Timeout(_)) => {
                 Err(Error::LogsUnavailable(format!(
-                    "peer {} did not answer log range request for tick {tick} after {elapsed:?}",
+                    "peer {} did not answer log protocol probe",
                     self.config.addr
                 )))
             }
@@ -1196,31 +1246,47 @@ impl Peer {
         }
     }
 
-    /// Records all-ranges capability and logs only on a transition, so a peer
-    /// without logging does not warn once per tick.
-    fn set_log_ranges_supported(&mut self, supported: bool, reason: &str) {
-        let previous = self.log_ranges_supported;
-        self.log_ranges_supported = Some(supported);
-        if let Ok(mut cache) = log_ranges_cache().lock() {
-            cache.insert(self.config.addr, supported);
+    fn set_log_protocol(&mut self, protocol: LogProtocol) {
+        self.log_protocol = Some(protocol);
+        if let Ok(mut cache) = log_protocol_cache().lock() {
+            cache.insert(self.config.addr, protocol);
         }
-        match (previous, supported) {
-            (Some(value), next) if value == next => {}
-            (_, true) => {
-                tracing::debug!(
-                    peer = %self.config.addr,
-                    reason,
-                    "peer supports the all-ranges log request"
-                );
-            }
-            (_, false) => {
-                tracing::warn!(
-                    peer = %self.config.addr,
-                    reason,
-                    "peer does not support the all-ranges log request; using per-transaction fallback"
-                );
-            }
+    }
+
+    /// Requests one slot's log range with `RequestLogIdRangeFromTx`.
+    ///
+    /// `EndResponse` is deliberately propagated: it means the peer does not
+    /// implement this request (or rejects the tick), not that the slot has no
+    /// logs. A real no-log slot is a 16-byte response with `-1/-1`.
+    async fn tx_log_range(&mut self, tick: u32, slot: usize) -> Result<(i64, i64)> {
+        let packet = self
+            .request_single_any_bounded(
+                MessageType::RequestLogIdRangeFromTx,
+                qubic::messages::request_log_id_range_from_tx(
+                    tick,
+                    slot as u32,
+                    self.config.passcode,
+                ),
+                &[MessageType::RespondLogIdRangeFromTx],
+                self.config.log_range_timeout,
+                0,
+            )
+            .await?;
+        if packet.payload.len() != 16 {
+            return Err(Error::Verification(format!(
+                "log range response needs 16 bytes, got {}",
+                packet.payload.len()
+            )));
         }
+        let from = i64::from_le_bytes(packet.payload[0..8].try_into().expect("8 bytes"));
+        let length = i64::from_le_bytes(packet.payload[8..16].try_into().expect("8 bytes"));
+        if from == -3 || length == -3 {
+            return Err(Error::LogsUnavailable(format!(
+                "peer {} has not generated logs for tick {tick}",
+                self.config.addr
+            )));
+        }
+        Ok((from, length))
     }
 
     /// Requests log records in `[from_log_id, to_log_id]`.
@@ -1358,83 +1424,17 @@ impl Peer {
             "bundle: log ranges"
         );
         let mut warnings = Vec::new();
-        let mut logs_complete = true;
-        let (log_ranges, logs) = match self.fetch_log_ranges(tick, &tick_data).await {
-            Ok(ranges) => {
-                if ranges.is_pending() {
-                    logs_complete = false;
-                    tracing::debug!(
-                        peer = %self.config.addr,
-                        tick,
-                        "log generation still pending"
-                    );
-                    warnings.push(format!(
-                        "peer {} reports log generation still pending for tick {tick}",
-                        self.config.addr
-                    ));
-                }
-                let logs = match ranges.range() {
-                    Some((from, to)) if from >= 0 && to >= from => {
-                        match self.logs(from as u64, to as u64).await {
-                            Ok(logs) => logs,
-                            Err(error) => {
-                                tracing::warn!(
-                                    peer = %self.config.addr,
-                                    tick,
-                                    %error,
-                                    "peer returned log ranges but not log records"
-                                );
-                                warnings.push(format!(
-                                    "peer {} returned log ranges but not log records: {error}",
-                                    self.config.addr
-                                ));
-                                Vec::new()
-                            }
-                        }
-                    }
-                    _ => Vec::new(),
-                };
-                if self.log_ranges_supported == Some(false)
-                    && ranges.count() == 0
-                    && tick_data.non_empty_transactions().next().is_some()
-                {
-                    logs_complete = false;
-                    warnings.push(format!(
-                        "log data unavailable from peer {}: fallback returned no log ranges",
-                        self.config.addr
-                    ));
-                }
-                if ranges.is_pending() || (logs.len() as i64) < ranges.count() {
-                    logs_complete = false;
-                }
-                (ranges, logs)
-            }
-            Err(error) => {
-                logs_complete = false;
-                // A peer that already rejected all-ranges logged that once; do
-                // not repeat the warning for every tick.
-                if self.log_ranges_supported == Some(false) {
-                    tracing::debug!(
-                        peer = %self.config.addr,
-                        tick,
-                        %error,
-                        "log data unavailable; continuing without logs"
-                    );
-                } else {
-                    tracing::warn!(
-                        peer = %self.config.addr,
-                        tick,
-                        %error,
-                        "log data unavailable; continuing without logs"
-                    );
-                }
-                warnings.push(format!(
-                    "log data unavailable from peer {}: {error}",
-                    self.config.addr
-                ));
-                (empty_log_ranges(), Vec::new())
-            }
+        let fetched = match self.complete_logs(&tick_data).await {
+            Ok(fetched) => fetched,
+            Err(error) => FetchedLogs::incomplete(format!(
+                "peer {} could not fetch logs: {error}",
+                self.config.addr
+            )),
         };
+        let logs_complete = fetched.complete;
+        let log_ranges = fetched.ranges;
+        let logs = fetched.logs;
+        warnings.extend(fetched.warnings);
 
         tracing::debug!(tick, "bundle: logs done");
         Ok(TickBundle {
@@ -1573,115 +1573,6 @@ impl Peer {
         }
 
         Ok(out)
-    }
-
-    /// Fetches log ranges, falling back to the per-transaction request when the
-    /// peer does not implement the all-ranges request.
-    async fn fetch_log_ranges(&mut self, tick: u32, tick_data: &TickData) -> Result<LogRanges> {
-        match self.log_ranges(tick).await {
-            Ok(ranges) => Ok(ranges),
-            Err(Error::LogsUnavailable(_)) => self.log_ranges_fallback(tick, tick_data).await,
-            Err(error) => Err(error),
-        }
-    }
-
-    /// Probes `RequestLogIdRangeFromTx` (type 48) for every non-empty
-    /// transaction plus the six special-event slots.
-    ///
-    /// All probes are sent before any response is read. The responses are
-    /// small and carry the request's dejavu, so a single round trip resolves
-    /// the whole set instead of paying one round trip per slot.
-    async fn log_ranges_fallback(&mut self, tick: u32, tick_data: &TickData) -> Result<LogRanges> {
-        let mut ranges = empty_log_ranges();
-        let indices = log_probe_indices(tick_data);
-
-        let budget = self
-            .config
-            .log_fallback_probe_timeout
-            .saturating_mul((indices.len() / 16).clamp(1, 32) as u32)
-            .max(Duration::from_secs(1))
-            .min(Duration::from_secs(20));
-        let answered = self.request_log_range_batch(tick, &indices, budget).await?;
-        for (index, from, length) in &answered {
-            ranges.from_log_id[*index] = *from;
-            ranges.length[*index] = *length;
-        }
-
-        if answered.len() == indices.len() {
-            Ok(ranges)
-        } else {
-            Err(Error::LogsUnavailable(format!(
-                "peer {} returned {}/{} log ranges for tick {tick} \
-                 (logging disabled, passcode mismatch, or response timeout)",
-                self.config.addr,
-                answered.len(),
-                indices.len()
-            )))
-        }
-    }
-
-    /// Sends every `RequestLogIdRangeFromTx` probe first, then reads responses
-    /// until all dejavus resolve or `budget` elapses.
-    async fn request_log_range_batch(
-        &mut self,
-        tick: u32,
-        indices: &[usize],
-        budget: Duration,
-    ) -> Result<Vec<(usize, i64, i64)>> {
-        let mut awaiting = HashMap::with_capacity(indices.len());
-        for &index in indices {
-            let dejavu = self
-                .send(
-                    MessageType::RequestLogIdRangeFromTx,
-                    request_log_id_range_from_tx(tick, index as u32, self.config.passcode),
-                )
-                .await?;
-            awaiting.insert(dejavu, index);
-        }
-
-        let deadline = std::time::Instant::now() + budget;
-        let mut answers = Vec::with_capacity(indices.len());
-        while !awaiting.is_empty() {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let packet = match self.read_packet_timeout(remaining).await {
-                Ok(packet) => packet,
-                Err(Error::Timeout(_)) => break,
-                Err(error) => {
-                    for dejavu in awaiting.keys() {
-                        self.pending.remove(dejavu);
-                    }
-                    return Err(error);
-                }
-            };
-            if packet.kind == MessageType::ExchangePublicPeers {
-                self.record_peers(&packet);
-                continue;
-            }
-            let Some(index) = awaiting.remove(&packet.dejavu) else {
-                // Unsolicited gossip or a response to another request.
-                continue;
-            };
-            self.pending.remove(&packet.dejavu);
-            match packet.kind {
-                MessageType::RespondLogIdRangeFromTx => {
-                    let (from, length) = decode_log_id_range(&packet.payload)?;
-                    answers.push((index, from, length));
-                }
-                // This slot has no logs on this peer. Count it as a
-                // definitive answer so a sparse tick is not mistaken for a
-                // truncated fallback response.
-                MessageType::EndResponse => answers.push((index, -1, 0)),
-                MessageType::TryAgain => {}
-                _ => {}
-            }
-        }
-        for dejavu in awaiting.keys() {
-            self.pending.remove(dejavu);
-        }
-        Ok(answers)
     }
 
     // ---- request machinery -------------------------------------------------
@@ -2249,10 +2140,6 @@ impl NodePool {
         *self.log_peer.lock().expect("log peer mutex poisoned") = Some(addr);
     }
 
-    pub fn peer_has_logs(&self, addr: SocketAddr) -> bool {
-        self.manager.has_logs(addr)
-    }
-
     /// Adds peers advertised by one reachable peer, up to
     /// [`DEFAULT_DISCOVERY_LIMIT`] total. Discovery is opt-in; API request
     /// paths must not call this.
@@ -2767,97 +2654,28 @@ impl NodePool {
         Ok(best)
     }
 
-    /// Fetches one tick's logs from every configured peer and returns the
-    /// largest complete set. Batch responses can lose log pages for a tick
-    /// even when another peer still has them.
+    /// Fetches one tick's logs from every configured peer and returns only a
+    /// proof-complete set. A peer that answers `EndResponse` has not proved
+    /// that the tick has no logs, so it is skipped rather than stored as empty.
     pub async fn logs(&self, tick_data: &TickData) -> Result<(LogRanges, Vec<LogEvent>)> {
-        let _permit = self
-            .log_slots
-            .acquire()
-            .await
-            .expect("log fallback semaphore is never closed");
-        let mut candidates = self.manager.attempt_order(&self.peers);
-        for config in &self.peers {
-            if !candidates
-                .iter()
-                .any(|candidate| candidate.addr == config.addr)
-            {
-                candidates.push(config.clone());
-            }
+        let mut fetched = self.log_batch(std::slice::from_ref(tick_data)).await?;
+        let logs = fetched.pop().expect("one log result");
+        if logs.complete {
+            Ok((logs.ranges, logs.logs))
+        } else {
+            Err(Error::LogsUnavailable(
+                logs.warnings
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| "no peer supplied verified log ranges".into()),
+            ))
         }
-        if candidates.is_empty() {
-            return Err(Error::NoPeers);
-        }
-        let preferred = *self.log_peer.lock().expect("log peer mutex poisoned");
-        if let Some(addr) = preferred {
-            if let Some(index) = candidates.iter().position(|config| config.addr == addr) {
-                candidates.swap(0, index);
-            }
-        }
-        let mut best_empty: Option<(LogRanges, Vec<LogEvent>)> = None;
-        let mut last_error = None;
-        for config in candidates {
-            let addr = config.addr;
-            let mut peer = match Peer::connect(config).await {
-                Ok(peer) => peer,
-                Err(error) => {
-                    if preferred == Some(addr) {
-                        self.clear_log_peer();
-                    }
-                    last_error = Some(error);
-                    continue;
-                }
-            };
-            match peer.complete_logs(tick_data).await {
-                Ok((ranges, logs, known, _warnings))
-                    if !ranges.is_pending()
-                        && (known || ranges.count() == 0)
-                        && prefetch::logs_cover_ranges(&ranges, &logs) =>
-                {
-                    if ranges.count() > 0 {
-                        self.manager.record_log_success(addr);
-                        *self.log_peer.lock().expect("log peer mutex poisoned") = Some(addr);
-                        return Ok((ranges, logs));
-                    }
-                    if preferred == Some(addr) {
-                        return Ok((ranges, logs));
-                    }
-                    best_empty.get_or_insert((ranges, logs));
-                }
-                Ok(_) => {
-                    if preferred == Some(addr) {
-                        self.clear_log_peer();
-                    }
-                }
-                Err(error) => {
-                    if matches!(
-                        error,
-                        Error::Io(_)
-                            | Error::Wire(_)
-                            | Error::Timeout(_)
-                            | Error::RetriesExhausted { .. }
-                            | Error::TryAgain(_)
-                            | Error::UnexpectedPacket { .. }
-                    ) {
-                        self.manager.record_failure(addr);
-                    }
-                    if preferred == Some(addr) {
-                        self.clear_log_peer();
-                    }
-                    last_error = Some(error);
-                }
-            }
-        }
-        best_empty.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
     }
 
     /// Repairs logs for a batch of ticks over one connection. Log fallback is
     /// the slow path; opening a socket per tick turns an empty-tick run into a
     /// connection storm.
-    pub async fn log_batch(
-        &self,
-        tick_data: &[TickData],
-    ) -> Result<Vec<(LogRanges, Vec<LogEvent>)>> {
+    pub async fn log_batch(&self, tick_data: &[TickData]) -> Result<Vec<FetchedLogs>> {
         if tick_data.is_empty() {
             return Ok(Vec::new());
         }
@@ -2884,18 +2702,26 @@ impl NodePool {
                 candidates.swap(0, index);
             }
         }
+        let mut results: Vec<Option<FetchedLogs>> = (0..tick_data.len()).map(|_| None).collect();
+        let mut remaining = (0..tick_data.len()).collect::<Vec<_>>();
         let mut last_error = None;
-        let mut best_empty: Option<Vec<(LogRanges, Vec<LogEvent>)>> = None;
         for config in candidates {
+            if remaining.is_empty() {
+                break;
+            }
             let addr = config.addr;
+            let subset = remaining
+                .iter()
+                .map(|index| tick_data[*index].clone())
+                .collect::<Vec<_>>();
             let fetched = tokio::time::timeout(Duration::from_secs(30), async {
                 let mut peer = Peer::connect(config).await?;
-                peer.complete_logs_batch(tick_data).await
+                peer.complete_logs_batch(&subset).await
             })
             .await
             .unwrap_or_else(|_| Err(Error::Timeout(Duration::from_secs(30))));
             let fetched = match fetched {
-                Ok(fetched) if fetched.len() == tick_data.len() => fetched,
+                Ok(fetched) if fetched.len() == subset.len() => fetched,
                 Ok(_) => {
                     last_error = Some(Error::Verification(
                         "log batch returned the wrong number of ticks".into(),
@@ -2910,42 +2736,47 @@ impl NodePool {
                     continue;
                 }
             };
-            let valid = fetched.iter().all(|(ranges, logs, known, _)| {
-                !ranges.is_pending()
-                    && (*known || ranges.count() == 0)
-                    && prefetch::logs_cover_ranges(ranges, logs)
-            });
-            if !valid {
-                if preferred == Some(addr) {
-                    self.clear_log_peer();
+            let mut supplied = false;
+            let mut supplied_logs = false;
+            for (index, fetch) in remaining.iter().copied().zip(fetched) {
+                if fetch.complete {
+                    supplied = true;
+                    supplied_logs |= fetch.ranges.count() > 0;
                 }
-                last_error = Some(Error::Verification(format!(
-                    "peer {addr} could not supply complete logs for the batch"
-                )));
-                continue;
+                if fetch.complete || results[index].is_none() {
+                    results[index] = Some(fetch);
+                }
             }
-            if fetched.iter().any(|(ranges, _, _, _)| ranges.count() > 0) {
+            if supplied {
                 self.manager.record_log_success(addr);
                 *self.log_peer.lock().expect("log peer mutex poisoned") = Some(addr);
-                return Ok(fetched
-                    .into_iter()
-                    .map(|(ranges, logs, _, _)| (ranges, logs))
-                    .collect());
             }
-            if preferred == Some(addr) {
-                return Ok(fetched
-                    .into_iter()
-                    .map(|(ranges, logs, _, _)| (ranges, logs))
-                    .collect());
+            if supplied_logs {
+                tracing::debug!(
+                    peer = %addr,
+                    ticks = remaining.len(),
+                    "peer supplied verified logs for a repair batch"
+                );
             }
-            best_empty.get_or_insert_with(|| {
-                fetched
-                    .into_iter()
-                    .map(|(ranges, logs, _, _)| (ranges, logs))
-                    .collect()
-            });
+            remaining.retain(|index| results[*index].as_ref().is_none_or(|fetch| !fetch.complete));
         }
-        best_empty.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
+        if !remaining.is_empty() {
+            if let Some(error) = last_error {
+                tracing::debug!(
+                    ticks = remaining.len(),
+                    %error,
+                    "log repair exhausted peers"
+                );
+            }
+        }
+        Ok(results
+            .into_iter()
+            .map(|fetch| {
+                fetch.unwrap_or_else(|| {
+                    FetchedLogs::incomplete("no peer supplied verified log ranges")
+                })
+            })
+            .collect())
     }
 
     fn clear_log_peer(&self) {
@@ -3084,51 +2915,17 @@ fn decode_transactions(packets: Vec<Packet>, tick: u32) -> Result<Vec<Transactio
     Ok(transactions)
 }
 
-/// Log ranges with every slot marked unavailable.
-fn empty_log_ranges() -> LogRanges {
-    LogRanges {
-        from_log_id: vec![-1; LOG_TX_PER_TICK],
-        length: vec![-1; LOG_TX_PER_TICK],
-    }
-}
-
-/// Every transaction slot that can own a log range for this tick: the
-/// non-empty transaction slots plus the protocol's special-event slots.
+/// Every slot that can own a log range for this tick: non-empty transaction
+/// slots plus Qubic's six special-event slots.
 fn log_probe_indices(tick_data: &TickData) -> Vec<usize> {
-    let mut indices: Vec<usize> = tick_data
+    let mut indices = tick_data
         .non_empty_transactions()
         .map(|(index, _)| index)
-        .collect();
-    indices.extend(TX_PER_TICK..LOG_TX_PER_TICK);
+        .collect::<Vec<_>>();
+    indices.extend(TX_PER_TICK..qubic::messages::LOG_TX_PER_TICK);
     indices.sort_unstable();
     indices.dedup();
     indices
-}
-
-/// Node-local helper for `RequestLogIdRangeFromTx` (type 48), which the codec
-/// crate does not expose.
-fn request_log_id_range_from_tx(tick: u32, tx_id: u32, passcode: [u64; 4]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(40);
-    for part in passcode {
-        out.extend_from_slice(&part.to_le_bytes());
-    }
-    out.extend_from_slice(&tick.to_le_bytes());
-    out.extend_from_slice(&tx_id.to_le_bytes());
-    out
-}
-
-/// Node-local decoder for `RespondLogIdRangeFromTx` (type 49).
-fn decode_log_id_range(payload: &[u8]) -> Result<(i64, i64)> {
-    if payload.len() != 16 {
-        return Err(qubic::Error::InvalidPacket(format!(
-            "log id range needs 16 bytes, got {}",
-            payload.len()
-        ))
-        .into());
-    }
-    let from = i64::from_le_bytes(payload[0..8].try_into().expect("8 bytes"));
-    let length = i64::from_le_bytes(payload[8..16].try_into().expect("8 bytes"));
-    Ok((from, length))
 }
 
 /// The quorum's own tick is the tick header. Fall back to the tick-data header
@@ -4239,19 +4036,12 @@ mod tests {
                     send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
                 }
                 MessageType::RequestAllLogIdRangesFromTx => {
-                    send(&mut stream, MessageType::EndResponse, dejavu, Vec::new()).await;
-                }
-                MessageType::RequestLogIdRangeFromTx => {
-                    let tx_id = u32::from_le_bytes(payload[36..40].try_into().unwrap());
-                    if fallback && tx_id == TX_PER_TICK as u32 {
-                        let mut range = Vec::with_capacity(16);
-                        range.extend_from_slice(&5i64.to_le_bytes());
-                        range.extend_from_slice(&2i64.to_le_bytes());
+                    if fallback {
                         send(
                             &mut stream,
-                            MessageType::RespondLogIdRangeFromTx,
+                            MessageType::RespondAllLogIdRangesFromTx,
                             dejavu,
-                            range,
+                            log_ranges_payload(),
                         )
                         .await;
                     } else {
@@ -4298,7 +4088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundle_falls_back_to_per_transaction_log_ranges() {
+    async fn bundle_fetches_logs_from_verified_ranges() {
         let mut peer = peer_with_optional_logs(true).await;
         let bundle = peer.bundle(TICK).await.unwrap();
         assert_eq!(bundle.log_ranges.range(), Some((5, 6)));
@@ -4318,19 +4108,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bundle_accepts_empty_tick_from_peer_without_logging() {
+    async fn bundle_rejects_peer_without_verified_log_ranges() {
         let mut peer = peer_with_optional_logs(false).await;
         let bundle = peer.bundle(TICK).await.unwrap();
         assert_eq!(bundle.tick.tick, TICK);
         assert_eq!(bundle.votes.len(), 1);
         assert!(bundle.logs.is_empty());
         assert_eq!(bundle.log_ranges.count(), 0);
-        assert!(bundle.logs_complete);
-        assert!(
-            bundle.warnings.is_empty(),
-            "warnings: {:?}",
-            bundle.warnings
-        );
+        assert!(!bundle.logs_complete);
+        assert!(!bundle.warnings.is_empty());
     }
 
     #[tokio::test]
@@ -4338,7 +4124,7 @@ mod tests {
         let mut peer = peer_with_optional_logs(false).await;
         match peer.log_ranges(TICK).await {
             Err(Error::LogsUnavailable(message)) => {
-                assert!(message.contains("logging disabled") || message.contains("passcode"));
+                assert!(message.contains("no verified log ranges"));
             }
             other => panic!("expected LogsUnavailable, got {other:?}"),
         }
@@ -4352,36 +4138,6 @@ mod tests {
             seen.push(kind);
         }
         seen
-    }
-
-    #[tokio::test]
-    async fn all_ranges_capability_is_cached_per_peer() {
-        let (mut peer, mut requests) = peer_with_optional_logs_counted(true).await;
-
-        let bundle = peer.bundle(TICK).await.unwrap();
-        assert_eq!(bundle.log_ranges.range(), Some((5, 6)));
-        let first = drain_requests(&mut requests);
-        assert_eq!(
-            first
-                .iter()
-                .filter(|kind| **kind == MessageType::RequestAllLogIdRangesFromTx)
-                .count(),
-            1,
-            "the first probe should hit all-ranges once: {first:?}"
-        );
-        assert_eq!(peer.log_ranges_supported, Some(false));
-
-        let bundle = peer.bundle(TICK).await.unwrap();
-        assert_eq!(bundle.log_ranges.range(), Some((5, 6)));
-        let second = drain_requests(&mut requests);
-        assert!(
-            !second.contains(&MessageType::RequestAllLogIdRangesFromTx),
-            "cached rejection must skip the all-ranges probe: {second:?}"
-        );
-        assert!(
-            second.contains(&MessageType::RequestLogIdRangeFromTx),
-            "the fallback probes should still run: {second:?}"
-        );
     }
 
     #[tokio::test]
@@ -4458,6 +4214,149 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires GLYPH_LIVE_PEERS and GLYPH_LIVE_TICK"]
+    async fn live_log_protocol_peers() {
+        let peers = std::env::var("GLYPH_LIVE_PEERS").expect("GLYPH_LIVE_PEERS");
+        let tick = std::env::var("GLYPH_LIVE_TICK")
+            .ok()
+            .and_then(|tick| tick.parse().ok())
+            .unwrap_or(92_273_000u32);
+        for addr in peers.split(',').map(str::trim).filter(|addr| !addr.is_empty()) {
+            let started = std::time::Instant::now();
+            let config = PeerConfig::new(addr.parse().expect("peer address"))
+                .with_timeout(Duration::from_secs(10));
+            let result = async {
+                let mut peer = Peer::connect(config).await?;
+                let data = peer.tick_data(tick).await?;
+                let protocol = peer.log_protocol(&data).await?;
+                Ok::<_, Error>((protocol, data.non_empty_transactions().count()))
+            }
+            .await;
+            match result {
+                Ok((protocol, transactions)) => eprintln!(
+                    "{addr}: protocol={protocol:?} transactions={transactions} elapsed={:?}",
+                    started.elapsed()
+                ),
+                Err(error) => eprintln!("{addr}: {error} elapsed={:?}", started.elapsed()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GLYPH_LIVE_PEERS and GLYPH_LIVE_TICK"]
+    async fn live_raw_log_protocol() {
+        let peers = std::env::var("GLYPH_LIVE_PEERS").expect("GLYPH_LIVE_PEERS");
+        let tick = std::env::var("GLYPH_LIVE_TICK")
+            .ok()
+            .and_then(|tick| tick.parse().ok())
+            .unwrap_or(92_273_000u32);
+        for addr in peers
+            .split(',')
+            .map(str::trim)
+            .filter(|addr| !addr.is_empty())
+        {
+            let config = PeerConfig::new(addr.parse().expect("peer address"))
+                .with_timeout(Duration::from_secs(1));
+            let Ok(mut peer) = Peer::connect(config).await else {
+                eprintln!("{addr}: connect failed");
+                continue;
+            };
+            for (label, kind, payload) in [
+                (
+                    "all-ranges",
+                    MessageType::RequestAllLogIdRangesFromTx,
+                    request_all_log_ranges(tick, [0; 4]),
+                ),
+                ("tx-range-0", MessageType::RequestLogIdRangeFromTx, {
+                    let mut payload = Vec::new();
+                    for part in [0u64; 4] {
+                        payload.extend_from_slice(&part.to_le_bytes());
+                    }
+                    payload.extend_from_slice(&tick.to_le_bytes());
+                    payload.extend_from_slice(&0u32.to_le_bytes());
+                    payload
+                }),
+                ("tx-range-special", MessageType::RequestLogIdRangeFromTx, {
+                    let mut payload = Vec::new();
+                    for part in [0u64; 4] {
+                        payload.extend_from_slice(&part.to_le_bytes());
+                    }
+                    payload.extend_from_slice(&tick.to_le_bytes());
+                    payload.extend_from_slice(&(TX_PER_TICK as u32).to_le_bytes());
+                    payload
+                }),
+            ] {
+                let dejavu = peer.send(kind, payload).await.expect("send");
+                let started = std::time::Instant::now();
+                let mut seen = Vec::new();
+                loop {
+                    match peer.read_packet_timeout(Duration::from_secs(3)).await {
+                        Ok(packet) => {
+                            if packet.dejavu == dejavu {
+                                eprintln!(
+                                    "{addr}: {label} -> {:?} payload={} first={:?} after={:?} seen={seen:?}",
+                                    packet.kind,
+                                    packet.payload.len(),
+                                    &packet.payload[..packet.payload.len().min(16)],
+                                    started.elapsed()
+                                );
+                                break;
+                            }
+                            if seen.len() < 12 {
+                                seen.push(packet.kind);
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "{addr}: {label} -> error {error} after={:?} seen={seen:?}",
+                                started.elapsed()
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires GLYPH_LIVE_PEERS and GLYPH_LIVE_TICK"]
+    async fn live_log_range_peers() {
+        let peers = std::env::var("GLYPH_LIVE_PEERS").expect("GLYPH_LIVE_PEERS");
+        let tick = std::env::var("GLYPH_LIVE_TICK")
+            .ok()
+            .and_then(|tick| tick.parse().ok())
+            .unwrap_or(92_273_000u32);
+        for addr in peers.split(',') {
+            let addr = addr.trim();
+            if addr.is_empty() {
+                continue;
+            }
+            let started = std::time::Instant::now();
+            let config = PeerConfig::new(addr.parse().expect("peer address"))
+                .with_timeout(Duration::from_secs(10))
+                .with_connect_timeout(Duration::from_secs(5));
+            let result = async {
+                let mut peer = Peer::connect(config).await?;
+                let head = peer.head().await?;
+                let ranges = peer.log_ranges(tick).await?;
+                Ok::<_, Error>((head, ranges))
+            }
+            .await;
+            match result {
+                Ok((head, ranges)) => eprintln!(
+                    "{addr}: head={} ranges={} logs={} elapsed={:?}",
+                    head.tick,
+                    ranges.range().map_or(0, |(from, to)| to - from + 1),
+                    ranges.count(),
+                    started.elapsed()
+                ),
+                Err(error) => eprintln!("{addr}: {error} elapsed={:?}", started.elapsed()),
+            }
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "requires GLYPH_LIVE_TICK and a reachable Qubic peer"]
     async fn live_prefetch_completeness_smoke() {
         let tick_number = std::env::var("GLYPH_LIVE_TICK")
@@ -4508,10 +4407,6 @@ mod tests {
             bundle.log_ranges.count(),
             bundle.logs_complete,
             bundle.warnings
-        );
-        eprintln!(
-            "live prefetch log-range capability: {:?}",
-            peer.log_ranges_supported
         );
         assert_eq!(missing, 0, "prefetch transaction completeness");
         assert!(bundle.logs_complete, "prefetch log completeness");
