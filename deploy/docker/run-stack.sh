@@ -154,7 +154,7 @@ EOF
     docker run -d --name glyph-nats --network "$network" \
       --restart unless-stopped "${log_opts[@]}" \
       -v glyph-nats-data:/data \
-      nats:2.10 -js -sd /data -m 8222 --max_payload 16777216 >/dev/null
+      nats:2.10 -js -sd /data -m 8222 >/dev/null
   else
     docker start glyph-nats >/dev/null
   fi
@@ -233,12 +233,13 @@ EOF
     "${app_env[@]}" \
     -e "RUST_LOG=${GLYPH_FETCHER_LOG:-info}" \
     -e "GLYPH_FROM_TICK=${GLYPH_FROM_TICK:-}" \
-    -e "INDEXER_FETCH_CONCURRENCY=${INDEXER_FETCH_CONCURRENCY:-32}" \
+    -e "INDEXER_FETCH_CONCURRENCY=${INDEXER_FETCH_CONCURRENCY:-16}" \
     -e "INDEXER_FETCH_WINDOW=${INDEXER_FETCH_WINDOW:-512}" \
     -e "INDEXER_FETCH_BATCH=${INDEXER_FETCH_BATCH:-32}" \
+    -e "INDEXER_FETCH_BATCH_INITIAL=${INDEXER_FETCH_BATCH_INITIAL:-4}" \
     -e "INDEXER_BATCH_MIN_LAG=${INDEXER_BATCH_MIN_LAG:-2}" \
     -e "INDEXER_VERIFY_CONCURRENCY=${INDEXER_VERIFY_CONCURRENCY:-3}" \
-    -e "INDEXER_WRITE_BATCH=${INDEXER_WRITE_BATCH:-64}" \
+    -e "INDEXER_WRITE_BATCH=${INDEXER_WRITE_BATCH:-32}" \
     -e "INDEXER_WRITE_FLUSH_MS=${INDEXER_WRITE_FLUSH_MS:-100}" \
     -e "INDEXER_DISCOVER_PEERS=${INDEXER_DISCOVER_PEERS:-true}" \
     -e "GLYPH_VERIFY_SIGNATURES=${GLYPH_VERIFY_SIGNATURES:-false}" \

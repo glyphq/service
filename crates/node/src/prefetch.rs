@@ -742,11 +742,7 @@ impl Peer {
             // One idle timeout covers every pipelined log request. A peer that
             // has the data answers promptly; waiting for the slowest peer in a
             // large batch is what made catch-up stall.
-            let idle = self
-                .config
-                .log_range_timeout
-                .saturating_mul(2)
-                .max(Duration::from_secs(1));
+            let idle = self.log_probe_timeout(decoded.len().saturating_mul(512));
             while !awaiting.is_empty() {
                 let packet = match self.read_packet_timeout(idle).await {
                     Ok(packet) => packet,
@@ -1022,11 +1018,7 @@ impl Peer {
             }
         }
 
-        let idle = self
-            .config
-            .log_range_timeout
-            .saturating_mul(2)
-            .max(Duration::from_secs(1));
+        let idle = self.log_probe_timeout(awaiting.len());
         while !awaiting.is_empty() {
             let packet = match self.read_packet_timeout(idle).await {
                 Ok(packet) => packet,
@@ -1183,6 +1175,15 @@ impl Peer {
             .timeout
             .saturating_mul(ticks.clamp(1, 16) as u32)
             .min(Duration::from_secs(60))
+    }
+
+    /// Idle budget for a log response. A batch with thousands of pipelined
+    /// probes can leave a longer gap than one packet's timeout, but the budget
+    /// stays bounded so an unresponsive peer is abandoned quickly.
+    fn log_probe_timeout(&self, probes: usize) -> Duration {
+        let base = self.config.log_range_timeout.max(Duration::from_secs(1));
+        let extra = Duration::from_millis((probes / 512) as u64 * 100);
+        base.saturating_add(extra).min(Duration::from_secs(6))
     }
 
     fn clear_pending<T>(&mut self, awaiting: &HashMap<u32, T>) {

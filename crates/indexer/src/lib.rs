@@ -200,7 +200,8 @@ fn transaction_hashes(verified: &VerifiedTick) -> HashMap<u16, String> {
 struct PipelineTuning {
     fetch_concurrency: usize,
     fetch_window: usize,
-    fetch_batch: usize,
+    fetch_batch_max: usize,
+    fetch_batch_initial: usize,
     batch_min_lag: usize,
     write_batch: usize,
     write_flush: Duration,
@@ -227,7 +228,8 @@ impl PipelineTuning {
             // flight or buffered by the ordered writer.
             fetch_concurrency: env_usize("INDEXER_FETCH_CONCURRENCY", 32, 1, 128),
             fetch_window: env_usize("INDEXER_FETCH_WINDOW", 512, 1, 8192),
-            fetch_batch: env_usize("INDEXER_FETCH_BATCH", 32, 1, 64),
+            fetch_batch_max: env_usize("INDEXER_FETCH_BATCH", 32, 1, 64),
+            fetch_batch_initial: env_usize("INDEXER_FETCH_BATCH_INITIAL", 4, 1, 64),
             batch_min_lag: env_usize("INDEXER_BATCH_MIN_LAG", 8, 1, 100_000),
             write_batch: env_usize("INDEXER_WRITE_BATCH", 128, 1, 4096),
             write_flush: Duration::from_millis(
@@ -242,6 +244,46 @@ impl PipelineTuning {
                 64,
             ),
         }
+    }
+}
+
+/// AIMD controller for the fetch batch. A peer that resets or times out under
+/// a large batch gets a smaller one next time; a peer that completes batches
+/// promptly earns a larger one. The limit is the configured maximum.
+#[derive(Debug)]
+struct AdaptiveBatch {
+    current: AtomicU32,
+    max: u32,
+}
+
+impl AdaptiveBatch {
+    fn new(initial: usize, max: usize) -> Self {
+        let max = u32::try_from(max.max(1)).unwrap_or(u32::MAX);
+        let initial = u32::try_from(initial.max(1)).unwrap_or(1).min(max);
+        Self {
+            current: AtomicU32::new(initial),
+            max,
+        }
+    }
+
+    fn current(&self) -> u32 {
+        self.current.load(Ordering::Acquire).max(1)
+    }
+
+    fn on_success(&self, ticks: usize) {
+        if ticks < 2 {
+            return;
+        }
+        let next = self.current().saturating_add(1).min(self.max);
+        self.current.fetch_max(next, Ordering::AcqRel);
+    }
+
+    fn on_failure(&self, ticks: usize) {
+        if ticks < 2 {
+            return;
+        }
+        let next = u32::try_from(ticks).unwrap_or(u32::MAX).max(1) / 2;
+        self.current.fetch_min(next.max(1), Ordering::AcqRel);
     }
 }
 
@@ -642,6 +684,10 @@ impl<S: Store + 'static> Indexer<S> {
         let work_rx = Arc::new(AsyncMutex::new(work_rx));
         let (result_tx, mut result_rx) = mpsc::channel::<FetchResult>(channel_capacity);
         let (retry_tx, retry_rx) = mpsc::channel::<RetryRequest>(channel_capacity);
+        let adaptive = Arc::new(AdaptiveBatch::new(
+            tuning.fetch_batch_initial,
+            tuning.fetch_batch_max,
+        ));
         let mut peer_configs = self.pool.peer_configs().to_vec();
         if std::env::var("INDEXER_DISCOVER_PEERS").is_ok_and(|value| value == "true") {
             let mut seen = peer_configs
@@ -700,7 +746,7 @@ impl<S: Store + 'static> Indexer<S> {
             retry_rx,
             pipeline_cancel.clone(),
             tuning.fetch_window,
-            tuning.fetch_batch,
+            adaptive.clone(),
             tuning.batch_min_lag,
         ));
         let verify_semaphore = Arc::new(tokio::sync::Semaphore::new(tuning.verify_concurrency));
@@ -770,6 +816,7 @@ impl<S: Store + 'static> Indexer<S> {
                 };
                 if let Some(error) = result.batch_error {
                     pending.fetch_sub(result.count as usize, Ordering::Release);
+                    adaptive.on_failure(result.count as usize);
                     tracing::warn!(
                         start = result.start,
                         count = result.count,
@@ -787,6 +834,7 @@ impl<S: Store + 'static> Indexer<S> {
                         .ok();
                     continue 'writer;
                 }
+                adaptive.on_success(result.count as usize);
                 for tick in result.outcomes {
                     if tick.tick < consume_next {
                         pending.fetch_sub(1, Ordering::Release);
@@ -2180,7 +2228,7 @@ async fn dispatch_loop(
     mut retry_rx: mpsc::Receiver<RetryRequest>,
     cancel: CancellationToken,
     window: usize,
-    batch_max: usize,
+    adaptive: Arc<AdaptiveBatch>,
     batch_min_lag: usize,
 ) {
     let mut retries = std::collections::VecDeque::<(Instant, u32, u32, u32)>::new();
@@ -2286,7 +2334,11 @@ async fn dispatch_loop(
             if let Some(upper) = dispatch_upper_bound(next_write_tick, head_tick, window) {
                 if next_tick >= next_write_tick && next_tick <= upper {
                     let lag = head_tick.saturating_sub(next_write_tick) as usize;
-                    let desired = if lag >= batch_min_lag { batch_max } else { 1 };
+                    let desired = if lag >= batch_min_lag {
+                        adaptive.current() as usize
+                    } else {
+                        1
+                    };
                     let available = window.saturating_sub(pending.load(Ordering::Acquire));
                     let mut count = desired
                         .min(available)
@@ -3051,6 +3103,22 @@ mod tests {
         assert!(Verification::Data < Verification::State);
     }
 
+    #[test]
+    fn adaptive_batch_grows_on_success_and_halves_on_failure() {
+        let adaptive = AdaptiveBatch::new(4, 8);
+        assert_eq!(adaptive.current(), 4);
+        for _ in 0..10 {
+            adaptive.on_success(4);
+        }
+        assert_eq!(adaptive.current(), 8);
+        adaptive.on_failure(8);
+        assert_eq!(adaptive.current(), 4);
+        adaptive.on_failure(1);
+        assert_eq!(adaptive.current(), 4, "single-tick retries do not shrink");
+        adaptive.on_failure(4);
+        assert_eq!(adaptive.current(), 2);
+    }
+
     fn golden_computors() -> Computors {
         Computors::decode(&include_bytes!("../../../fixtures/computors.bin")[8..])
             .expect("computors fixture")
@@ -3317,7 +3385,7 @@ mod tests {
             retry_rx,
             cancel.clone(),
             4,
-            1,
+            Arc::new(AdaptiveBatch::new(1, 1)),
             1,
         ));
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3357,7 +3425,7 @@ mod tests {
             retry_rx,
             cancel.clone(),
             256,
-            16,
+            Arc::new(AdaptiveBatch::new(16, 16)),
             1,
         ));
 
@@ -3407,7 +3475,7 @@ mod tests {
             retry_rx,
             cancel.clone(),
             256,
-            16,
+            Arc::new(AdaptiveBatch::new(16, 16)),
             32,
         ));
 
@@ -3447,7 +3515,7 @@ mod tests {
             retry_rx,
             cancel.clone(),
             256,
-            16,
+            Arc::new(AdaptiveBatch::new(16, 16)),
             32,
         ));
 

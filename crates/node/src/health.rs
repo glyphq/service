@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -96,6 +97,7 @@ struct PeerState {
 pub struct PeerManager {
     policy: PeerPolicy,
     state: Arc<Mutex<HashMap<SocketAddr, PeerState>>>,
+    rotation: Arc<AtomicU64>,
 }
 
 impl Default for PeerManager {
@@ -109,6 +111,7 @@ impl PeerManager {
         Self {
             policy,
             state: Arc::new(Mutex::new(HashMap::new())),
+            rotation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -251,6 +254,25 @@ impl PeerManager {
             })
             .collect();
         scored.sort_by(|left, right| left.0.total_cmp(&right.0));
+        // Workers should cycle across the healthy leaders instead of opening
+        // every connection to the single lowest-latency peer. Only peers with
+        // a clean success history join the rotation, so a stale address cannot
+        // win a turn just because it has never been tried.
+        let clean = scored
+            .iter()
+            .take(4)
+            .take_while(|(_, config)| {
+                state.get(&config.addr).is_some_and(|entry| {
+                    entry.successes > 0
+                        && entry.consecutive_failures == 0
+                        && entry.log_failures == 0
+                })
+            })
+            .count();
+        if clean > 1 {
+            let offset = self.rotation.fetch_add(1, Ordering::Relaxed) as usize % clean;
+            scored[..clean].rotate_left(offset);
+        }
         scored.into_iter().map(|(_, config)| config).collect()
     }
 
@@ -459,6 +481,26 @@ mod tests {
         let order = manager.attempt_order(&[slow.clone(), fast.clone()]);
         assert_eq!(order[0].addr, fast.addr);
         assert!(manager.score(fast.addr) < manager.score(slow.addr));
+    }
+
+    #[test]
+    fn healthy_leaders_cycle_between_workers() {
+        let manager = PeerManager::new(fast_policy());
+        let first = config(1);
+        let second = config(2);
+        manager.record_success(first.addr, Duration::from_millis(10));
+        manager.record_success(second.addr, Duration::from_millis(10));
+
+        let a = manager.attempt_order(&[first.clone(), second.clone()]);
+        let b = manager.attempt_order(&[first.clone(), second.clone()]);
+        assert_ne!(a[0].addr, b[0].addr);
+        assert_eq!(
+            [a[0].addr, b[0].addr]
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
     }
 
     #[test]
