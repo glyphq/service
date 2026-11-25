@@ -335,6 +335,26 @@ impl EpochRollover {
     }
 }
 
+/// Build the skip range when a peer moves the current epoch's published start
+/// forward. The previous start was provisional, so its tick numbers must not be
+/// fetched or indexed.
+fn moved_boundary_rollover(
+    epoch: u16,
+    previous_initial: u32,
+    previous_epoch_last: Option<u32>,
+    new_initial: u32,
+) -> Option<EpochRollover> {
+    if new_initial <= previous_initial {
+        return None;
+    }
+    Some(EpochRollover {
+        old_epoch: epoch.saturating_sub(1),
+        old_last: previous_epoch_last.unwrap_or_else(|| previous_initial.saturating_sub(1)),
+        new_epoch: epoch,
+        new_initial,
+    })
+}
+
 /// Resolve the epoch that owns `tick` from observed boundaries.
 ///
 /// Returns `None` when the tick predates every observed epoch start. Callers
@@ -448,7 +468,7 @@ impl<S: Store + 'static> Indexer<S> {
         self.store.init().await?;
         let mut peer = self.pool.connect_best().await?;
         let head = peer.head().await?;
-        let next = self.next_tick(&head).await?;
+        let mut next = self.next_tick(&head).await?;
         let tuning = PipelineTuning::from_env();
 
         // Load observed boundaries and record this head before any worker can
@@ -460,12 +480,24 @@ impl<S: Store + 'static> Indexer<S> {
                 EpochBoundaries::new()
             }
         };
-        boundaries.insert(head.epoch, head.initial_tick);
-        if let Err(error) = self
-            .store
-            .write_epoch_start(head.epoch, head.initial_tick)
-            .await
-        {
+        // A provisional boundary may already have been persisted before a
+        // restart. Keep the later value so the writer never moves backwards
+        // into a tick range the network has abandoned.
+        let stored_initial = boundaries.get(&head.epoch).copied();
+        let initial_tick =
+            stored_initial.map_or(head.initial_tick, |stored| stored.max(head.initial_tick));
+        if initial_tick != head.initial_tick {
+            tracing::warn!(
+                epoch = head.epoch,
+                reported_initial = head.initial_tick,
+                stored_initial,
+                using_initial = initial_tick,
+                "stored epoch boundary is ahead of the peer head"
+            );
+        }
+        boundaries.insert(head.epoch, initial_tick);
+        next = next.max(initial_tick);
+        if let Err(error) = self.store.write_epoch_start(head.epoch, initial_tick).await {
             tracing::warn!(epoch = head.epoch, %error, "epoch start was not persisted");
         }
         close_stale_epochs(self.store.as_ref(), &boundaries, &head).await;
@@ -594,7 +626,6 @@ impl<S: Store + 'static> Indexer<S> {
         drop(result_tx);
 
         let mut buffer = OrderedBuffer::new(tuning.fetch_window);
-        let mut next = next;
         let mut consume_next = next;
         let mut backoff = Duration::from_millis(250);
         let mut since_progress = 0u64;
@@ -1690,6 +1721,20 @@ async fn coordinate<S: Store + 'static>(
                         }
                     }
                 }
+                // A peer can report an epoch once with a provisional initial
+                // tick and later with the final restart tick. Never move the
+                // boundary backwards; a stale peer must not rewind the
+                // indexer or make already indexed ticks look like a new epoch.
+                let previous_initial = boundaries.read().await.get(&updated.epoch).copied();
+                if previous_initial.is_some_and(|initial| updated.initial_tick < initial) {
+                    tracing::warn!(
+                        epoch = updated.epoch,
+                        previous_initial = previous_initial.unwrap_or_default(),
+                        reported_initial = updated.initial_tick,
+                        "ignoring backward epoch boundary"
+                    );
+                    continue;
+                }
                 // Persist and publish the boundary before the head so a
                 // worker never sees a head whose epoch has no boundary.
                 let boundary_changed = {
@@ -1747,6 +1792,58 @@ async fn coordinate<S: Store + 'static>(
                             %error,
                             "previous epoch was not closed"
                         );
+                    }
+                } else if let Some(previous_initial) = previous_initial {
+                    if updated.initial_tick > previous_initial {
+                        // The same epoch moved its published start forward.
+                        // This happens when a peer announces a provisional
+                        // restart tick and the network restarts again before
+                        // the new epoch produces a verifiable tick. Move the
+                        // writer past the abandoned range instead of trying
+                        // those tick numbers forever.
+                        let old_epoch = updated.epoch.saturating_sub(1);
+                        let previous_epoch_last = match store.last_tick_for_epoch(old_epoch).await {
+                            Ok(tick) => tick,
+                            Err(error) => {
+                                tracing::warn!(
+                                    epoch = old_epoch,
+                                    %error,
+                                    "last indexed tick was not read"
+                                );
+                                None
+                            }
+                        };
+                        if let Some(state) = moved_boundary_rollover(
+                            updated.epoch,
+                            previous_initial,
+                            previous_epoch_last,
+                            updated.initial_tick,
+                        ) {
+                            let skipped = updated
+                                .initial_tick
+                                .saturating_sub(state.old_last)
+                                .saturating_sub(1);
+                            *rollover.write().await = Some(state);
+                            tracing::warn!(
+                                epoch = updated.epoch,
+                                previous_initial,
+                                new_initial = updated.initial_tick,
+                                skipped,
+                                "epoch initial tick moved forward"
+                            );
+                            if let Ok(Some(metadata)) = store.epoch_metadata_for(old_epoch).await {
+                                if let Err(error) = store
+                                    .close_epoch(old_epoch, metadata.initial_tick, state.old_last)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        epoch = old_epoch,
+                                        %error,
+                                        "previous epoch was not closed after boundary move"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 *head.write().await = updated.clone();
@@ -2631,6 +2728,24 @@ mod tests {
         assert!(rollover.contains(101));
         assert!(rollover.contains(199));
         assert!(!rollover.contains(200));
+    }
+
+    #[test]
+    fn moved_boundary_skips_the_provisional_epoch_start() {
+        let rollover = moved_boundary_rollover(241, 92_241_594, Some(92_241_593), 92_260_000)
+            .expect("a forward boundary move needs a skip range");
+        assert_eq!(rollover.old_epoch, 240);
+        assert_eq!(rollover.old_last, 92_241_593);
+        assert!(rollover.contains(92_241_594));
+        assert!(rollover.contains(92_259_999));
+        assert!(!rollover.contains(92_260_000));
+
+        let without_prior_epoch = moved_boundary_rollover(241, 92_241_594, None, 92_260_000)
+            .expect("a forward boundary move needs a skip range");
+        assert_eq!(without_prior_epoch.old_last, 92_241_593);
+
+        assert!(moved_boundary_rollover(241, 92_260_000, Some(92_241_593), 92_241_594).is_none());
+        assert!(moved_boundary_rollover(241, 92_260_000, Some(92_241_593), 92_260_000).is_none());
     }
 
     #[tokio::test]

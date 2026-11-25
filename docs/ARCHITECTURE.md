@@ -266,6 +266,9 @@ changed tick rate before, so Glyph never assumes 604,800 ticks per epoch.
 - Restart-based transitions can skip a large range of tick numbers. The new epoch's
   `initialTick` is authoritative, and the gap is skipped instead of treated as missing
   data.
+- A peer can publish a provisional start for the new epoch and then move it forward when
+  the network restarts again. The stored start is monotonic, backward reports are ignored,
+  and the writer skips the abandoned range instead of retrying those tick numbers.
 - With no stored cursor, the indexer starts at the current epoch `initialTick`. With a
   cursor, it resumes at `last_indexed_tick + 1`. A tick whose epoch cannot be resolved
   from the persisted boundaries is skipped with a warning rather than guessed.

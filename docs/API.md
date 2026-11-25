@@ -439,6 +439,9 @@ derives a boundary from 604,800 ticks.
   not at `new_initial_tick - 1`. A restart-based transition can skip tens of
   thousands of tick numbers, so the next initial tick does not prove the
   previous epoch's last tick. `closed` is a persisted fact.
+- If a peer moves the new epoch's `initial_tick` forward after a provisional
+  announcement, the persisted start only moves forward. Ticks in the abandoned
+  range are skipped rather than assigned to the epoch or retried.
 - Tick-to-epoch assignment uses the persisted boundary map. A tick whose epoch
   cannot be resolved is skipped with a warning instead of being guessed.
 - Previous-epoch catch-up runs only when that epoch's boundary and computor set

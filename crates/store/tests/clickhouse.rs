@@ -673,6 +673,42 @@ async fn last_tick_for_epoch_returns_the_partition_maximum() {
 }
 
 #[tokio::test]
+async fn write_epoch_start_keeps_a_forward_boundary() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    store
+        .write_epoch_start(241, 92_241_594)
+        .await
+        .expect("provisional start");
+    store
+        .write_epoch_start(241, 92_260_000)
+        .await
+        .expect("final start");
+
+    let row = store
+        .epoch_metadata_for(241)
+        .await
+        .expect("read metadata")
+        .expect("epoch row");
+    assert_eq!(row.initial_tick, 92_260_000);
+    assert_eq!(row.first_tick, 92_260_000);
+    assert_eq!(row.last_tick, 92_260_000);
+
+    store
+        .write_epoch_start(241, 92_241_594)
+        .await
+        .expect("stale start");
+    let row = store
+        .epoch_metadata_for(241)
+        .await
+        .expect("read metadata")
+        .expect("epoch row");
+    assert_eq!(row.initial_tick, 92_260_000);
+    assert_eq!(row.first_tick, 92_260_000);
+}
+
+#[tokio::test]
 async fn advanced_reads_are_ordered_deduped_and_bucketed() {
     let Some(store) = test_store().await else {
         return;

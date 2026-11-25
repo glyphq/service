@@ -894,6 +894,21 @@ impl ClickHouseStore {
         u64::try_from(timestamp.timestamp_micros()).unwrap_or(0)
     }
 
+    /// Keep an observed epoch range consistent when a peer moves the published
+    /// start forward. Any recorded tick below the new start belongs to a
+    /// provisional boundary and must not survive as the epoch's first tick.
+    fn epoch_start_range(existing: Option<&EpochMetadata>, initial_tick: u32) -> (u32, u32) {
+        let first_tick = existing
+            .map(|row| row.first_tick)
+            .filter(|tick| *tick >= initial_tick)
+            .unwrap_or(initial_tick);
+        let last_tick = existing
+            .map(|row| row.last_tick)
+            .unwrap_or(initial_tick)
+            .max(initial_tick);
+        (first_tick, last_tick)
+    }
+
     async fn upsert_epoch(&self, row: &EpochMetadata) -> Result<()> {
         let now = Utc::now();
         let mut insert = self.client.insert::<rows::EpochInsert>("epochs")?;
@@ -1868,16 +1883,11 @@ LIMIT ? OFFSET ?
 
     async fn write_epoch_start(&self, epoch: u16, initial_tick: u32) -> Result<()> {
         let existing = self.epoch_metadata_for(epoch).await?;
-        let first_tick = existing
+        let initial_tick = existing
             .as_ref()
-            .map(|row| row.first_tick)
-            .filter(|tick| *tick != 0)
+            .map(|row| row.initial_tick.max(initial_tick))
             .unwrap_or(initial_tick);
-        let last_tick = existing
-            .as_ref()
-            .map(|row| row.last_tick)
-            .unwrap_or(initial_tick)
-            .max(initial_tick);
+        let (first_tick, last_tick) = Self::epoch_start_range(existing.as_ref(), initial_tick);
         self.upsert_epoch(&EpochMetadata {
             epoch,
             initial_tick,
@@ -2638,6 +2648,37 @@ mod tests {
         assert_eq!(plan_prune(&[1, 2, 3], 99), Vec::<u16>::new());
         assert_eq!(plan_prune(&[1, 2, 3], 0), vec![1, 2, 3]);
         assert_eq!(plan_prune(&[], 5), Vec::<u16>::new());
+    }
+
+    #[test]
+    fn epoch_start_range_discards_a_provisional_boundary() {
+        let provisional = EpochMetadata {
+            epoch: 241,
+            initial_tick: 92_241_594,
+            first_tick: 92_241_594,
+            last_tick: 92_241_594,
+            closed: false,
+        };
+        assert_eq!(
+            ClickHouseStore::epoch_start_range(Some(&provisional), 92_260_000),
+            (92_260_000, 92_260_000)
+        );
+
+        let indexed = EpochMetadata {
+            epoch: 241,
+            initial_tick: 92_260_000,
+            first_tick: 92_260_010,
+            last_tick: 92_260_100,
+            closed: false,
+        };
+        assert_eq!(
+            ClickHouseStore::epoch_start_range(Some(&indexed), 92_260_000),
+            (92_260_010, 92_260_100)
+        );
+        assert_eq!(
+            ClickHouseStore::epoch_start_range(None, 92_260_000),
+            (92_260_000, 92_260_000)
+        );
     }
 
     #[test]
