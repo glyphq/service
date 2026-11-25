@@ -2392,6 +2392,13 @@ async fn dispatch_loop(
                 }
             }
             let available = window.saturating_sub(pending.load(Ordering::Acquire));
+            // The write cursor's own range must never wait for a full window.
+            // One extra batch is bounded and guarantees forward progress.
+            let available = if start == next && requested > 0 {
+                available.max(1)
+            } else {
+                available
+            };
             let count = requested.min(available as u32);
             if count > 0 {
                 pending.fetch_add(count as usize, Ordering::Release);

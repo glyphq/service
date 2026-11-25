@@ -1884,6 +1884,11 @@ impl NodePool {
     /// Builds a pool with explicit health policy, primarily for tests and
     /// deployments that prefer a shorter quarantine.
     pub fn with_policy(peers: Vec<PeerConfig>, policy: PeerPolicy) -> Self {
+        let log_concurrency = std::env::var("INDEXER_LOG_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8)
+            .clamp(1, 32);
         Self {
             peers,
             manager: PeerManager::new(policy),
@@ -1891,7 +1896,7 @@ impl NodePool {
             connection_limit: 4,
             slot_available: std::sync::Arc::new(tokio::sync::Notify::new()),
             log_peer: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            log_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
+            log_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(log_concurrency)),
         }
     }
 
