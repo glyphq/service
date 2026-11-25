@@ -100,6 +100,8 @@ pub enum Error {
     Archive(String),
     #[error("archive has no data: {0}")]
     ArchiveNotAvailable(String),
+    #[error("archive has not processed the tick yet: {0}")]
+    ArchiveNotReady(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 }
@@ -375,16 +377,19 @@ pub struct Peer {
 }
 
 impl Peer {
-    async fn archive_tick_data(&self, tick: u32) -> Option<TickData> {
-        let archive = self.archive.as_ref()?;
+    async fn archive_tick_data(&self, tick: u32) -> Result<Option<TickData>> {
+        let Some(archive) = self.archive.as_ref() else {
+            return Ok(None);
+        };
         match archive.tick_data(tick).await {
             Ok(tick_data) => {
                 tracing::info!(tick, "recovered tick data from the public archive");
-                Some(tick_data)
+                Ok(Some(tick_data))
             }
+            Err(Error::ArchiveNotAvailable(_)) => Ok(None),
             Err(error) => {
                 tracing::warn!(tick, %error, "public archive tick data unavailable");
-                None
+                Err(error)
             }
         }
     }
@@ -1364,7 +1369,7 @@ impl Peer {
             None => {
                 tracing::debug!(tick, "tick data absent; checking for an empty tick");
                 if votes.iter().any(|vote| !vote.is_empty_vote()) || votes.is_empty() {
-                    if let Some(tick_data) = self.archive_tick_data(tick).await {
+                    if let Some(tick_data) = self.archive_tick_data(tick).await? {
                         tick_data
                     } else {
                         empty_tick_from_votes(&votes, tick)?

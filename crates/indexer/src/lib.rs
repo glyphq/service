@@ -493,7 +493,38 @@ impl<S: Store + 'static> Indexer<S> {
     pub async fn run(&mut self, cancel: CancellationToken) -> Result<()> {
         self.store.init().await?;
         let mut peer = self.pool.connect_best().await?;
-        let head = peer.head().await?;
+        let mut head = peer.head().await?;
+        let mut current = peer.config().addr;
+        let mut probes = tokio::task::JoinSet::new();
+        for config in self.config.peers.clone() {
+            if config.addr == current {
+                continue;
+            }
+            probes.spawn(async move {
+                let mut candidate = Peer::connect(config).await.ok()?;
+                let candidate_head = candidate.head().await.ok()?;
+                Some((candidate, candidate_head))
+            });
+        }
+        while let Some(joined) = probes.join_next().await {
+            let Ok(Some((candidate, candidate_head))) = joined else {
+                continue;
+            };
+            let newer = candidate_head.epoch > head.epoch
+                || (candidate_head.epoch == head.epoch && candidate_head.tick > head.tick);
+            if newer {
+                tracing::info!(
+                    from = %current,
+                    to = %candidate.config().addr,
+                    old_head = head.tick,
+                    new_head = candidate_head.tick,
+                    "using more advanced peer head"
+                );
+                current = candidate.config().addr;
+                peer = candidate;
+                head = candidate_head;
+            }
+        }
         let mut next = self.next_tick(&head).await?;
         let tuning = PipelineTuning::from_env();
 
@@ -1101,6 +1132,19 @@ impl<S: Store + 'static> Indexer<S> {
                     count: 1,
                     attempt: attempt.saturating_add(1),
                     delay: Duration::ZERO,
+                })
+                .await
+                .ok();
+            return FetchAction::Retry;
+        }
+
+        if let Error::Node(node::Error::ArchiveNotReady(_)) = &error {
+            retry
+                .send(RetryRequest {
+                    start: next,
+                    count: 1,
+                    attempt: attempt.saturating_add(1),
+                    delay: Duration::from_millis(500),
                 })
                 .await
                 .ok();
@@ -1771,10 +1815,6 @@ async fn connect_from(configs: &[PeerConfig], start: usize) -> Option<(Peer, usi
     None
 }
 
-async fn connect_any(configs: &[PeerConfig]) -> Option<Peer> {
-    connect_from(configs, 0).await.map(|(peer, _)| peer)
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn coordinate<S: Store + 'static>(
     mut peer: Peer,
@@ -1788,6 +1828,7 @@ async fn coordinate<S: Store + 'static>(
     cancel: CancellationToken,
     poll: Duration,
 ) {
+    let mut cursor = 0usize;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return,
@@ -1800,6 +1841,24 @@ async fn coordinate<S: Store + 'static>(
         match head_result {
             Ok(updated) => {
                 let old_head = head.read().await.clone();
+                let regressed = updated.epoch < old_head.epoch
+                    || (updated.epoch == old_head.epoch && updated.tick < old_head.tick);
+                if regressed {
+                    tracing::warn!(
+                        epoch = updated.epoch,
+                        tick = updated.tick,
+                        known_epoch = old_head.epoch,
+                        known_tick = old_head.tick,
+                        "head refresh regressed; rotating peer"
+                    );
+                    if let Some((replacement, index)) =
+                        connect_from(&configs, cursor.saturating_add(1)).await
+                    {
+                        peer = replacement;
+                        cursor = index;
+                    }
+                    continue;
+                }
                 let epoch_changed = updated.epoch != old_head.epoch;
                 let missing = !computors.read().await.contains_key(&updated.epoch);
                 // Cache the new epoch's computors before workers can observe
@@ -1824,8 +1883,11 @@ async fn coordinate<S: Store + 'static>(
                         }
                         Err(error) => {
                             tracing::warn!(%error, "computor refresh failed, reconnecting");
-                            if let Some(replacement) = connect_any(&configs).await {
+                            if let Some((replacement, index)) =
+                                connect_from(&configs, cursor.saturating_add(1)).await
+                            {
                                 peer = replacement;
+                                cursor = index;
                             }
                             continue;
                         }
@@ -1986,8 +2048,11 @@ async fn coordinate<S: Store + 'static>(
             }
             Err(error) => {
                 tracing::warn!(%error, "head refresh failed, reconnecting");
-                if let Some(replacement) = connect_any(&configs).await {
+                if let Some((replacement, index)) =
+                    connect_from(&configs, cursor.saturating_add(1)).await
+                {
                     peer = replacement;
+                    cursor = index;
                 }
             }
         }

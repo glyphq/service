@@ -326,8 +326,10 @@ pub fn check_head(previous: Option<&Head>, next: &Head) -> Result<()> {
 /// stale tick.
 pub fn check_cached_head(observed: Option<&Head>, cached: &Head) -> Result<()> {
     if let Some(observed) = observed {
-        // `cached` is stale when it is older than what this peer already saw.
-        if head_regressed(observed, cached) {
+        // A same-epoch cached head below the peer's current head is still a
+        // valid lower bound for historical ticks. Only a cached head from an
+        // older epoch is unusable after rollover.
+        if cached.epoch < observed.epoch {
             return Err(Error::NotSynchronized {
                 head: observed.tick,
                 requested: cached.tick,
@@ -463,6 +465,10 @@ mod tests {
             check_cached_head(Some(&observed), &head(240, 9_000)),
             Err(Error::NotSynchronized { head: 50, .. })
         ));
+        assert!(
+            check_cached_head(Some(&head(241, 100)), &head(241, 90)).is_ok(),
+            "a same-epoch cached head remains a valid lower bound"
+        );
         assert!(check_cached_head(Some(&observed), &observed).is_ok());
 
         let computors = Computors {

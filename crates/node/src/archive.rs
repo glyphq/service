@@ -18,7 +18,8 @@ use crate::{Error, Result};
 const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const ARCHIVE_INTERVAL: Duration = Duration::from_millis(100);
 const ARCHIVE_ATTEMPTS: u32 = 4;
-const ARCHIVE_MISSING_TTL: Duration = Duration::from_secs(300);
+const ARCHIVE_MISSING_TTL: Duration = Duration::from_secs(60);
+const ARCHIVE_HEAD_TTL: Duration = Duration::from_secs(2);
 
 /// The public Query API rate-limits a host. Serialize requests across every
 /// peer and worker so a batch of missing ticks does not turn into a burst of
@@ -38,6 +39,12 @@ fn archive_missing() -> &'static std::sync::Mutex<HashMap<u32, Instant>> {
     static MISSING: std::sync::OnceLock<std::sync::Mutex<HashMap<u32, Instant>>> =
         std::sync::OnceLock::new();
     MISSING.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn archive_head_cache() -> &'static std::sync::Mutex<Option<(Instant, u32)>> {
+    static HEAD: std::sync::OnceLock<std::sync::Mutex<Option<(Instant, u32)>>> =
+        std::sync::OnceLock::new();
+    HEAD.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 #[derive(Clone)]
@@ -66,17 +73,16 @@ impl ArchiveClient {
                 )));
             }
         }
+        let head = self.head().await?;
+        if tick > head {
+            return Err(Error::ArchiveNotReady(format!(
+                "tick {tick} is above the archive head {head}"
+            )));
+        }
         let url = format!("{}/getTickData", self.base_url.trim_end_matches('/'));
         let mut last_error = None;
         for attempt in 0..ARCHIVE_ATTEMPTS {
-            {
-                let mut next = archive_gate().next.lock().await;
-                let now = Instant::now();
-                if *next > now {
-                    tokio::time::sleep(*next - now).await;
-                }
-                *next = Instant::now() + ARCHIVE_INTERVAL;
-            }
+            wait_for_archive_turn().await;
             let response = match self
                 .client
                 .post(&url)
@@ -128,6 +134,52 @@ impl ArchiveClient {
         }
         Err(last_error.unwrap_or_else(|| Error::Archive(format!("request tick {tick} failed"))))
     }
+
+    async fn head(&self) -> Result<u32> {
+        if let Ok(cache) = archive_head_cache().lock() {
+            if let Some((at, head)) = *cache {
+                if at.elapsed() < ARCHIVE_HEAD_TTL {
+                    return Ok(head);
+                }
+            }
+        }
+        wait_for_archive_turn().await;
+        let url = format!(
+            "{}/getLastProcessedTick",
+            self.base_url.trim_end_matches('/')
+        );
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| Error::Archive(format!("request archive head: {error}")))?;
+        let response = response
+            .error_for_status()
+            .map_err(|error| Error::Archive(format!("request archive head: {error}")))?;
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|error| Error::Archive(format!("decode archive head: {error}")))?;
+        let head = body
+            .get("tickNumber")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|head| u32::try_from(head).ok())
+            .ok_or_else(|| Error::Archive("archive head is missing tickNumber".into()))?;
+        if let Ok(mut cache) = archive_head_cache().lock() {
+            *cache = Some((Instant::now(), head));
+        }
+        Ok(head)
+    }
+}
+
+async fn wait_for_archive_turn() {
+    let mut next = archive_gate().next.lock().await;
+    let now = Instant::now();
+    if *next > now {
+        tokio::time::sleep(*next - now).await;
+    }
+    *next = Instant::now() + ARCHIVE_INTERVAL;
 }
 
 fn parse_tick_data(body: &serde_json::Value, requested: u32) -> Result<TickData> {

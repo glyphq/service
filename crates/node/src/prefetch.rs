@@ -203,7 +203,7 @@ impl Peer {
                                 Error::ArchiveNotAvailable(_) => {
                                     Error::EndResponse(MessageType::RequestTickData)
                                 }
-                                error => Error::Archive(error.to_string()),
+                                error => error,
                             }));
                         }
                         Err(error) => {
