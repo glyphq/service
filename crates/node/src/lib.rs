@@ -2851,6 +2851,103 @@ impl NodePool {
         best_empty.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
     }
 
+    /// Repairs logs for a batch of ticks over one connection. Log fallback is
+    /// the slow path; opening a socket per tick turns an empty-tick run into a
+    /// connection storm.
+    pub async fn log_batch(
+        &self,
+        tick_data: &[TickData],
+    ) -> Result<Vec<(LogRanges, Vec<LogEvent>)>> {
+        if tick_data.is_empty() {
+            return Ok(Vec::new());
+        }
+        let _permit = self
+            .log_slots
+            .acquire()
+            .await
+            .expect("log fallback semaphore is never closed");
+        let mut candidates = self.manager.attempt_order(&self.peers);
+        for config in &self.peers {
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.addr == config.addr)
+            {
+                candidates.push(config.clone());
+            }
+        }
+        if candidates.is_empty() {
+            return Err(Error::NoPeers);
+        }
+        let preferred = *self.log_peer.lock().expect("log peer mutex poisoned");
+        if let Some(addr) = preferred {
+            if let Some(index) = candidates.iter().position(|config| config.addr == addr) {
+                candidates.swap(0, index);
+            }
+        }
+        let mut last_error = None;
+        let mut best_empty: Option<Vec<(LogRanges, Vec<LogEvent>)>> = None;
+        for config in candidates {
+            let addr = config.addr;
+            let fetched = tokio::time::timeout(Duration::from_secs(30), async {
+                let mut peer = Peer::connect(config).await?;
+                peer.complete_logs_batch(tick_data).await
+            })
+            .await
+            .unwrap_or_else(|_| Err(Error::Timeout(Duration::from_secs(30))));
+            let fetched = match fetched {
+                Ok(fetched) if fetched.len() == tick_data.len() => fetched,
+                Ok(_) => {
+                    last_error = Some(Error::Verification(
+                        "log batch returned the wrong number of ticks".into(),
+                    ));
+                    continue;
+                }
+                Err(error) => {
+                    if preferred == Some(addr) {
+                        self.clear_log_peer();
+                    }
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let valid = fetched.iter().all(|(ranges, logs, known, _)| {
+                !ranges.is_pending()
+                    && (*known || ranges.count() == 0)
+                    && prefetch::logs_cover_ranges(ranges, logs)
+            });
+            if !valid {
+                if preferred == Some(addr) {
+                    self.clear_log_peer();
+                }
+                last_error = Some(Error::Verification(format!(
+                    "peer {addr} could not supply complete logs for the batch"
+                )));
+                continue;
+            }
+            if fetched.iter().any(|(ranges, _, _, _)| ranges.count() > 0) {
+                self.manager.record_log_success(addr);
+                *self.log_peer.lock().expect("log peer mutex poisoned") = Some(addr);
+                return Ok(fetched
+                    .into_iter()
+                    .map(|(ranges, logs, _, _)| (ranges, logs))
+                    .collect());
+            }
+            if preferred == Some(addr) {
+                return Ok(fetched
+                    .into_iter()
+                    .map(|(ranges, logs, _, _)| (ranges, logs))
+                    .collect());
+            }
+            best_empty.get_or_insert_with(|| {
+                fetched
+                    .into_iter()
+                    .map(|(ranges, logs, _, _)| (ranges, logs))
+                    .collect()
+            });
+        }
+        best_empty.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
+    }
+
     fn clear_log_peer(&self) {
         *self.log_peer.lock().expect("log peer mutex poisoned") = None;
     }

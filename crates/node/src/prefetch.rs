@@ -338,40 +338,33 @@ impl Peer {
             .collect::<Vec<_>>();
         if !incomplete.is_empty() {
             if let Some(pool) = fallback.as_ref() {
-                // A bad peer can miss logs for many ticks in one batch. Fan
-                // out to peers per affected tick; the pool semaphore bounds
-                // concurrent fallback connections.
-                let mut tasks = tokio::task::JoinSet::new();
-                for index in incomplete {
-                    let Some(tick) = decoded[index].as_ref() else {
-                        continue;
-                    };
-                    let tick_number = tick.tick;
-                    let tick_data = tick.tick_data.clone();
-                    let pool = pool.clone();
-                    tasks.spawn(async move {
-                        let result =
-                            tokio::time::timeout(Duration::from_secs(20), pool.logs(&tick_data))
-                                .await
-                                .unwrap_or_else(|_| Err(Error::Timeout(Duration::from_secs(20))));
-                        (index, tick_number, result)
-                    });
-                }
-                while let Some(joined) = tasks.join_next().await {
-                    match joined {
-                        Ok((index, _, Ok((ranges, tick_logs)))) => {
+                // Repair the whole affected set over one connection. Opening
+                // a socket per tick turns an empty-tick run into a connection
+                // storm against every peer.
+                let indices = incomplete
+                    .iter()
+                    .copied()
+                    .filter(|index| decoded[*index].is_some())
+                    .collect::<Vec<_>>();
+                let data = indices
+                    .iter()
+                    .filter_map(|index| decoded[*index].as_ref())
+                    .map(|tick| tick.tick_data.clone())
+                    .collect::<Vec<_>>();
+                match pool.log_batch(&data).await {
+                    Ok(fetched) => {
+                        for (index, (ranges, tick_logs)) in indices.into_iter().zip(fetched) {
                             log_ranges[index] = ranges;
                             logs[index] = tick_logs;
                             known[index] = true;
                             log_warnings[index].clear();
                         }
-                        Ok((index, tick_number, Err(error))) => {
+                    }
+                    Err(error) => {
+                        for index in indices {
                             log_warnings[index].push(format!(
-                                "no peer supplied complete logs for tick {tick_number}: {error}"
+                                "no peer supplied complete logs for the batch: {error}"
                             ));
-                        }
-                        Err(error) => {
-                            tracing::warn!(%error, "log fallback task failed");
                         }
                     }
                 }
@@ -1114,6 +1107,35 @@ impl Peer {
             known.pop().expect("one known entry"),
             warnings.pop().expect("one warning entry"),
         ))
+    }
+
+    /// Fetches logs for several ticks on one connection. Used by the pool to
+    /// repair a whole batch without opening one socket per tick.
+    pub async fn complete_logs_batch(
+        &mut self,
+        tick_data: &[TickData],
+    ) -> Result<Vec<(LogRanges, Vec<LogEvent>, bool, Vec<String>)>> {
+        let decoded = tick_data
+            .iter()
+            .cloned()
+            .map(|tick_data| {
+                Some(DecodedTick {
+                    tick: tick_data.tick,
+                    tick_data,
+                    votes: Vec::new(),
+                    transactions: Vec::new(),
+                    warnings: Vec::new(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let (ranges, logs, known, warnings) = self.prefetch_logs(&decoded).await;
+        Ok(ranges
+            .into_iter()
+            .zip(logs)
+            .zip(known)
+            .zip(warnings)
+            .map(|(((ranges, logs), known), warnings)| (ranges, logs, known, warnings))
+            .collect())
     }
 
     fn prefetch_timeout(&self, ticks: usize) -> Duration {
