@@ -679,8 +679,12 @@ impl<S: Store + 'static> Indexer<S> {
         let pending = Arc::new(AtomicUsize::new(0));
         let pipeline_cancel = CancellationToken::new();
         let channel_capacity = tuning.fetch_window.max(tuning.fetch_concurrency);
+        // Queue only a couple of batches per worker. A deep FIFO lets the
+        // dispatcher run hundreds of ticks ahead, so a hole at the write
+        // cursor waits behind work that cannot be written yet.
+        let work_capacity = tuning.fetch_concurrency.saturating_mul(2).max(8);
 
-        let (work_tx, work_rx) = mpsc::channel::<FetchWork>(channel_capacity);
+        let (work_tx, work_rx) = mpsc::channel::<FetchWork>(work_capacity);
         let work_rx = Arc::new(AsyncMutex::new(work_rx));
         let (result_tx, mut result_rx) = mpsc::channel::<FetchResult>(channel_capacity);
         let (retry_tx, retry_rx) = mpsc::channel::<RetryRequest>(channel_capacity);
@@ -2253,8 +2257,8 @@ async fn dispatch_loop(
         // dispatcher keeps assigning newer ticks. Re-anchor at the write
         // cursor when it has not moved for a couple of seconds.
         if assigned_upto.is_some_and(|upto| upto >= write_tick)
-            && now.duration_since(stalled_since) >= Duration::from_secs(2)
-            && now.duration_since(last_anchor) >= Duration::from_secs(2)
+            && now.duration_since(stalled_since) >= Duration::from_secs(5)
+            && now.duration_since(last_anchor) >= Duration::from_secs(5)
         {
             tracing::warn!(
                 next = write_tick,
@@ -2266,7 +2270,16 @@ async fn dispatch_loop(
             last_anchor = now;
         }
 
-        if let Some(position) = retries.iter().position(|(at, _, _, _)| *at <= now) {
+        // Retry the lowest range first. A far-ahead batch that timed out must
+        // not keep taking worker slots while the write cursor is missing a
+        // much earlier tick.
+        let due = retries
+            .iter()
+            .enumerate()
+            .filter(|(_, (at, _, _, _))| *at <= now)
+            .min_by_key(|(_, (_, start, _, _))| *start)
+            .map(|(position, _)| position);
+        if let Some(position) = due {
             let (_, mut start, mut count, attempt) = retries.remove(position).expect("retry entry");
             let next = next_write.load(Ordering::Acquire);
             if start.saturating_add(count) <= next {
