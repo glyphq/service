@@ -2757,25 +2757,37 @@ impl NodePool {
             }
         }
         let mut results: Vec<Option<FetchedLogs>> = (0..tick_data.len()).map(|_| None).collect();
-        let mut remaining = (0..tick_data.len()).collect::<Vec<_>>();
         let mut last_error = None;
-        for config in candidates {
-            if remaining.is_empty() {
-                break;
-            }
+        // Log latency varies by an order of magnitude between peers, and a
+        // preferred peer that has gone slow must not delay every batch behind
+        // it. Race a small number of peers and keep the first complete proof
+        // for each tick. The semaphore still bounds total log connections.
+        let mut tasks = tokio::task::JoinSet::new();
+        for config in candidates.into_iter().take(3) {
             let addr = config.addr;
-            let subset = remaining
-                .iter()
-                .map(|index| tick_data[*index].clone())
-                .collect::<Vec<_>>();
-            let fetched = tokio::time::timeout(Duration::from_secs(8), async {
-                let mut peer = Peer::connect(config).await?;
-                peer.complete_logs_batch(&subset).await
-            })
-            .await
-            .unwrap_or_else(|_| Err(Error::Timeout(Duration::from_secs(8))));
+            let subset = tick_data.to_vec();
+            tasks.spawn(async move {
+                let fetched = tokio::time::timeout(Duration::from_secs(8), async {
+                    let mut peer = Peer::connect(config).await?;
+                    peer.complete_logs_batch(&subset).await
+                })
+                .await
+                .unwrap_or_else(|_| Err(Error::Timeout(Duration::from_secs(8))));
+                (addr, fetched)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            let (addr, fetched) = match joined {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    last_error = Some(Error::Verification(format!(
+                        "log fetch task failed: {error}"
+                    )));
+                    continue;
+                }
+            };
             let fetched = match fetched {
-                Ok(fetched) if fetched.len() == subset.len() => fetched,
+                Ok(fetched) if fetched.len() == tick_data.len() => fetched,
                 Ok(_) => {
                     last_error = Some(Error::Verification(
                         "log batch returned the wrong number of ticks".into(),
@@ -2792,12 +2804,15 @@ impl NodePool {
             };
             let mut supplied = false;
             let mut supplied_logs = false;
-            for (index, fetch) in remaining.iter().copied().zip(fetched) {
+            for (index, fetch) in fetched.into_iter().enumerate() {
                 if fetch.complete {
                     supplied = true;
                     supplied_logs |= fetch.ranges.count() > 0;
                 }
-                if fetch.complete || results[index].is_none() {
+                let replace = results[index]
+                    .as_ref()
+                    .is_none_or(|existing| !existing.complete && fetch.complete);
+                if replace {
                     results[index] = Some(fetch);
                 }
             }
@@ -2808,16 +2823,26 @@ impl NodePool {
             if supplied_logs {
                 tracing::debug!(
                     peer = %addr,
-                    ticks = remaining.len(),
+                    ticks = tick_data.len(),
                     "peer supplied verified logs for a repair batch"
                 );
             }
-            remaining.retain(|index| results[*index].as_ref().is_none_or(|fetch| !fetch.complete));
+            if results
+                .iter()
+                .all(|fetch| fetch.as_ref().is_some_and(|f| f.complete))
+            {
+                tasks.abort_all();
+                break;
+            }
         }
-        if !remaining.is_empty() {
+        let remaining = results
+            .iter()
+            .filter(|fetch| !fetch.as_ref().is_some_and(|f| f.complete))
+            .count();
+        if remaining > 0 {
             if let Some(error) = last_error {
                 tracing::debug!(
-                    ticks = remaining.len(),
+                    ticks = remaining,
                     %error,
                     "log repair exhausted peers"
                 );
