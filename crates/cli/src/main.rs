@@ -75,6 +75,10 @@ enum Command {
         /// Log progress every N indexed ticks.
         #[arg(long, default_value_t = 100)]
         progress_every: u64,
+        /// Skip a tick after this many attempts when every peer reports that
+        /// its tick data does not exist.
+        #[arg(long, env = "INDEXER_MAX_TICK_ATTEMPTS", default_value_t = 4)]
+        max_tick_attempts: u32,
     },
     /// Initialize ClickHouse tables.
     DbInit,
@@ -231,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
             verify_signatures,
             no_verify_signatures,
             progress_every,
+            max_tick_attempts,
         } => {
             if peers.is_empty() {
                 bail!("at least one --peer or QUBIC_PEERS entry is required");
@@ -245,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
                 poll_interval: std::time::Duration::from_millis(poll_ms),
                 verify_signatures: verify,
                 progress_every: progress_every.max(1),
+                max_tick_attempts: max_tick_attempts.max(1),
                 archive: archive_from_env()?,
                 archive_fail_closed: std::env::var("ARCHIVE_FAIL_CLOSED")
                     .is_ok_and(|value| value == "true"),
@@ -366,6 +372,7 @@ mod tests {
                 verify_signatures,
                 no_verify_signatures,
                 progress_every,
+                max_tick_attempts,
             } => {
                 assert_eq!(
                     peers,
@@ -379,6 +386,7 @@ mod tests {
                 assert!(!verify_signatures);
                 assert!(no_verify_signatures);
                 assert_eq!(progress_every, 100);
+                assert_eq!(max_tick_attempts, 4);
             }
             _ => panic!("expected sync command"),
         }
@@ -395,6 +403,7 @@ mod tests {
                 verify_signatures,
                 no_verify_signatures,
                 progress_every,
+                max_tick_attempts,
             } => {
                 assert_eq!(peers, vec!["157.180.10.49:21841".parse().unwrap()]);
                 assert_eq!(from, None);
@@ -402,6 +411,7 @@ mod tests {
                 assert!(!verify_signatures);
                 assert!(!no_verify_signatures);
                 assert_eq!(progress_every, 100);
+                assert_eq!(max_tick_attempts, 4);
             }
             _ => panic!("expected sync command"),
         }

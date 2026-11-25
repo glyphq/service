@@ -56,6 +56,9 @@ pub struct IndexerConfig {
     pub verify_signatures: bool,
     /// Log progress every N ticks.
     pub progress_every: u64,
+    /// Give up on a tick after this many fetch attempts when every peer says
+    /// the tick data does not exist. Retries still apply to transient errors.
+    pub max_tick_attempts: u32,
     /// Optional raw bundle archive (filesystem or S3/MinIO).
     pub archive: Option<SharedArchive>,
     /// When true, an archive failure prevents the tick from being indexed.
@@ -70,6 +73,7 @@ impl Default for IndexerConfig {
             poll_interval: Duration::from_millis(750),
             verify_signatures: false,
             progress_every: 100,
+            max_tick_attempts: 4,
             archive: None,
             archive_fail_closed: false,
         }
@@ -252,6 +256,12 @@ struct RetryRequest {
     count: u32,
     attempt: u32,
     delay: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchAction {
+    Retry,
+    SkipTo(u32),
 }
 
 /// Bounded out-of-order buffer that the ordered writer drains from `next`.
@@ -722,7 +732,7 @@ impl<S: Store + 'static> Indexer<S> {
                     let fetched = match result.outcome {
                         Ok(fetched) => fetched,
                         Err(error) => {
-                            let moved = self
+                            let action = self
                                 .handle_fetch_error(
                                     consume_next,
                                     result.attempt,
@@ -733,8 +743,13 @@ impl<S: Store + 'static> Indexer<S> {
                                     &mut consecutive_failures,
                                 )
                                 .await;
-                            if moved {
-                                next = head_snapshot.initial_tick;
+                            if let FetchAction::SkipTo(skip_to) = action {
+                                tracing::warn!(
+                                    from = consume_next,
+                                    to = skip_to,
+                                    "skipping unavailable ticks"
+                                );
+                                next = skip_to;
                                 consume_next = next;
                                 next_write.store(next, Ordering::Release);
                                 let dropped = buffer.retain_from(consume_next);
@@ -1041,7 +1056,7 @@ impl<S: Store + 'static> Indexer<S> {
         retry: &mpsc::Sender<RetryRequest>,
         backoff: &mut Duration,
         consecutive_failures: &mut u32,
-    ) -> bool {
+    ) -> FetchAction {
         if let Error::Node(node::Error::NotSynchronized {
             head: peer_head, ..
         }) = &error
@@ -1061,14 +1076,42 @@ impl<S: Store + 'static> Indexer<S> {
                 })
                 .await
                 .ok();
-            return false;
+            return FetchAction::Retry;
+        }
+
+        if matches!(
+            &error,
+            Error::Node(node::Error::EndResponse(
+                qubic::wire::MessageType::RequestTickData
+            ))
+        ) {
+            *consecutive_failures += 1;
+            if attempt.saturating_add(1) >= self.config.max_tick_attempts {
+                tracing::error!(
+                    tick = next,
+                    attempts = attempt.saturating_add(1),
+                    "tick data is unavailable from every peer, skipping tick"
+                );
+                *consecutive_failures = 0;
+                return FetchAction::SkipTo(next.saturating_add(1));
+            }
+            retry
+                .send(RetryRequest {
+                    start: next,
+                    count: 1,
+                    attempt: attempt.saturating_add(1),
+                    delay: Duration::ZERO,
+                })
+                .await
+                .ok();
+            return FetchAction::Retry;
         }
 
         if let Error::Node(node::Error::Verification(message)) = &error {
             if message.starts_with("unknown epoch boundary") {
                 tracing::warn!(tick = next, %message, "skipping a tick with no known epoch");
                 *consecutive_failures = 0;
-                return true;
+                return FetchAction::SkipTo(next.saturating_add(1));
             }
         }
 
@@ -1088,7 +1131,7 @@ impl<S: Store + 'static> Indexer<S> {
                     "previous epoch tail did not verify, skipping range"
                 );
                 *consecutive_failures = 0;
-                return true;
+                return FetchAction::SkipTo(head.initial_tick);
             }
             retry
                 .send(RetryRequest {
@@ -1099,7 +1142,7 @@ impl<S: Store + 'static> Indexer<S> {
                 })
                 .await
                 .ok();
-            return false;
+            return FetchAction::Retry;
         }
 
         if matches!(
@@ -1121,7 +1164,7 @@ impl<S: Store + 'static> Indexer<S> {
                 })
                 .await
                 .ok();
-            return false;
+            return FetchAction::Retry;
         }
 
         tracing::warn!(tick = next, %error, "tick fetch failed, retrying");
@@ -1145,9 +1188,9 @@ impl<S: Store + 'static> Indexer<S> {
                 "previous epoch tail is unavailable, skipping range"
             );
             *consecutive_failures = 0;
-            return true;
+            return FetchAction::SkipTo(head.initial_tick);
         }
-        false
+        FetchAction::Retry
     }
 
     async fn next_tick(&self, head: &Head) -> Result<u32> {
