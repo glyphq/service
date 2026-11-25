@@ -145,7 +145,7 @@ Relevant settings:
 | `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before a partial batch is flushed |
 | `INDEXER_VERIFY_CONCURRENCY` | CPU count minus one | Concurrent signature-verification tasks |
 | `INDEXER_POLL_MS` | `750` | Head poll interval when caught up |
-| `GLYPH_VERIFY_SIGNATURES` | `true` | Verify SchnorrQ signatures in addition to quorum digests |
+| `GLYPH_VERIFY_SIGNATURES` | `false` | Verify SchnorrQ signatures in addition to quorum digests |
 
 The indexer pipelines tick data, quorum votes, and tick transactions on one
 connection, then fetches logs separately. Fetch workers lease the least-loaded
@@ -155,15 +155,13 @@ multiple ticks verify in parallel while the ordered writer only builds and
 persists rows. This keeps live ingestion ahead of the chain during normal 4-5
 tick/s operation and short bursts.
 
-Live Qubic traffic is a few ticks per second, so full verification is comfortable.
-Historical backfill is CPU-bound by signature verification. On one core this
-implementation verifies roughly 6,500 signatures per second in release mode, so a
-4 vCPU machine tops out near 58 ticks per second if every vote is checked. A live
-multi-peer run on a 12-core host measured about 32 ticks per second with signatures on
-and 110 ticks per second with signatures off at 96 fetch workers. With the default 32
-workers, signatures off reached about 42 ticks per second, which is fetch-latency bound.
-Use `--no-verify-signatures` only for a deliberate bulk catch-up of finalized ticks,
-then turn verification back on for live ingestion.
+By default the indexer does not verify SchnorrQ signatures locally. It still requires
+a distinct supermajority of computor indices to agree on one transaction digest, checks
+the tick-data digest, verifies every log digest, and resolves every non-zero transaction
+digest. Local FourQ verification costs roughly 5 ms per vote on a small host, so checking
+all ~451 votes caps catch-up near one tick per second. Pass `--verify-signatures` (or set
+`GLYPH_VERIFY_SIGNATURES=true`) when you want cryptographic evidence from the votes,
+tick data, and transactions in addition to the quorum agreement.
 
 ## Configuration
 
@@ -319,8 +317,8 @@ cargo run -p cli --bin glyph -- price --peer peer.example:21841
 # Index from the current epoch initial tick
 cargo run -p cli --bin glyph -- sync --peer peer.example:21841
 
-# Backfill without signature checks, then restart with verification on
-cargo run -p cli --bin glyph -- sync --peer peer.example:21841 --no-verify-signatures
+# Backfill with local SchnorrQ checks enabled
+cargo run -p cli --bin glyph -- sync --peer peer.example:21841 --verify-signatures
 
 # Apply the ClickHouse schema
 cargo run -p cli --bin glyph -- db-init

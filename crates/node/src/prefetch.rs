@@ -417,6 +417,7 @@ impl Peer {
                     }
                     Err(error) => {
                         self.clear_pending(&awaiting);
+                        self.desynced = true;
                         for &index in &all_ranges_ticks {
                             need_fallback[index] = true;
                             warnings[index].push(format!(
@@ -534,6 +535,7 @@ impl Peer {
                     }
                     Err(error) => {
                         self.clear_pending(&awaiting);
+                        self.desynced = true;
                         warnings[index].push(format!(
                             "peer {} could not probe log ranges: {error}",
                             self.config.addr
@@ -544,13 +546,17 @@ impl Peer {
                 }
             }
             if !send_failed {
+                // The fallback probes are pipelined, but a peer still has to
+                // process one request per slot. Scale the budget with the
+                // batch so a large catch-up batch does not lose its logs to a
+                // timeout tuned for a single tick.
                 let deadline = Instant::now()
                     + self
                         .config
                         .log_fallback_probe_timeout
-                        .saturating_mul(4)
+                        .saturating_mul((probes.len() / 16).clamp(1, 32) as u32)
                         .max(Duration::from_secs(1))
-                        .min(Duration::from_secs(10));
+                        .min(Duration::from_secs(20));
                 while !awaiting.is_empty() {
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
@@ -667,6 +673,7 @@ impl Peer {
                         page.pages += 1;
                     }
                     Err(error) => {
+                        self.desynced = true;
                         page.done = true;
                         warnings[page.tick_index].push(format!(
                             "peer {} could not request logs: {error}",
@@ -678,7 +685,13 @@ impl Peer {
             if awaiting.is_empty() {
                 break;
             }
-            let deadline = Instant::now() + self.config.timeout;
+            let active = pages.iter().filter(|page| !page.done).count().max(1);
+            let deadline = Instant::now()
+                + self
+                    .config
+                    .timeout
+                    .saturating_mul(active.min(16) as u32)
+                    .min(Duration::from_secs(20));
             while !awaiting.is_empty() {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {

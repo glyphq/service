@@ -217,7 +217,7 @@ EOF
     -e "INDEXER_WRITE_BATCH=${INDEXER_WRITE_BATCH:-128}" \
     -e "INDEXER_WRITE_FLUSH_MS=${INDEXER_WRITE_FLUSH_MS:-250}" \
     -e "INDEXER_DISCOVER_PEERS=${INDEXER_DISCOVER_PEERS:-false}" \
-    -e "GLYPH_VERIFY_SIGNATURES=${GLYPH_VERIFY_SIGNATURES:-true}" \
+    -e "GLYPH_VERIFY_SIGNATURES=${GLYPH_VERIFY_SIGNATURES:-false}" \
     "$image" indexer >/dev/null
 
   docker run -d --name glyph-api --network "$network" \

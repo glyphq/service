@@ -53,8 +53,11 @@ case "$role" in
     args+=(--poll-ms "${INDEXER_POLL_MS:-750}")
     args+=(--progress-every "${INDEXER_PROGRESS_EVERY:-100}")
 
-    case "${GLYPH_VERIFY_SIGNATURES:-true}" in
-      0 | false | no | off)
+    case "${GLYPH_VERIFY_SIGNATURES:-false}" in
+      1 | true | yes | on)
+        args+=(--verify-signatures)
+        ;;
+      *)
         args+=(--no-verify-signatures)
         ;;
     esac

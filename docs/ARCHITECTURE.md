@@ -244,7 +244,7 @@ The `indexer::Verification` enum defines three labels. The API exposes them as t
 
 | Tier | Evidence required | What it rules out |
 | --- | --- | --- |
-| `quorum` | Votes for the tick are grouped by transaction digest. The largest group must meet the threshold: 451 for a non-empty tick, 226 for an empty tick. The winning `TickData` digest must match that group unless the tick is empty. | A single peer inventing a tick, a stale peer serving an old tick as current, a partial vote set |
+| `quorum` | Votes for the tick are grouped by transaction digest. The largest group must meet the threshold: 451 for a non-empty tick, 226 for an empty tick. The winning `TickData` digest must match that group unless the tick is empty. | A stale peer serving an old tick as current, a partial or inconsistent vote set, accidental tick-data corruption. Without local signature checks it does not rule out a malicious peer fabricating the vote packets. |
 | `data` | Quorum passed, all non-zero transaction digests resolved to fetched transactions whose K12 hash matches, every log digest matches `K12_8(body)`, and the log count covers the ranges. When `verify_signatures` is true, the required vote signatures, the tick data signature, and every transaction signature also verify. | Truncated bundles, reordered transactions, corrupted log bodies, missing logs, forged signatures |
 | `state` | Reserved in the `Verification` enum. No current verifier emits it and no digest-chain continuity check runs. | Nothing yet |
 

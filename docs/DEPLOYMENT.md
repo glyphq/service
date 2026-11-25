@@ -118,7 +118,7 @@ and the stack is reachable only from the same machine.
 | `INDEXER_WRITE_BATCH` | `128` | Maximum ticks per ClickHouse insert batch. |
 | `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before an idle partial batch is flushed. |
 | `INDEXER_DISCOVER_PEERS` | `false` | Append IPv4 peers advertised through `ExchangePublicPeers`, using port `21841`. |
-| `GLYPH_VERIFY_SIGNATURES` | `true` | Set `false` to skip SchnorrQ checks. Keep enabled for live ingest. |
+| `GLYPH_VERIFY_SIGNATURES` | `false` | Set `true` to verify SchnorrQ signatures locally. Quorum agreement is always checked. |
 | `S3_ENDPOINT` | `http://seaweedfs:8333` | S3 endpoint inside the Compose network, passed to the archive client and `s3-init`. |
 | `S3_BUCKET` | `glyph-archive` | Bucket created by `s3-init` and used by the archive client. |
 | `S3_ACCESS_KEY` | `glyph` | SeaweedFS identity access key. |
@@ -426,9 +426,10 @@ checkpoint and duplicate writes, though writes are idempotent.
 - Raw archive: budget separately from ClickHouse. One epoch of `TickData` and the full
   vote set is about 213 GiB uncompressed before Zstandard. Object storage is usually the
   better target than the ClickHouse volume.
-- CPU: signature verification is CPU-bound. Keep it enabled. Use
-  `GLYPH_VERIFY_SIGNATURES=false` only for a deliberate bulk catch-up, then turn
-  it back on for live ingest.
+- CPU: local SchnorrQ verification is CPU-bound. It is off by default because
+  checking every vote caps catch-up near one tick per second on a small host.
+  Enable it only when you need cryptographic evidence in addition to quorum
+  agreement.
 - Network: one peer is a single point of failure. Supply at least two addresses
   in `QUBIC_PEERS`; the indexer fails over across configured peers.
 - Log rotation: service logs use the `json-file` driver with a 10 MB limit and

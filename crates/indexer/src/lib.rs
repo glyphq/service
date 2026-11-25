@@ -49,8 +49,10 @@ pub struct IndexerConfig {
     pub start_tick: Option<u32>,
     /// How often to poll the head when caught up.
     pub poll_interval: Duration,
-    /// Verify SchnorrQ signatures in addition to quorum digests. This is
-    /// CPU-heavy for backfills but should be enabled for live ingestion.
+    /// Verify SchnorrQ signatures in addition to quorum digests. Off by
+    /// default: per-vote FourQ verification caps catch-up at roughly one tick
+    /// per second on a small host. The quorum check still requires a distinct
+    /// supermajority of computor indices to agree on one transaction digest.
     pub verify_signatures: bool,
     /// Log progress every N ticks.
     pub progress_every: u64,
@@ -66,7 +68,7 @@ impl Default for IndexerConfig {
             peers: Vec::new(),
             start_tick: None,
             poll_interval: Duration::from_millis(750),
-            verify_signatures: true,
+            verify_signatures: false,
             progress_every: 100,
             archive: None,
             archive_fail_closed: false,

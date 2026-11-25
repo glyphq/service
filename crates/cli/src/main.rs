@@ -36,7 +36,11 @@ enum Command {
         tick: u32,
         #[arg(long, default_value = "157.180.10.49:21841")]
         peer: SocketAddr,
-        /// Skip SchnorrQ signature checks (faster, but only quorum-tier evidence).
+        /// Verify SchnorrQ signatures locally (slower).
+        #[arg(long)]
+        verify_signatures: bool,
+        /// Skip SchnorrQ signature checks. Kept for compatibility; this is
+        /// already the default.
         #[arg(long)]
         no_verify_signatures: bool,
     },
@@ -61,7 +65,11 @@ enum Command {
         /// How often to poll the head once caught up.
         #[arg(long, default_value_t = 750)]
         poll_ms: u64,
-        /// Skip SchnorrQ signature checks (faster, but weaker verification).
+        /// Verify SchnorrQ signatures locally (slower).
+        #[arg(long)]
+        verify_signatures: bool,
+        /// Skip SchnorrQ signature checks. Kept for compatibility; this is
+        /// already the default.
         #[arg(long)]
         no_verify_signatures: bool,
         /// Log progress every N indexed ticks.
@@ -130,12 +138,14 @@ async fn main() -> anyhow::Result<()> {
         Command::Tick {
             tick,
             peer,
+            verify_signatures,
             no_verify_signatures,
         } => {
             let pool = NodePool::new(vec![PeerConfig::new(peer)]);
             let mut connection = pool.connect_best().await?;
             let bundle = connection.bundle(tick).await?;
-            let verified = indexer::verify_bundle(bundle, !no_verify_signatures)
+            let verify = verify_signatures && !no_verify_signatures;
+            let verified = indexer::verify_bundle(bundle, verify)
                 .with_context(|| format!("verify tick {tick}"))?;
             let transactions = verified
                 .transactions
@@ -218,6 +228,7 @@ async fn main() -> anyhow::Result<()> {
             peers,
             from,
             poll_ms,
+            verify_signatures,
             no_verify_signatures,
             progress_every,
         } => {
@@ -227,11 +238,12 @@ async fn main() -> anyhow::Result<()> {
             if peers.len() > 64 {
                 bail!("at most 64 peers may be configured");
             }
+            let verify = verify_signatures && !no_verify_signatures;
             let config = IndexerConfig {
                 peers: peers.iter().copied().map(PeerConfig::new).collect(),
                 start_tick: from,
                 poll_interval: std::time::Duration::from_millis(poll_ms),
-                verify_signatures: !no_verify_signatures,
+                verify_signatures: verify,
                 progress_every: progress_every.max(1),
                 archive: archive_from_env()?,
                 archive_fail_closed: std::env::var("ARCHIVE_FAIL_CLOSED")
@@ -251,10 +263,10 @@ async fn main() -> anyhow::Result<()> {
                 signal.cancel();
             });
 
-            let verify = if no_verify_signatures {
-                "signatures off"
-            } else {
+            let verify = if verify {
                 "signatures on"
+            } else {
+                "signatures off"
             };
             println!(
                 "indexer started: {} peer(s), from {}, poll {}ms, {verify}, db {db}",
@@ -351,6 +363,7 @@ mod tests {
                 peers,
                 from,
                 poll_ms,
+                verify_signatures,
                 no_verify_signatures,
                 progress_every,
             } => {
@@ -363,6 +376,7 @@ mod tests {
                 );
                 assert_eq!(from, Some(12345));
                 assert_eq!(poll_ms, 250);
+                assert!(!verify_signatures);
                 assert!(no_verify_signatures);
                 assert_eq!(progress_every, 100);
             }
@@ -371,19 +385,21 @@ mod tests {
     }
 
     #[test]
-    fn sync_defaults_use_seed_peer_and_verify_signatures() {
+    fn sync_defaults_use_seed_peer_and_skip_signatures() {
         let cli = Cli::try_parse_from(["glyph", "sync"]).unwrap();
         match cli.command {
             Command::Sync {
                 peers,
                 from,
                 poll_ms,
+                verify_signatures,
                 no_verify_signatures,
                 progress_every,
             } => {
                 assert_eq!(peers, vec!["157.180.10.49:21841".parse().unwrap()]);
                 assert_eq!(from, None);
                 assert_eq!(poll_ms, 750);
+                assert!(!verify_signatures);
                 assert!(!no_verify_signatures);
                 assert_eq!(progress_every, 100);
             }
@@ -392,15 +408,17 @@ mod tests {
     }
 
     #[test]
-    fn tick_verifies_signatures_by_default() {
+    fn tick_skips_signatures_by_default() {
         let cli = Cli::try_parse_from(["glyph", "tick", "42"]).unwrap();
         match cli.command {
             Command::Tick {
                 tick,
+                verify_signatures,
                 no_verify_signatures,
                 ..
             } => {
                 assert_eq!(tick, 42);
+                assert!(!verify_signatures);
                 assert!(!no_verify_signatures);
             }
             _ => panic!("expected tick command"),
