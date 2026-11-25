@@ -146,6 +146,7 @@ Relevant settings:
 | `INDEXER_VERIFY_CONCURRENCY` | CPU count minus one | Concurrent signature-verification tasks |
 | `INDEXER_POLL_MS` | `750` | Head poll interval when caught up |
 | `INDEXER_MAX_TICK_ATTEMPTS` | `4` | Skip a tick when every peer reports that its tick data does not exist |
+| `QUBIC_ARCHIVE_URL` | `https://rpc.qubic.org/query/v1` | Qubic Query API used when peers no longer serve a tick's data |
 | `GLYPH_VERIFY_SIGNATURES` | `false` | Verify SchnorrQ signatures in addition to quorum digests |
 
 The indexer pipelines tick data, quorum votes, and tick transactions on one
@@ -164,10 +165,14 @@ all ~451 votes caps catch-up near one tick per second. Pass `--verify-signatures
 `GLYPH_VERIFY_SIGNATURES=true`) when you want cryptographic evidence from the votes,
 tick data, and transactions in addition to the quorum agreement.
 
-Some finalized ticks are absent from every peer's tick-data storage. After
-`INDEXER_MAX_TICK_ATTEMPTS` attempts the indexer logs the tick, skips it, and keeps
-the pipeline moving instead of blocking catch-up forever. Transient failures such as
-timeouts and not-synchronized peers keep retrying.
+Some finalized ticks are absent from every peer's tick-data storage even though their
+votes and transactions remain. The indexer recovers those ticks from the Qubic Query
+API configured by `QUBIC_ARCHIVE_URL` and checks the reconstructed tick-data digest
+against the quorum vote digest. Truly empty ticks are synthesized from their empty
+quorum votes without a network round trip. If both paths fail and the tick is still
+unavailable after `INDEXER_MAX_TICK_ATTEMPTS`, the indexer logs and skips it so the
+pipeline keeps moving. Transient failures such as timeouts and not-synchronized peers
+keep retrying.
 
 ## Configuration
 

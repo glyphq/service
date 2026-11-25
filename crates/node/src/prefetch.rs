@@ -150,15 +150,83 @@ impl Peer {
         }
         drained?;
 
-        let mut decoded = (0..ticks.len()).map(|_| None).collect::<Vec<_>>();
+        let mut parts = (0..ticks.len()).map(|_| None).collect::<Vec<_>>();
         let mut results = (0..ticks.len()).map(|_| None).collect::<Vec<_>>();
+        let mut missing = Vec::new();
         for (index, mut state) in states.into_iter().enumerate() {
             match state.error.take() {
                 Some(error) => results[index] = Some(Err(error)),
-                None => match decode_main_state(state) {
-                    Ok(tick) => decoded[index] = Some(tick),
+                None => match decode_main_parts(state) {
+                    Ok(mut part) => {
+                        if part.tick_data.is_none() {
+                            if part.votes.iter().any(|vote| !vote.is_empty_vote())
+                                || part.votes.is_empty()
+                            {
+                                missing.push((index, part.tick));
+                            } else {
+                                part.tick_data = empty_tick_from_votes(&part.votes, part.tick).ok();
+                            }
+                        }
+                        if part.tick_data.is_some() {
+                            parts[index] = Some(part);
+                        } else {
+                            results[index] =
+                                Some(Err(Error::EndResponse(MessageType::RequestTickData)));
+                        }
+                    }
                     Err(error) => results[index] = Some(Err(error)),
                 },
+            }
+        }
+
+        if !missing.is_empty() {
+            if let Some(archive) = self.archive.clone() {
+                let mut tasks = tokio::task::JoinSet::new();
+                for (index, tick) in missing {
+                    let archive = archive.clone();
+                    tasks.spawn(async move { (index, tick, archive.tick_data(tick).await) });
+                }
+                while let Some(joined) = tasks.join_next().await {
+                    match joined {
+                        Ok((index, _tick, Ok(tick_data))) => {
+                            if let Some(part) = parts[index].as_mut() {
+                                part.tick_data = Some(tick_data);
+                            }
+                        }
+                        Ok((index, tick, Err(error))) => {
+                            tracing::warn!(
+                                tick,
+                                %error,
+                                "public archive could not supply missing tick data"
+                            );
+                            let fallback = parts[index]
+                                .as_ref()
+                                .and_then(|part| empty_tick_from_votes(&part.votes, tick).ok());
+                            if let Some(fallback) = fallback {
+                                if let Some(part) = parts[index].as_mut() {
+                                    part.tick_data = Some(fallback);
+                                }
+                            } else {
+                                results[index] =
+                                    Some(Err(Error::EndResponse(MessageType::RequestTickData)));
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "archive tick-data task failed");
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut decoded = (0..ticks.len()).map(|_| None).collect::<Vec<_>>();
+        for (index, part) in parts.into_iter().enumerate() {
+            let Some(part) = part else {
+                continue;
+            };
+            match finish_decoded(part) {
+                Ok(tick) => decoded[index] = Some(tick),
+                Err(error) => results[index] = Some(Err(error)),
             }
         }
 
@@ -814,29 +882,73 @@ fn fail_tick(
     }
 }
 
-fn decode_main_state(mut state: MainState) -> Result<DecodedTick> {
+struct MainParts {
+    tick: u32,
+    votes: Vec<Tick>,
+    transactions: Vec<Transaction>,
+    tick_data: Option<TickData>,
+}
+
+fn decode_main_parts(mut state: MainState) -> Result<MainParts> {
     let votes = decode_votes(std::mem::take(&mut state.votes), state.tick)?;
     let transactions = decode_transactions(std::mem::take(&mut state.transactions), state.tick)?;
-    let tick_data = match state.tick_data {
-        Some(packet) => TickData::decode(&packet.payload)?,
-        None => {
-            let Some(vote) = votes.iter().find(|vote| vote.is_empty_vote()) else {
-                return Err(Error::EndResponse(MessageType::RequestTickData));
-            };
-            empty_tick_data(vote)
-        }
-    };
-    if tick_data.tick != state.tick {
-        return Err(Error::Verification(format!(
-            "tick data is for tick {}, requested {}",
-            tick_data.tick, state.tick
-        )));
-    }
-    Ok(DecodedTick {
+    let tick_data = state
+        .tick_data
+        .map(|packet| TickData::decode(&packet.payload))
+        .transpose()?;
+    Ok(MainParts {
         tick: state.tick,
-        tick_data,
         votes,
         transactions,
+        tick_data,
+    })
+}
+
+fn finish_decoded(part: MainParts) -> Result<DecodedTick> {
+    let tick_data = match part.tick_data {
+        Some(tick_data) => tick_data,
+        None => empty_tick_from_votes(&part.votes, part.tick)?,
+    };
+    if tick_data.tick != part.tick {
+        return Err(Error::Verification(format!(
+            "tick data is for tick {}, requested {}",
+            tick_data.tick, part.tick
+        )));
+    }
+    first_vote_or_synthetic(&part.votes, &tick_data, part.tick)?;
+    Ok(DecodedTick {
+        tick: part.tick,
+        tick_data,
+        votes: part.votes,
+        transactions: part.transactions,
         warnings: Vec::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "connects to a live Qubic peer and the public archive"]
+    async fn prefetch_recovers_missing_tick_data_from_archive() {
+        let config = PeerConfig::new("198.27.75.81:21841".parse::<SocketAddr>().unwrap())
+            .with_archive_url("https://rpc.qubic.org/query/v1");
+        let mut peer = Peer::connect(config).await.expect("peer");
+        let head = peer.head().await.expect("head");
+        let computors = peer.computors().await.expect("computors");
+        let bundles = peer
+            .prefetch_bundles(&[92_261_883], head, computors)
+            .await
+            .expect("prefetch");
+        let bundle = bundles
+            .into_iter()
+            .next()
+            .expect("one bundle")
+            .expect("tick");
+        assert_eq!(bundle.tick_data.tick, 92_261_883);
+        assert!(bundle.tick_data.non_empty_transactions().count() > 0);
+    }
 }

@@ -118,6 +118,7 @@ and the stack is reachable only from the same machine.
 | `INDEXER_WRITE_BATCH` | `128` | Maximum ticks per ClickHouse insert batch. |
 | `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before an idle partial batch is flushed. |
 | `INDEXER_DISCOVER_PEERS` | `false` | Append IPv4 peers advertised through `ExchangePublicPeers`, using port `21841`. |
+| `QUBIC_ARCHIVE_URL` | `https://rpc.qubic.org/query/v1` | Qubic Query API used to recover tick data that peers no longer serve. |
 | `INDEXER_MAX_TICK_ATTEMPTS` | `4` | Skip a tick after this many attempts when every peer reports its tick data does not exist. Transient errors keep retrying. |
 | `GLYPH_VERIFY_SIGNATURES` | `false` | Set `true` to verify SchnorrQ signatures locally. Quorum agreement is always checked. |
 | `S3_ENDPOINT` | `http://seaweedfs:8333` | S3 endpoint inside the Compose network, passed to the archive client and `s3-init`. |

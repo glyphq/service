@@ -167,6 +167,9 @@ Ingestion is a bounded prefetch pipeline, not a serial tick loop.
    non-zero transaction digest must resolve to a transaction whose K12 hash matches.
    Every log digest must match `K12_8(body)`. When `verify_signatures` is enabled, vote,
    tick data, and transaction signatures are also checked.
+   Peers sometimes prune a finalized tick's `TickData` while keeping its votes and
+   transactions. Those ticks are reconstructed from the Qubic Query API
+   (`QUBIC_ARCHIVE_URL`) and still have to pass the same digest and quorum checks.
 7. If raw archiving is configured, encode the verified tick's header, tick data,
    transactions, log ranges, and logs into a zstd-compressed QBB1 bundle and write it
    before the ClickHouse write. Full vote headers are written only when

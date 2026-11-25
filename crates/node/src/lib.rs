@@ -26,8 +26,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
+mod archive;
 pub mod health;
 mod prefetch;
+use archive::ArchiveClient;
 
 /// Capability is a property of the peer, not of one TCP connection. Fetch
 /// workers open short-lived connections, so cache the answer per address to
@@ -94,6 +96,8 @@ pub enum Error {
     Verification(String),
     #[error("log data unavailable: {0}")]
     LogsUnavailable(String),
+    #[error("archive: {0}")]
+    Archive(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 }
@@ -115,6 +119,8 @@ pub struct PeerConfig {
     pub log_range_timeout: Duration,
     /// Per-probe timeout for the per-transaction log fallback.
     pub log_fallback_probe_timeout: Duration,
+    /// Qubic Query API base URL used when a peer cannot serve tick data.
+    pub archive_url: Option<String>,
 }
 
 impl PeerConfig {
@@ -128,6 +134,9 @@ impl PeerConfig {
             retries: DEFAULT_RETRIES,
             log_range_timeout: DEFAULT_LOG_RANGE_TIMEOUT,
             log_fallback_probe_timeout: DEFAULT_LOG_FALLBACK_PROBE_TIMEOUT,
+            archive_url: std::env::var("QUBIC_ARCHIVE_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
         }
     }
 
@@ -158,6 +167,11 @@ impl PeerConfig {
 
     pub fn with_log_fallback_probe_timeout(mut self, timeout: Duration) -> Self {
         self.log_fallback_probe_timeout = timeout;
+        self
+    }
+
+    pub fn with_archive_url(mut self, url: impl Into<String>) -> Self {
+        self.archive_url = Some(url.into());
         self
     }
 }
@@ -354,9 +368,25 @@ pub struct Peer {
     /// Latest head this connection reported. Used to reject backwards ticks
     /// and cached heads from before an epoch rollover.
     observed_head: Option<Head>,
+    /// Optional Qubic Query API fallback for tick data peers no longer serve.
+    archive: Option<ArchiveClient>,
 }
 
 impl Peer {
+    async fn archive_tick_data(&self, tick: u32) -> Option<TickData> {
+        let archive = self.archive.as_ref()?;
+        match archive.tick_data(tick).await {
+            Ok(tick_data) => {
+                tracing::info!(tick, "recovered tick data from the public archive");
+                Some(tick_data)
+            }
+            Err(error) => {
+                tracing::warn!(tick, %error, "public archive tick data unavailable");
+                None
+            }
+        }
+    }
+
     /// Connects to a peer and completes the exchange-public-peers handshake.
     pub async fn connect(config: PeerConfig) -> Result<Self> {
         let stream = Self::open(&config).await?;
@@ -365,6 +395,11 @@ impl Peer {
             .lock()
             .ok()
             .and_then(|cache| cache.get(&config.addr).copied());
+        let archive = config
+            .archive_url
+            .as_ref()
+            .map(|url| ArchiveClient::new(url.clone()))
+            .transpose()?;
         let mut peer = Self {
             config,
             reader: BufReader::new(reader),
@@ -375,6 +410,7 @@ impl Peer {
             desynced: false,
             log_ranges_supported,
             observed_head: None,
+            archive,
         };
         peer.handshake().await?;
         Ok(peer)
@@ -1325,10 +1361,15 @@ impl Peer {
             Some(packet) => TickData::decode(&packet.payload)?,
             None => {
                 tracing::debug!(tick, "tick data absent; checking for an empty tick");
-                let Some(vote) = votes.iter().find(|vote| vote.is_empty_vote()) else {
-                    return Err(Error::EndResponse(MessageType::RequestTickData));
-                };
-                empty_tick_data(vote)
+                if votes.iter().any(|vote| !vote.is_empty_vote()) || votes.is_empty() {
+                    if let Some(tick_data) = self.archive_tick_data(tick).await {
+                        tick_data
+                    } else {
+                        empty_tick_from_votes(&votes, tick)?
+                    }
+                } else {
+                    empty_tick_from_votes(&votes, tick)?
+                }
             }
         };
         if tick_data.tick != tick {
@@ -2597,6 +2638,22 @@ fn empty_tick_data(vote: &Tick) -> TickData {
         contract_fees: vec![0; MAX_CONTRACTS],
         signature: [0; 64],
     }
+}
+
+/// Synthesize an empty tick from any empty vote, or fail when the peer gave no
+/// empty vote at all.
+fn empty_tick_from_votes(votes: &[Tick], tick: u32) -> Result<TickData> {
+    let Some(vote) = votes.iter().find(|vote| vote.is_empty_vote()) else {
+        return Err(Error::EndResponse(MessageType::RequestTickData));
+    };
+    let data = empty_tick_data(vote);
+    if data.tick != tick {
+        return Err(Error::Verification(format!(
+            "empty vote is for tick {}, requested {tick}",
+            data.tick
+        )));
+    }
+    Ok(data)
 }
 
 #[cfg(test)]
