@@ -2737,12 +2737,12 @@ impl NodePool {
                 .iter()
                 .map(|index| tick_data[*index].clone())
                 .collect::<Vec<_>>();
-            let fetched = tokio::time::timeout(Duration::from_secs(30), async {
+            let fetched = tokio::time::timeout(Duration::from_secs(8), async {
                 let mut peer = Peer::connect(config).await?;
                 peer.complete_logs_batch(&subset).await
             })
             .await
-            .unwrap_or_else(|_| Err(Error::Timeout(Duration::from_secs(30))));
+            .unwrap_or_else(|_| Err(Error::Timeout(Duration::from_secs(8))));
             let fetched = match fetched {
                 Ok(fetched) if fetched.len() == subset.len() => fetched,
                 Ok(_) => {
