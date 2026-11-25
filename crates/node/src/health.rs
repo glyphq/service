@@ -82,6 +82,7 @@ struct PeerState {
     consecutive_failures: u32,
     ewma_ms: Option<f64>,
     fetch_ms_per_tick: Option<f64>,
+    log_failures: u32,
     last_latency: Option<Duration>,
     last_attempt: Option<tokio::time::Instant>,
     quarantined_until: Option<tokio::time::Instant>,
@@ -187,6 +188,21 @@ impl PeerManager {
         entry.last_attempt = Some(now);
     }
 
+    /// Penalizes a peer that cannot supply complete log data. The main tick
+    /// streams stay usable, but workers should prefer peers that can finish a
+    /// bundle without a per-tick retry.
+    pub fn record_log_failure(&self, addr: SocketAddr) {
+        let mut state = self.state.lock().expect("peer health mutex poisoned");
+        let entry = state.entry(addr).or_default();
+        entry.log_failures = entry.log_failures.saturating_add(1);
+    }
+
+    pub fn record_log_success(&self, addr: SocketAddr) {
+        let mut state = self.state.lock().expect("peer health mutex poisoned");
+        let entry = state.entry(addr).or_default();
+        entry.log_failures = 0;
+    }
+
     /// Whether `addr` is currently skipped. Expired quarantines are cleared.
     pub fn is_quarantined(&self, addr: SocketAddr) -> bool {
         let now = tokio::time::Instant::now();
@@ -290,7 +306,8 @@ impl PeerManager {
         let fraction = (age.as_secs_f64() / window).min(1.0);
         let bonus = self.policy.exploration_bonus.as_secs_f64() * 1_000.0 * fraction;
         let fetch = entry.fetch_ms_per_tick.unwrap_or(0.0);
-        (latency + fetch + penalty - bonus).max(0.0)
+        let log_penalty = f64::from(entry.log_failures) * 60_000.0;
+        (latency + fetch + penalty + log_penalty - bonus).max(0.0)
     }
 }
 

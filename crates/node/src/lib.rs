@@ -2236,6 +2236,14 @@ impl NodePool {
         self.manager.report(&self.peers)
     }
 
+    pub fn record_log_failure(&self, addr: SocketAddr) {
+        self.manager.record_log_failure(addr);
+    }
+
+    pub fn record_log_success(&self, addr: SocketAddr) {
+        self.manager.record_log_success(addr);
+    }
+
     /// Adds peers advertised by one reachable peer, up to
     /// [`DEFAULT_DISCOVERY_LIMIT`] total. Discovery is opt-in; API request
     /// paths must not call this.
@@ -2748,6 +2756,78 @@ impl NodePool {
             return Err(last_error.unwrap_or(Error::NoPeers));
         }
         Ok(best)
+    }
+
+    /// Fetches one tick's logs from every configured peer and returns the
+    /// largest complete set. Batch responses can lose log pages for a tick
+    /// even when another peer still has them.
+    pub async fn logs(&self, tick_data: &TickData) -> Result<(LogRanges, Vec<LogEvent>)> {
+        let mut candidates = self.manager.attempt_order(&self.peers);
+        for config in &self.peers {
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.addr == config.addr)
+            {
+                candidates.push(config.clone());
+            }
+        }
+        if candidates.is_empty() {
+            return Err(Error::NoPeers);
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for config in candidates {
+            let tick_data = tick_data.clone();
+            tasks.spawn(async move {
+                let addr = config.addr;
+                let mut peer = match Peer::connect(config).await {
+                    Ok(peer) => peer,
+                    Err(error) => return Err((error, addr)),
+                };
+                match peer.complete_logs(&tick_data).await {
+                    Ok((ranges, logs, known, _warnings)) => Ok((ranges, logs, known, addr)),
+                    Err(error) => Err((error, addr)),
+                }
+            });
+        }
+        let mut best: Option<(LogRanges, Vec<LogEvent>)> = None;
+        let mut best_count = -1i64;
+        let mut last_error = None;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok((ranges, logs, known, addr))) => {
+                    if !ranges.is_pending()
+                        && (known || ranges.count() == 0)
+                        && prefetch::logs_cover_ranges(&ranges, &logs)
+                    {
+                        self.manager.record_log_success(addr);
+                        if ranges.count() > 0 {
+                            tasks.abort_all();
+                            return Ok((ranges, logs));
+                        }
+                        if ranges.count() > best_count {
+                            best_count = ranges.count();
+                            best = Some((ranges, logs));
+                        }
+                    }
+                }
+                Ok(Err((error, addr))) => {
+                    if matches!(
+                        error,
+                        Error::Io(_)
+                            | Error::Wire(_)
+                            | Error::Timeout(_)
+                            | Error::RetriesExhausted { .. }
+                            | Error::TryAgain(_)
+                            | Error::UnexpectedPacket { .. }
+                    ) {
+                        self.manager.record_failure(addr);
+                    }
+                    last_error = Some(error);
+                }
+                Err(_) => last_error = Some(Error::NoPeers),
+            }
+        }
+        best.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
     }
 }
 
@@ -4262,34 +4342,61 @@ mod tests {
             .ok()
             .and_then(|tick| tick.parse().ok())
             .unwrap_or(92_264_150u32);
-        let mut peer = live_peer().await;
+        let mut configs = vec![PeerConfig::new(live_addr()).with_timeout(Duration::from_secs(10))];
+        if let Ok(fallback) = std::env::var("GLYPH_LIVE_FALLBACK_PEER") {
+            configs.push(
+                PeerConfig::new(
+                    fallback
+                        .parse()
+                        .expect("GLYPH_LIVE_FALLBACK_PEER must be host:port"),
+                )
+                .with_timeout(Duration::from_secs(10)),
+            );
+        }
+        let pool = NodePool::new(configs);
+        let mut peer =
+            Peer::connect(PeerConfig::new(live_addr()).with_timeout(Duration::from_secs(10)))
+                .await
+                .expect("live connect");
         let head = peer.head().await.expect("live head");
         let computors = peer.computors().await.expect("live computors");
         let mut bundles = peer
-            .prefetch_bundles(&[tick_number], head, computors, None)
+            .prefetch_bundles(&[tick_number], head, computors, Some(&pool))
             .await
             .expect("live prefetch");
         let bundle = bundles.pop().expect("one bundle").expect("prefetch result");
-        let expected = bundle.tick_data.non_empty_transactions().count();
+        let expected = bundle
+            .tick_data
+            .non_empty_transactions()
+            .map(|(_, digest)| *digest)
+            .collect::<std::collections::HashSet<_>>();
         let fetched = bundle
             .transactions
             .iter()
             .map(Transaction::hash)
-            .collect::<std::collections::HashSet<_>>()
-            .len();
+            .collect::<std::collections::HashSet<_>>();
+        let missing = expected.difference(&fetched).count();
         eprintln!(
-            "live prefetch raw tick {tick_number}: transactions={} unique={fetched} \
-             expected={expected} logs={} ranges={} complete={} warnings={:?}",
+            "live prefetch raw tick {tick_number}: transactions={} unique={} \
+             expected={} missing={missing} logs={} ranges={} complete={} warnings={:?}",
             bundle.transactions.len(),
+            fetched.len(),
+            expected.len(),
             bundle.logs.len(),
             bundle.log_ranges.count(),
             bundle.logs_complete,
             bundle.warnings
         );
-        assert_eq!(fetched, expected, "prefetch transaction completeness");
+        eprintln!(
+            "live prefetch log-range capability: {:?}",
+            peer.log_ranges_supported
+        );
+        assert_eq!(missing, 0, "prefetch transaction completeness");
         assert!(bundle.logs_complete, "prefetch log completeness");
         eprintln!(
-            "live prefetch tick {tick_number}: transactions={fetched}/{expected} logs={} warnings={:?}",
+            "live prefetch tick {tick_number}: transactions={}/{} logs={} warnings={:?}",
+            fetched.len(),
+            expected.len(),
             bundle.logs.len(),
             bundle.warnings
         );

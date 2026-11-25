@@ -341,6 +341,37 @@ impl Peer {
                 log_warnings[index].extend(retry_warnings[0].clone());
             }
         }
+        let still_incomplete = (0..decoded.len())
+            .filter(|index| {
+                decoded[*index].is_some()
+                    && !(known[*index]
+                        && !log_ranges[*index].is_pending()
+                        && (logs[*index].len() as i64) >= log_ranges[*index].count())
+            })
+            .collect::<Vec<_>>();
+        if !still_incomplete.is_empty() {
+            if let Some(pool) = fallback.as_ref() {
+                for index in still_incomplete {
+                    let Some(tick) = decoded[index].as_ref() else {
+                        continue;
+                    };
+                    match pool.logs(&tick.tick_data).await {
+                        Ok((ranges, tick_logs)) => {
+                            log_ranges[index] = ranges;
+                            logs[index] = tick_logs;
+                            known[index] = true;
+                            log_warnings[index].clear();
+                        }
+                        Err(error) => {
+                            log_warnings[index].push(format!(
+                                "no peer supplied complete logs for tick {}: {error}",
+                                tick.tick
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         let mut log_ranges = log_ranges.into_iter();
         let mut logs = logs.into_iter();
         let mut known = known.into_iter();
@@ -886,11 +917,7 @@ impl Peer {
         }
         if self.log_ranges_supported == Some(false) {
             for index in 0..count {
-                if decoded[index]
-                    .as_ref()
-                    .is_some_and(|tick| tick.tick_data.non_empty_transactions().next().is_some())
-                    && ranges[index].count() == 0
-                {
+                if decoded[index].is_some() && ranges[index].count() == 0 {
                     known[index] = false;
                     warnings[index].push(format!(
                         "log data unavailable from peer {} for tick {}: \
@@ -1060,6 +1087,30 @@ impl Peer {
         (ranges, logs, known, warnings)
     }
 
+    /// Fetches one tick's log ranges and records on a fresh connection.
+    /// Used by [`NodePool::logs`] when a batch peer cannot supply complete
+    /// logs.
+    pub async fn complete_logs(
+        &mut self,
+        tick_data: &TickData,
+    ) -> Result<(LogRanges, Vec<LogEvent>, bool, Vec<String>)> {
+        let tick = DecodedTick {
+            tick: tick_data.tick,
+            tick_data: tick_data.clone(),
+            votes: Vec::new(),
+            transactions: Vec::new(),
+            warnings: Vec::new(),
+        };
+        let (mut ranges, mut logs, mut known, mut warnings) =
+            self.prefetch_logs(&[Some(tick)]).await;
+        Ok((
+            ranges.pop().expect("one log range entry"),
+            logs.pop().expect("one log entry"),
+            known.pop().expect("one known entry"),
+            warnings.pop().expect("one warning entry"),
+        ))
+    }
+
     fn prefetch_timeout(&self, ticks: usize) -> Duration {
         self.config
             .timeout
@@ -1072,6 +1123,28 @@ impl Peer {
             self.pending.remove(dejavu);
         }
     }
+}
+
+/// True when the fetched records exactly match the declared ranges and every
+/// record belongs to one of them.
+pub(crate) fn logs_cover_ranges(ranges: &LogRanges, logs: &[LogEvent]) -> bool {
+    if logs.len() as i64 != ranges.count() {
+        return false;
+    }
+    let mut declared = ranges
+        .from_log_id
+        .iter()
+        .zip(ranges.length.iter())
+        .filter(|(from, length)| **from >= 0 && **length > 0)
+        .map(|(from, length)| (*from, from.saturating_add(*length)))
+        .collect::<Vec<_>>();
+    declared.sort_unstable();
+    logs.iter().all(|event| {
+        let id = event.log_id as i64;
+        declared
+            .iter()
+            .any(|(start, end)| id >= *start && id < *end)
+    })
 }
 
 struct PageState {

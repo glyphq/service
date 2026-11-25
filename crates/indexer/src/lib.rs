@@ -2410,11 +2410,19 @@ async fn fetch_worker(
             if let Some(connection) = peer.as_ref() {
                 pool.record_fetch(connection.addr(), run.ticks.len(), fetch_started.elapsed());
             }
+            let peer_addr = peer.as_ref().map(|peer| peer.addr());
 
             for (offset, bundle) in fetched.into_iter().enumerate() {
                 let position = run.positions[offset];
                 let outcome = match bundle {
                     Ok(bundle) => {
+                        if let Some(addr) = peer_addr {
+                            if bundle.logs_complete
+                                && bundle.tick_data.non_empty_transactions().next().is_some()
+                            {
+                                pool.record_log_success(addr);
+                            }
+                        }
                         match verify_fetched(bundle, verify_signatures, &verify_semaphore, &cancel)
                             .await
                         {
@@ -2429,6 +2437,13 @@ async fn fetch_worker(
                         Err(Error::Node(error))
                     }
                 };
+                if let Err(Error::IncompleteTick { detail, .. }) = &outcome {
+                    if detail.contains("log") {
+                        if let Some(addr) = peer_addr {
+                            pool.record_log_failure(addr);
+                        }
+                    }
+                }
                 if matches!(outcome, Err(Error::IncompleteTick { .. })) {
                     peer_failed = true;
                 }
