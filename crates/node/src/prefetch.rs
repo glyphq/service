@@ -164,6 +164,8 @@ impl Peer {
                                 || part.votes.is_empty()
                             {
                                 missing.push((index, part.tick));
+                                parts[index] = Some(part);
+                                continue;
                             } else {
                                 part.tick_data = empty_tick_from_votes(&part.votes, part.tick).ok();
                             }
