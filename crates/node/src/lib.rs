@@ -102,6 +102,8 @@ pub enum Error {
     ArchiveNotAvailable(String),
     #[error("archive has not processed the tick yet: {0}")]
     ArchiveNotReady(String),
+    #[error("tick {tick} has non-empty votes but no tick data")]
+    MissingNonEmptyTick { tick: u32 },
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 }
@@ -1371,6 +1373,8 @@ impl Peer {
                 if votes.iter().any(|vote| !vote.is_empty_vote()) || votes.is_empty() {
                     if let Some(tick_data) = self.archive_tick_data(tick).await? {
                         tick_data
+                    } else if votes.iter().any(|vote| !vote.is_empty_vote()) {
+                        return Err(Error::MissingNonEmptyTick { tick });
                     } else {
                         empty_tick_from_votes(&votes, tick)?
                     }
@@ -2243,33 +2247,58 @@ impl NodePool {
         Ok(addresses)
     }
 
-    /// Queries peers in score order until one reports its head.
+    /// Queries every peer and returns the most advanced head. A lagging peer
+    /// must not make the network look caught up.
     pub async fn head(&self) -> Result<Head> {
-        let candidates = self.manager.attempt_order(&self.peers);
+        let mut candidates = self.manager.attempt_order(&self.peers);
+        for config in &self.peers {
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.addr == config.addr)
+            {
+                candidates.push(config.clone());
+            }
+        }
         if candidates.is_empty() {
             return Err(Error::NoPeers);
         }
-        let mut last_error = None;
+        let mut tasks = tokio::task::JoinSet::new();
         for config in candidates {
-            let started = std::time::Instant::now();
-            match Peer::connect(config.clone()).await {
-                Ok(mut peer) => {
-                    self.manager.record_success(config.addr, started.elapsed());
-                    match peer.head().await {
-                        Ok(head) => return Ok(head),
-                        Err(error) => {
-                            self.manager.record_failure(config.addr);
-                            last_error = Some(error);
-                        }
+            tasks.spawn(async move {
+                let started = std::time::Instant::now();
+                let addr = config.addr;
+                let mut peer = match Peer::connect(config).await {
+                    Ok(peer) => peer,
+                    Err(error) => return Err((error, addr)),
+                };
+                match peer.head().await {
+                    Ok(head) => Ok((head, addr, started.elapsed())),
+                    Err(error) => Err((error, addr)),
+                }
+            });
+        }
+        let mut best: Option<Head> = None;
+        let mut last_error = None;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok((head, addr, latency))) => {
+                    self.manager.record_success(addr, latency);
+                    let newer = best.as_ref().is_none_or(|best| {
+                        head.epoch > best.epoch
+                            || (head.epoch == best.epoch && head.tick > best.tick)
+                    });
+                    if newer {
+                        best = Some(head);
                     }
                 }
-                Err(error) => {
-                    self.manager.record_failure(config.addr);
+                Ok(Err((error, addr))) => {
+                    self.manager.record_failure(addr);
                     last_error = Some(error);
                 }
+                Err(_) => last_error = Some(Error::NoPeers),
             }
         }
-        Err(last_error.unwrap_or(Error::NoPeers))
+        best.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
     }
 
     /// Requests system info from the best currently reachable peer.
@@ -2282,17 +2311,100 @@ impl NodePool {
         self.connect_best().await?.revenue_data().await
     }
 
-    /// Looks up a spectrum entity on the best currently reachable peer.
+    /// Looks up a spectrum entity on every reachable peer and returns the
+    /// response with the highest observed tick. A lagging peer must not win
+    /// just because its handshake was faster.
     pub async fn entity(&self, public_key: [u8; 32]) -> Result<RespondEntity> {
-        self.connect_best().await?.entity(public_key).await
+        let mut candidates = self.manager.attempt_order(&self.peers);
+        for config in &self.peers {
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.addr == config.addr)
+            {
+                candidates.push(config.clone());
+            }
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for config in candidates {
+            tasks.spawn(async move {
+                let started = std::time::Instant::now();
+                let addr = config.addr;
+                let mut peer = match Peer::connect(config).await {
+                    Ok(peer) => peer,
+                    Err(error) => return Err((error, addr)),
+                };
+                match peer.entity(public_key).await {
+                    Ok(entity) => Ok((entity, addr, started.elapsed())),
+                    Err(error) => Err((error, addr)),
+                }
+            });
+        }
+        let mut best: Option<RespondEntity> = None;
+        let mut last_error = None;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok((entity, addr, latency))) => {
+                    self.manager.record_success(addr, latency);
+                    if best.as_ref().is_none_or(|best| entity.tick > best.tick) {
+                        best = Some(entity);
+                    }
+                }
+                Ok(Err((error, addr))) => {
+                    self.manager.record_failure(addr);
+                    last_error = Some(error);
+                }
+                Err(_) => last_error = Some(Error::NoPeers),
+            }
+        }
+        best.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
     }
 
     /// Looks up a spectrum entity by its 60-character identity.
     pub async fn entity_by_identity(&self, identity: &str) -> Result<RespondEntity> {
-        self.connect_best()
-            .await?
-            .entity_by_identity(identity)
-            .await
+        let identity = identity.to_string();
+        let mut candidates = self.manager.attempt_order(&self.peers);
+        for config in &self.peers {
+            if !candidates
+                .iter()
+                .any(|candidate| candidate.addr == config.addr)
+            {
+                candidates.push(config.clone());
+            }
+        }
+        let mut tasks = tokio::task::JoinSet::new();
+        for config in candidates {
+            let identity = identity.clone();
+            tasks.spawn(async move {
+                let started = std::time::Instant::now();
+                let addr = config.addr;
+                let mut peer = match Peer::connect(config).await {
+                    Ok(peer) => peer,
+                    Err(error) => return Err((error, addr)),
+                };
+                match peer.entity_by_identity(&identity).await {
+                    Ok(entity) => Ok((entity, addr, started.elapsed())),
+                    Err(error) => Err((error, addr)),
+                }
+            });
+        }
+        let mut best: Option<RespondEntity> = None;
+        let mut last_error = None;
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(Ok((entity, addr, latency))) => {
+                    self.manager.record_success(addr, latency);
+                    if best.as_ref().is_none_or(|best| entity.tick > best.tick) {
+                        best = Some(entity);
+                    }
+                }
+                Ok(Err((error, addr))) => {
+                    self.manager.record_failure(addr);
+                    last_error = Some(error);
+                }
+                Err(_) => last_error = Some(Error::NoPeers),
+            }
+        }
+        best.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
     }
 
     /// Invokes a read-only contract function on the best currently reachable

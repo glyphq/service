@@ -291,7 +291,7 @@ async fn status(State(state): State<AppState>) -> Result<impl IntoResponse, ApiE
     );
     let head = head?;
     let earliest = earliest?;
-    let stats = match state.live_cache.get("status:stats", Duration::from_secs(5)) {
+    let stats = match state.live_cache.get("status:stats", Duration::from_secs(1)) {
         Some(stats) => stats,
         None => {
             let stats = state.store.stats().await?;

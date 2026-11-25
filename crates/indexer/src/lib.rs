@@ -1164,6 +1164,26 @@ impl<S: Store + 'static> Indexer<S> {
             return FetchAction::Retry;
         }
 
+        if let Error::Node(node::Error::MissingNonEmptyTick { tick }) = &error {
+            if attempt % 60 == 0 {
+                tracing::warn!(
+                    tick = *tick,
+                    attempt,
+                    "non-empty tick data is not yet available; waiting"
+                );
+            }
+            retry
+                .send(RetryRequest {
+                    start: next,
+                    count: 1,
+                    attempt: attempt.saturating_add(1),
+                    delay: Duration::from_secs(1),
+                })
+                .await
+                .ok();
+            return FetchAction::Retry;
+        }
+
         if let Error::Node(node::Error::Archive(_)) = &error {
             *consecutive_failures += 1;
             if attempt.saturating_add(1) >= self.config.max_tick_attempts.saturating_mul(5) {
@@ -2514,6 +2534,7 @@ fn node_error_is_unusable(error: &node::Error) -> bool {
 /// connection is healthy. Rotate instead of retrying the same peer forever.
 fn node_error_is_peer_specific(error: &node::Error) -> bool {
     node_error_is_unusable(error)
+        || matches!(error, node::Error::MissingNonEmptyTick { .. })
         || matches!(
             error,
             node::Error::Verification(message) if message.starts_with("no votes for tick")
