@@ -181,10 +181,25 @@ impl Peer {
 
         if !missing.is_empty() {
             if let Some(archive) = self.archive.clone() {
+                let head = match archive.head().await {
+                    Ok(head) => Some(head),
+                    Err(error) => {
+                        tracing::warn!(%error, "public archive head is unavailable");
+                        None
+                    }
+                };
                 let mut tasks = tokio::task::JoinSet::new();
                 for (index, tick) in missing {
                     let archive = archive.clone();
-                    tasks.spawn(async move { (index, tick, archive.tick_data(tick).await) });
+                    tasks.spawn(async move {
+                        let result = match head {
+                            Some(head) => archive.tick_data_at(tick, head).await,
+                            None => {
+                                Err(Error::ArchiveNotReady("archive head is unavailable".into()))
+                            }
+                        };
+                        (index, tick, result)
+                    });
                 }
                 while let Some(joined) = tasks.join_next().await {
                     match joined {

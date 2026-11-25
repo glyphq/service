@@ -16,7 +16,7 @@ use qubic::messages::{MAX_CONTRACTS, TICK_DATA_SIZE, TX_PER_TICK, TickData};
 use crate::{Error, Result};
 
 const ARCHIVE_TIMEOUT: Duration = Duration::from_secs(5);
-const ARCHIVE_INTERVAL: Duration = Duration::from_millis(100);
+const ARCHIVE_INTERVAL: Duration = Duration::from_millis(200);
 const ARCHIVE_ATTEMPTS: u32 = 4;
 const ARCHIVE_MISSING_TTL: Duration = Duration::from_secs(60);
 const ARCHIVE_HEAD_TTL: Duration = Duration::from_secs(2);
@@ -45,6 +45,11 @@ fn archive_head_cache() -> &'static std::sync::Mutex<Option<(Instant, u32)>> {
     static HEAD: std::sync::OnceLock<std::sync::Mutex<Option<(Instant, u32)>>> =
         std::sync::OnceLock::new();
     HEAD.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+fn archive_head_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
 #[derive(Clone)]
@@ -78,6 +83,25 @@ impl ArchiveClient {
             return Err(Error::ArchiveNotReady(format!(
                 "tick {tick} is above the archive head {head}"
             )));
+        }
+        self.tick_data_at(tick, head).await
+    }
+
+    pub(crate) async fn tick_data_at(&self, tick: u32, head: u32) -> Result<TickData> {
+        if tick > head {
+            return Err(Error::ArchiveNotReady(format!(
+                "tick {tick} is above the archive head {head}"
+            )));
+        }
+        if let Ok(missing) = archive_missing().lock() {
+            if missing
+                .get(&tick)
+                .is_some_and(|until| *until > Instant::now())
+            {
+                return Err(Error::ArchiveNotAvailable(format!(
+                    "tick {tick} is not archived"
+                )));
+            }
         }
         let url = format!("{}/getTickData", self.base_url.trim_end_matches('/'));
         let mut last_error = None;
@@ -135,7 +159,7 @@ impl ArchiveClient {
         Err(last_error.unwrap_or_else(|| Error::Archive(format!("request tick {tick} failed"))))
     }
 
-    async fn head(&self) -> Result<u32> {
+    pub(crate) async fn head(&self) -> Result<u32> {
         if let Ok(cache) = archive_head_cache().lock() {
             if let Some((at, head)) = *cache {
                 if at.elapsed() < ARCHIVE_HEAD_TTL {
@@ -143,33 +167,66 @@ impl ArchiveClient {
                 }
             }
         }
-        wait_for_archive_turn().await;
+        let _guard = archive_head_lock().lock().await;
+        if let Ok(cache) = archive_head_cache().lock() {
+            if let Some((at, head)) = *cache {
+                if at.elapsed() < ARCHIVE_HEAD_TTL {
+                    return Ok(head);
+                }
+            }
+        }
         let url = format!(
             "{}/getLastProcessedTick",
             self.base_url.trim_end_matches('/')
         );
-        let response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .map_err(|error| Error::Archive(format!("request archive head: {error}")))?;
-        let response = response
-            .error_for_status()
-            .map_err(|error| Error::Archive(format!("request archive head: {error}")))?;
-        let body = response
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|error| Error::Archive(format!("decode archive head: {error}")))?;
-        let head = body
-            .get("tickNumber")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|head| u32::try_from(head).ok())
-            .ok_or_else(|| Error::Archive("archive head is missing tickNumber".into()))?;
-        if let Ok(mut cache) = archive_head_cache().lock() {
-            *cache = Some((Instant::now(), head));
+        let mut last_error = None;
+        for attempt in 0..ARCHIVE_ATTEMPTS {
+            wait_for_archive_turn().await;
+            let response = match self.client.get(&url).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = Some(Error::Archive(format!("request archive head: {error}")));
+                    tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                    continue;
+                }
+            };
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let wait = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .map(Duration::from_secs)
+                    .unwrap_or_else(|| Duration::from_millis(500 * (1 << attempt)));
+                last_error = Some(Error::Archive(
+                    "request archive head: HTTP 429 too many requests".into(),
+                ));
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            let response = match response.error_for_status() {
+                Ok(response) => response,
+                Err(error) => {
+                    last_error = Some(Error::Archive(format!("request archive head: {error}")));
+                    tokio::time::sleep(Duration::from_millis(250 * (1 << attempt))).await;
+                    continue;
+                }
+            };
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .map_err(|error| Error::Archive(format!("decode archive head: {error}")))?;
+            let head = body
+                .get("tickNumber")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|head| u32::try_from(head).ok())
+                .ok_or_else(|| Error::Archive("archive head is missing tickNumber".into()))?;
+            if let Ok(mut cache) = archive_head_cache().lock() {
+                *cache = Some((Instant::now(), head));
+            }
+            return Ok(head);
         }
-        Ok(head)
+        Err(last_error.unwrap_or_else(|| Error::Archive("request archive head failed".into())))
     }
 }
 
