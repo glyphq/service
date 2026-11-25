@@ -2371,13 +2371,14 @@ async fn dispatch_loop(
             .min_by_key(|(_, (_, start, _, _))| *start)
             .map(|(position, _)| position);
         if let Some(position) = due {
-            let (_, mut start, mut count, attempt) = retries.remove(position).expect("retry entry");
+            let (_, mut start, mut requested, attempt) =
+                retries.remove(position).expect("retry entry");
             let next = next_write.load(Ordering::Acquire);
-            if start.saturating_add(count) <= next {
+            if start.saturating_add(requested) <= next {
                 continue;
             }
             if start < next {
-                count = count.saturating_sub(next - start);
+                requested = requested.saturating_sub(next - start);
                 start = next;
             }
             if let Some(state) = *rollover.read().await {
@@ -2385,13 +2386,13 @@ async fn dispatch_loop(
                     continue;
                 }
                 if start <= state.old_last
-                    && start.saturating_add(count) > state.old_last.saturating_add(1)
+                    && start.saturating_add(requested) > state.old_last.saturating_add(1)
                 {
-                    count = state.old_last.saturating_sub(start) + 1;
+                    requested = state.old_last.saturating_sub(start) + 1;
                 }
             }
             let available = window.saturating_sub(pending.load(Ordering::Acquire));
-            let count = count.min(available as u32);
+            let count = requested.min(available as u32);
             if count > 0 {
                 pending.fetch_add(count as usize, Ordering::Release);
                 if work_tx
@@ -2409,7 +2410,7 @@ async fn dispatch_loop(
                 continue;
             } else {
                 // The window is full. Keep the request instead of dropping it.
-                retries.push_back((now + Duration::from_millis(20), start, count, attempt));
+                retries.push_back((now + Duration::from_millis(20), start, requested, attempt));
                 continue;
             }
         }
