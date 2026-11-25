@@ -41,6 +41,10 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Ticks this close to the head may not be archived yet. Never skip them;
+/// wait for a peer or the archive to publish the data instead.
+const LIVE_HEAD_MARGIN: u32 = 256;
+
 #[derive(Clone)]
 pub struct IndexerConfig {
     pub peers: Vec<PeerConfig>,
@@ -1117,7 +1121,8 @@ impl<S: Store + 'static> Indexer<S> {
             ))
         ) {
             *consecutive_failures += 1;
-            if attempt.saturating_add(1) >= self.config.max_tick_attempts {
+            let near_head = next.saturating_add(LIVE_HEAD_MARGIN) >= head.tick;
+            if !near_head && attempt.saturating_add(1) >= self.config.max_tick_attempts {
                 tracing::error!(
                     tick = next,
                     attempts = attempt.saturating_add(1),
@@ -1131,7 +1136,11 @@ impl<S: Store + 'static> Indexer<S> {
                     start: next,
                     count: 1,
                     attempt: attempt.saturating_add(1),
-                    delay: Duration::ZERO,
+                    delay: if near_head {
+                        Duration::from_secs(1)
+                    } else {
+                        Duration::ZERO
+                    },
                 })
                 .await
                 .ok();

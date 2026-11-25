@@ -2105,7 +2105,17 @@ impl NodePool {
                     return Ok(data);
                 }
                 Ok(Err((error, addr))) => {
-                    self.manager.record_failure(addr);
+                    if matches!(
+                        error,
+                        Error::Io(_)
+                            | Error::Wire(_)
+                            | Error::Timeout(_)
+                            | Error::RetriesExhausted { .. }
+                            | Error::TryAgain(_)
+                            | Error::UnexpectedPacket { .. }
+                    ) {
+                        self.manager.record_failure(addr);
+                    }
                     last_error = Some(error);
                 }
                 Err(_) => last_error = Some(Error::NoPeers),
