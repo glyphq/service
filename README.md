@@ -145,7 +145,7 @@ Relevant settings:
 | `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before a partial batch is flushed |
 | `INDEXER_VERIFY_CONCURRENCY` | CPU count minus one | Concurrent signature-verification tasks |
 | `INDEXER_POLL_MS` | `750` | Head poll interval when caught up |
-| `INDEXER_MAX_TICK_ATTEMPTS` | `4` | Skip a tick when every peer reports that its tick data does not exist |
+| `INDEXER_MAX_TICK_ATTEMPTS` | `2` | Skip a tick when every peer and the archive report that its tick data does not exist |
 | `QUBIC_ARCHIVE_URL` | `https://rpc.qubic.org/query/v1` | Qubic Query API used when peers no longer serve a tick's data |
 | `GLYPH_VERIFY_SIGNATURES` | `false` | Verify SchnorrQ signatures in addition to quorum digests |
 

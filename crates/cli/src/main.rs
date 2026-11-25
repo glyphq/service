@@ -77,7 +77,7 @@ enum Command {
         progress_every: u64,
         /// Skip a tick after this many attempts when every peer reports that
         /// its tick data does not exist.
-        #[arg(long, env = "INDEXER_MAX_TICK_ATTEMPTS", default_value_t = 4)]
+        #[arg(long, env = "INDEXER_MAX_TICK_ATTEMPTS", default_value_t = 2)]
         max_tick_attempts: u32,
     },
     /// Initialize ClickHouse tables.
@@ -386,7 +386,7 @@ mod tests {
                 assert!(!verify_signatures);
                 assert!(no_verify_signatures);
                 assert_eq!(progress_every, 100);
-                assert_eq!(max_tick_attempts, 4);
+                assert_eq!(max_tick_attempts, 2);
             }
             _ => panic!("expected sync command"),
         }
@@ -411,7 +411,7 @@ mod tests {
                 assert!(!verify_signatures);
                 assert!(!no_verify_signatures);
                 assert_eq!(progress_every, 100);
-                assert_eq!(max_tick_attempts, 4);
+                assert_eq!(max_tick_attempts, 2);
             }
             _ => panic!("expected sync command"),
         }

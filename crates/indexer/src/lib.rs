@@ -73,7 +73,7 @@ impl Default for IndexerConfig {
             poll_interval: Duration::from_millis(750),
             verify_signatures: false,
             progress_every: 100,
-            max_tick_attempts: 4,
+            max_tick_attempts: 2,
             archive: None,
             archive_fail_closed: false,
         }
