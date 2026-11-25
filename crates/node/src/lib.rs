@@ -98,6 +98,8 @@ pub enum Error {
     LogsUnavailable(String),
     #[error("archive: {0}")]
     Archive(String),
+    #[error("archive has no data: {0}")]
+    ArchiveNotAvailable(String),
     #[error("invalid request: {0}")]
     InvalidRequest(String),
 }

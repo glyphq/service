@@ -103,7 +103,8 @@ impl ArchiveClient {
 fn parse_tick_data(body: &serde_json::Value, requested: u32) -> Result<TickData> {
     let data = body
         .get("tickData")
-        .ok_or_else(|| Error::Archive(format!("tick {requested} has no tickData")))?;
+        .filter(|data| !data.is_null())
+        .ok_or_else(|| Error::ArchiveNotAvailable(format!("tick {requested} is not archived")))?;
     let tick = number(data, "tickNumber")?;
     if tick != u64::from(requested) {
         return Err(Error::Archive(format!(

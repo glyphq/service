@@ -199,7 +199,12 @@ impl Peer {
                                 %error,
                                 "public archive could not supply missing tick data"
                             );
-                            results[index] = Some(Err(Error::Archive(error.to_string())));
+                            results[index] = Some(Err(match error {
+                                Error::ArchiveNotAvailable(_) => {
+                                    Error::EndResponse(MessageType::RequestTickData)
+                                }
+                                error => Error::Archive(error.to_string()),
+                            }));
                         }
                         Err(error) => {
                             tracing::warn!(%error, "archive tick-data task failed");
