@@ -73,7 +73,7 @@ impl Default for IndexerConfig {
             poll_interval: Duration::from_millis(750),
             verify_signatures: false,
             progress_every: 100,
-            max_tick_attempts: 2,
+            max_tick_attempts: 4,
             archive: None,
             archive_fail_closed: false,
         }
@@ -213,7 +213,7 @@ impl PipelineTuning {
             fetch_concurrency: env_usize("INDEXER_FETCH_CONCURRENCY", 32, 1, 128),
             fetch_window: env_usize("INDEXER_FETCH_WINDOW", 512, 1, 8192),
             fetch_batch: env_usize("INDEXER_FETCH_BATCH", 32, 1, 256),
-            batch_min_lag: env_usize("INDEXER_BATCH_MIN_LAG", 64, 1, 100_000),
+            batch_min_lag: env_usize("INDEXER_BATCH_MIN_LAG", 8, 1, 100_000),
             write_batch: env_usize("INDEXER_WRITE_BATCH", 128, 1, 4096),
             write_flush: Duration::from_millis(
                 env_usize("INDEXER_WRITE_FLUSH_MS", 250, 10, 10_000) as u64,
@@ -1180,6 +1180,20 @@ impl<S: Store + 'static> Indexer<S> {
                 tracing::warn!(tick = next, %message, "skipping a tick with no known epoch");
                 *consecutive_failures = 0;
                 return FetchAction::SkipTo(next.saturating_add(1));
+            }
+            if message.starts_with("no votes for tick")
+                || message.starts_with("tick data digest does not match")
+            {
+                retry
+                    .send(RetryRequest {
+                        start: next,
+                        count: 1,
+                        attempt: attempt.saturating_add(1),
+                        delay: Duration::from_millis(250),
+                    })
+                    .await
+                    .ok();
+                return FetchAction::Retry;
             }
         }
 
@@ -2322,7 +2336,7 @@ async fn fetch_worker(
             let fetched = match fetched {
                 Ok(fetched) => fetched,
                 Err(error) => {
-                    if node_error_is_unusable(&error) {
+                    if node_error_is_peer_specific(&error) {
                         if let Some(peer) = peer.as_ref() {
                             pool.record_failure(peer.addr());
                         }
@@ -2353,7 +2367,7 @@ async fn fetch_worker(
                         }
                     }
                     Err(error) => {
-                        if node_error_is_unusable(&error) {
+                        if node_error_is_peer_specific(&error) {
                             peer_failed = true;
                         }
                         Err(Error::Node(error))
@@ -2480,6 +2494,16 @@ fn node_error_is_unusable(error: &node::Error) -> bool {
             | node::Error::UnexpectedPacket { .. }
             | node::Error::InvalidRequest(_)
     )
+}
+
+/// A peer that has no quorum votes for a tick cannot serve it even though the
+/// connection is healthy. Rotate instead of retrying the same peer forever.
+fn node_error_is_peer_specific(error: &node::Error) -> bool {
+    node_error_is_unusable(error)
+        || matches!(
+            error,
+            node::Error::Verification(message) if message.starts_with("no votes for tick")
+        )
 }
 
 fn required_quorum(digest: &[u8; 32]) -> usize {
