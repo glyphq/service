@@ -310,6 +310,24 @@ impl Peer {
 
         let (mut log_ranges, mut logs, mut known, mut log_warnings) =
             self.prefetch_logs(&decoded).await;
+        if self.log_ranges_supported == Some(false) {
+            if let Some(pool) = fallback.as_ref() {
+                if pool.peer_has_logs(self.config.addr) {
+                    // This peer has served real logs before, so an all-empty
+                    // fallback is a genuine no-log tick rather than a peer
+                    // with logging disabled.
+                    for index in 0..decoded.len() {
+                        if decoded[index].is_some()
+                            && !known[index]
+                            && log_ranges[index].count() == 0
+                        {
+                            known[index] = true;
+                            log_warnings[index].clear();
+                        }
+                    }
+                }
+            }
+        }
         let incomplete = (0..decoded.len())
             .filter(|index| {
                 decoded[*index].is_some()

@@ -1966,6 +1966,8 @@ pub struct NodePool {
     load: std::sync::Arc<std::sync::Mutex<HashMap<SocketAddr, usize>>>,
     connection_limit: usize,
     slot_available: std::sync::Arc<tokio::sync::Notify>,
+    log_peer: std::sync::Arc<std::sync::Mutex<Option<SocketAddr>>>,
+    log_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 impl NodePool {
@@ -1982,6 +1984,8 @@ impl NodePool {
             load: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             connection_limit: 4,
             slot_available: std::sync::Arc::new(tokio::sync::Notify::new()),
+            log_peer: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            log_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(2)),
         }
     }
 
@@ -2242,6 +2246,10 @@ impl NodePool {
 
     pub fn record_log_success(&self, addr: SocketAddr) {
         self.manager.record_log_success(addr);
+    }
+
+    pub fn peer_has_logs(&self, addr: SocketAddr) -> bool {
+        self.manager.has_logs(addr)
     }
 
     /// Adds peers advertised by one reachable peer, up to
@@ -2762,6 +2770,11 @@ impl NodePool {
     /// largest complete set. Batch responses can lose log pages for a tick
     /// even when another peer still has them.
     pub async fn logs(&self, tick_data: &TickData) -> Result<(LogRanges, Vec<LogEvent>)> {
+        let _permit = self
+            .log_slots
+            .acquire()
+            .await
+            .expect("log fallback semaphore is never closed");
         let mut candidates = self.manager.attempt_order(&self.peers);
         for config in &self.peers {
             if !candidates
@@ -2774,43 +2787,48 @@ impl NodePool {
         if candidates.is_empty() {
             return Err(Error::NoPeers);
         }
-        let mut tasks = tokio::task::JoinSet::new();
-        for config in candidates {
-            let tick_data = tick_data.clone();
-            tasks.spawn(async move {
-                let addr = config.addr;
-                let mut peer = match Peer::connect(config).await {
-                    Ok(peer) => peer,
-                    Err(error) => return Err((error, addr)),
-                };
-                match peer.complete_logs(&tick_data).await {
-                    Ok((ranges, logs, known, _warnings)) => Ok((ranges, logs, known, addr)),
-                    Err(error) => Err((error, addr)),
-                }
-            });
+        let preferred = *self.log_peer.lock().expect("log peer mutex poisoned");
+        if let Some(addr) = preferred {
+            if let Some(index) = candidates.iter().position(|config| config.addr == addr) {
+                candidates.swap(0, index);
+            }
         }
-        let mut best: Option<(LogRanges, Vec<LogEvent>)> = None;
-        let mut best_count = -1i64;
+        let mut best_empty: Option<(LogRanges, Vec<LogEvent>)> = None;
         let mut last_error = None;
-        while let Some(joined) = tasks.join_next().await {
-            match joined {
-                Ok(Ok((ranges, logs, known, addr))) => {
+        for config in candidates {
+            let addr = config.addr;
+            let mut peer = match Peer::connect(config).await {
+                Ok(peer) => peer,
+                Err(error) => {
+                    if preferred == Some(addr) {
+                        self.clear_log_peer();
+                    }
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            match peer.complete_logs(tick_data).await {
+                Ok((ranges, logs, known, _warnings))
                     if !ranges.is_pending()
                         && (known || ranges.count() == 0)
-                        && prefetch::logs_cover_ranges(&ranges, &logs)
-                    {
+                        && prefetch::logs_cover_ranges(&ranges, &logs) =>
+                {
+                    if ranges.count() > 0 {
                         self.manager.record_log_success(addr);
-                        if ranges.count() > 0 {
-                            tasks.abort_all();
-                            return Ok((ranges, logs));
-                        }
-                        if ranges.count() > best_count {
-                            best_count = ranges.count();
-                            best = Some((ranges, logs));
-                        }
+                        *self.log_peer.lock().expect("log peer mutex poisoned") = Some(addr);
+                        return Ok((ranges, logs));
+                    }
+                    if preferred == Some(addr) {
+                        return Ok((ranges, logs));
+                    }
+                    best_empty.get_or_insert((ranges, logs));
+                }
+                Ok(_) => {
+                    if preferred == Some(addr) {
+                        self.clear_log_peer();
                     }
                 }
-                Ok(Err((error, addr))) => {
+                Err(error) => {
                     if matches!(
                         error,
                         Error::Io(_)
@@ -2822,12 +2840,18 @@ impl NodePool {
                     ) {
                         self.manager.record_failure(addr);
                     }
+                    if preferred == Some(addr) {
+                        self.clear_log_peer();
+                    }
                     last_error = Some(error);
                 }
-                Err(_) => last_error = Some(Error::NoPeers),
             }
         }
-        best.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
+        best_empty.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
+    }
+
+    fn clear_log_peer(&self) {
+        *self.log_peer.lock().expect("log peer mutex poisoned") = None;
     }
 }
 

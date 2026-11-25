@@ -2418,6 +2418,7 @@ async fn fetch_worker(
                     Ok(bundle) => {
                         if let Some(addr) = peer_addr {
                             if bundle.logs_complete
+                                && !bundle.logs.is_empty()
                                 && bundle.tick_data.non_empty_transactions().next().is_some()
                             {
                                 pool.record_log_success(addr);

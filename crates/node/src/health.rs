@@ -83,6 +83,7 @@ struct PeerState {
     ewma_ms: Option<f64>,
     fetch_ms_per_tick: Option<f64>,
     log_failures: u32,
+    has_logs: bool,
     last_latency: Option<Duration>,
     last_attempt: Option<tokio::time::Instant>,
     quarantined_until: Option<tokio::time::Instant>,
@@ -201,6 +202,15 @@ impl PeerManager {
         let mut state = self.state.lock().expect("peer health mutex poisoned");
         let entry = state.entry(addr).or_default();
         entry.log_failures = 0;
+        entry.has_logs = true;
+    }
+
+    pub fn has_logs(&self, addr: SocketAddr) -> bool {
+        self.state
+            .lock()
+            .expect("peer health mutex poisoned")
+            .get(&addr)
+            .is_some_and(|entry| entry.has_logs)
     }
 
     /// Whether `addr` is currently skipped. Expired quarantines are cleared.
