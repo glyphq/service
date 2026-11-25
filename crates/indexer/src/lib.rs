@@ -2107,16 +2107,12 @@ async fn fetch_worker(
         let peer_addr = peer.as_ref().expect("worker peer").addr();
         if outcome.is_ok() {
             pool.record_healthy(peer_addr);
-        } else if matches!(
-            &outcome,
-            Err(Error::Node(
-                node::Error::Io(_) | node::Error::Timeout(_) | node::Error::RetriesExhausted { .. }
-            ))
-        ) {
+        } else if peer_is_unusable(&outcome) {
             pool.record_failure(peer_addr);
-            // Drop the broken connection now. The next work item connects to
-            // the best healthy peer instead of paying a handshake before the
-            // writer can retry.
+            // Drop the connection now. A peer that is behind the requested
+            // tick, has already pruned it, or is busy must not keep receiving
+            // retries for the same tick while a healthy peer can serve it.
+            // The next work item connects to the best peer instead.
             peer = None;
         }
         if results
@@ -2131,6 +2127,26 @@ async fn fetch_worker(
             return;
         }
     }
+}
+
+/// A peer-level failure means this connection should not receive the same
+/// request again. Verification failures are deliberately excluded: they can
+/// be a real protocol disagreement and the writer has its own handling.
+fn peer_is_unusable(outcome: &Result<VerifiedTick>) -> bool {
+    matches!(
+        outcome,
+        Err(Error::Node(
+            node::Error::Io(_)
+                | node::Error::Wire(_)
+                | node::Error::Timeout(_)
+                | node::Error::RetriesExhausted { .. }
+                | node::Error::NotSynchronized { .. }
+                | node::Error::TryAgain(_)
+                | node::Error::EndResponse(_)
+                | node::Error::UnexpectedPacket { .. }
+                | node::Error::InvalidRequest(_)
+        ))
+    )
 }
 
 fn required_quorum(digest: &[u8; 32]) -> usize {
@@ -2746,6 +2762,28 @@ mod tests {
 
         assert!(moved_boundary_rollover(241, 92_260_000, Some(92_241_593), 92_241_594).is_none());
         assert!(moved_boundary_rollover(241, 92_260_000, Some(92_241_593), 92_260_000).is_none());
+    }
+
+    #[test]
+    fn peers_that_cannot_serve_a_tick_are_rotated() {
+        let unavailable = [
+            node::Error::NotSynchronized {
+                head: 100,
+                requested: 200,
+            },
+            node::Error::TryAgain(qubic::wire::MessageType::RequestTickData),
+            node::Error::EndResponse(qubic::wire::MessageType::RequestTickData),
+        ];
+        for error in unavailable {
+            assert!(peer_is_unusable(&Err(Error::Node(error))));
+        }
+
+        assert!(!peer_is_unusable(&Err(Error::Verification(
+            "bad quorum".into()
+        ))));
+        assert!(!peer_is_unusable(&Err(Error::Node(
+            node::Error::Verification("bad tick data".into())
+        ))));
     }
 
     #[tokio::test]
