@@ -6,19 +6,19 @@ use qubic::LogEvent;
 use qubic::crypto::schnorrq;
 use qubic::messages::{
     ASSET_REQUEST_GET_SIBLINGS, COMPUTOR_COUNT, Computors, CurrentTickInfo, LOG_TX_PER_TICK,
-    LogRanges, MAX_AMOUNT, MAX_CONTRACTS, MAX_INPUT_SIZE, ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS,
+    LogRanges, MAX_AMOUNT, MAX_INPUT_SIZE, ORACLE_REQUEST_ACTIVE_SUBSCRIPTIONS,
     ORACLE_REQUEST_QUERY_AND_RESPONSE, ORACLE_REQUEST_SUBSCRIPTION, ORACLE_RESPOND_QUERY_DATA,
     ORACLE_RESPOND_QUERY_METADATA, ORACLE_RESPOND_REPLY_DATA, ORACLE_RESPOND_SUBSCRIPTION,
     ORACLE_RESPOND_SUBSCRIPTION_IDS, OracleQueryMetadata, OracleQueryStatistics, OracleSubscriber,
-    OracleSubscription, PRICE_SERIES_MAX_POINTS, PeerAddress, RequestAssets, RespondAssets,
+    OracleSubscription, PRICE_SERIES_MAX_POINTS, PeerAddress, QUORUM, RequestAssets, RespondAssets,
     RespondAssetsWithSiblings, RespondContractFunction, RespondEntity, RespondIssuedAssets,
     RespondOracleData, RespondOwnedAssets, RespondPossessedAssets, RespondPriceSeries,
-    RespondRevenueData, RespondTxStatus, SystemInfo, TX_PER_TICK, Tick, TickData, Transaction,
-    request_all_log_ranges, request_assets, request_computors, request_contract_function,
-    request_current_tick_info, request_entity, request_issued_assets, request_logs,
-    request_oracle_data, request_owned_assets, request_possessed_assets, request_price_series,
-    request_quorum_tick, request_revenue_data, request_system_info, request_tick_data,
-    request_tick_transactions, request_transaction_info, request_tx_status,
+    RespondRevenueData, RespondTxStatus, SystemInfo, TX_PER_TICK, Tick, TickAlignment, TickData,
+    Transaction, request_all_log_ranges, request_assets, request_computors,
+    request_contract_function, request_current_tick_info, request_entity, request_issued_assets,
+    request_logs, request_oracle_data, request_owned_assets, request_possessed_assets,
+    request_price_series, request_quorum_tick, request_revenue_data, request_system_info,
+    request_tick_data, request_tick_transactions, request_transaction_info, request_tx_status,
 };
 use qubic::wire::{HEADER_SIZE, MessageType, Packet};
 use serde::Serialize;
@@ -26,10 +26,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
-mod archive;
 pub mod health;
 mod prefetch;
-use archive::ArchiveClient;
 
 /// Capability is a property of the peer, not of one TCP connection. Fetch
 /// workers open short-lived connections, so cache the answer per address to
@@ -96,12 +94,6 @@ pub enum Error {
     Verification(String),
     #[error("log data unavailable: {0}")]
     LogsUnavailable(String),
-    #[error("archive: {0}")]
-    Archive(String),
-    #[error("archive has no data: {0}")]
-    ArchiveNotAvailable(String),
-    #[error("archive has not processed the tick yet: {0}")]
-    ArchiveNotReady(String),
     #[error("tick {tick} has non-empty votes but no tick data")]
     MissingNonEmptyTick { tick: u32 },
     #[error("invalid request: {0}")]
@@ -125,8 +117,6 @@ pub struct PeerConfig {
     pub log_range_timeout: Duration,
     /// Per-probe timeout for the per-transaction log fallback.
     pub log_fallback_probe_timeout: Duration,
-    /// Qubic Query API base URL used when a peer cannot serve tick data.
-    pub archive_url: Option<String>,
 }
 
 impl PeerConfig {
@@ -140,9 +130,6 @@ impl PeerConfig {
             retries: DEFAULT_RETRIES,
             log_range_timeout: DEFAULT_LOG_RANGE_TIMEOUT,
             log_fallback_probe_timeout: DEFAULT_LOG_FALLBACK_PROBE_TIMEOUT,
-            archive_url: std::env::var("QUBIC_ARCHIVE_URL")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
         }
     }
 
@@ -173,11 +160,6 @@ impl PeerConfig {
 
     pub fn with_log_fallback_probe_timeout(mut self, timeout: Duration) -> Self {
         self.log_fallback_probe_timeout = timeout;
-        self
-    }
-
-    pub fn with_archive_url(mut self, url: impl Into<String>) -> Self {
-        self.archive_url = Some(url.into());
         self
     }
 }
@@ -374,28 +356,9 @@ pub struct Peer {
     /// Latest head this connection reported. Used to reject backwards ticks
     /// and cached heads from before an epoch rollover.
     observed_head: Option<Head>,
-    /// Optional Qubic Query API fallback for tick data peers no longer serve.
-    archive: Option<ArchiveClient>,
 }
 
 impl Peer {
-    async fn archive_tick_data(&self, tick: u32) -> Result<Option<TickData>> {
-        let Some(archive) = self.archive.as_ref() else {
-            return Ok(None);
-        };
-        match archive.tick_data(tick).await {
-            Ok(tick_data) => {
-                tracing::info!(tick, "recovered tick data from the public archive");
-                Ok(Some(tick_data))
-            }
-            Err(Error::ArchiveNotAvailable(_)) => Ok(None),
-            Err(error) => {
-                tracing::warn!(tick, %error, "public archive tick data unavailable");
-                Err(error)
-            }
-        }
-    }
-
     /// Connects to a peer and completes the exchange-public-peers handshake.
     pub async fn connect(config: PeerConfig) -> Result<Self> {
         let stream = Self::open(&config).await?;
@@ -404,11 +367,6 @@ impl Peer {
             .lock()
             .ok()
             .and_then(|cache| cache.get(&config.addr).copied());
-        let archive = config
-            .archive_url
-            .as_ref()
-            .map(|url| ArchiveClient::new(url.clone()))
-            .transpose()?;
         let mut peer = Self {
             config,
             reader: BufReader::new(reader),
@@ -419,7 +377,6 @@ impl Peer {
             desynced: false,
             log_ranges_supported,
             observed_head: None,
-            archive,
         };
         peer.handshake().await?;
         Ok(peer)
@@ -1370,9 +1327,7 @@ impl Peer {
             Some(packet) => TickData::decode(&packet.payload)?,
             None => {
                 tracing::debug!(tick, "tick data absent; checking for an empty tick");
-                if let Some(tick_data) = self.archive_tick_data(tick).await? {
-                    tick_data
-                } else if votes.is_empty() || votes.iter().any(|vote| !vote.is_empty_vote()) {
+                if votes.is_empty() || votes.iter().any(|vote| !vote.is_empty_vote()) {
                     return Err(Error::MissingNonEmptyTick { tick });
                 } else {
                     empty_tick_from_votes(&votes, tick)?
@@ -1980,6 +1935,8 @@ pub struct NodePool {
     peers: Vec<PeerConfig>,
     manager: PeerManager,
     load: std::sync::Arc<std::sync::Mutex<HashMap<SocketAddr, usize>>>,
+    connection_limit: usize,
+    slot_available: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl NodePool {
@@ -1994,7 +1951,17 @@ impl NodePool {
             peers,
             manager: PeerManager::new(policy),
             load: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            connection_limit: 4,
+            slot_available: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Caps concurrent TCP connections to one peer. Qubic full nodes accept a
+    /// bounded number of connections from one address; exceeding the limit
+    /// produces early EOFs and wastes handshakes.
+    pub fn with_connection_limit(mut self, limit: usize) -> Self {
+        self.connection_limit = limit.max(1);
+        self
     }
 
     pub fn peer_configs(&self) -> &[PeerConfig] {
@@ -2031,43 +1998,57 @@ impl NodePool {
     /// indexer workers needs `connect_balanced`, otherwise every worker picks
     /// the same low-latency peer and resets its connection under the herd.
     pub async fn connect_balanced(&self) -> Result<PooledPeer> {
-        let mut candidates = self.manager.attempt_order(&self.peers);
-        if candidates.is_empty() {
-            // Health quarantines must not turn a brief all-peer outage into a
-            // long stall. Fall back to every configured peer; a successful
-            // connect clears its quarantine.
-            candidates = self.peers.clone();
-        }
-        let mut last_error = None;
-        while !candidates.is_empty() {
-            let (config, index) = self
-                .reserve_least_loaded(&candidates)
-                .expect("non-empty candidate list");
-            let addr = config.addr;
-            let started = std::time::Instant::now();
-            match Peer::connect(config).await {
-                Ok(peer) => {
-                    self.manager.record_success(addr, started.elapsed());
-                    return Ok(PooledPeer {
-                        peer,
-                        addr,
-                        load: self.load.clone(),
-                    });
-                }
-                Err(error) => {
-                    self.add_load(addr, -1);
-                    self.manager.record_failure(addr);
-                    candidates.remove(index);
-                    last_error = Some(error);
+        loop {
+            let mut candidates = self.manager.attempt_order(&self.peers);
+            if candidates.is_empty() {
+                // Health quarantines must not turn a brief all-peer outage into
+                // a long stall. Fall back to every configured peer; a successful
+                // connect clears its quarantine.
+                candidates = self.peers.clone();
+            }
+            if candidates.is_empty() {
+                return Err(Error::NoPeers);
+            }
+            let mut last_error = None;
+            while !candidates.is_empty() {
+                let Some((config, index)) = self.reserve_least_loaded(&candidates) else {
+                    break;
+                };
+                let addr = config.addr;
+                let started = std::time::Instant::now();
+                match Peer::connect(config).await {
+                    Ok(peer) => {
+                        self.manager.record_success(addr, started.elapsed());
+                        return Ok(PooledPeer {
+                            peer,
+                            addr,
+                            load: self.load.clone(),
+                            slot_available: self.slot_available.clone(),
+                        });
+                    }
+                    Err(error) => {
+                        self.add_load(addr, -1);
+                        self.manager.record_failure(addr);
+                        candidates.remove(index);
+                        last_error = Some(error);
+                    }
                 }
             }
+            // Every usable peer is at its connection cap. Wait for a worker to
+            // release a slot instead of opening an extra socket.
+            tokio::select! {
+                _ = self.slot_available.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
+            if let Some(error) = last_error {
+                tracing::debug!(%error, "no peer connection slot available");
+            }
         }
-        Err(last_error.unwrap_or(Error::NoPeers))
     }
 
     /// Requests one tick's data from every configured peer in parallel and
-    /// returns the first copy. Used when a single peer and the public archive
-    /// cannot supply tick data that another peer still retains.
+    /// returns the first copy. Used when a peer's batch response lacks tick
+    /// data that another peer still retains.
     pub async fn tick_data(&self, tick: u32) -> Result<TickData> {
         let mut candidates = self.manager.attempt_order(&self.peers);
         for config in &self.peers {
@@ -2196,6 +2177,9 @@ impl NodePool {
         let (index, _) = candidates
             .iter()
             .enumerate()
+            .filter(|(_, config)| {
+                loads.get(&config.addr).copied().unwrap_or(0) < self.connection_limit
+            })
             .min_by_key(|(_, config)| loads.get(&config.addr).copied().unwrap_or(0))?;
         let config = candidates[index].clone();
         *loads.entry(config.addr).or_insert(0) += 1;
@@ -2672,6 +2656,7 @@ pub struct PooledPeer {
     peer: Peer,
     addr: SocketAddr,
     load: std::sync::Arc<std::sync::Mutex<HashMap<SocketAddr, usize>>>,
+    slot_available: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl PooledPeer {
@@ -2701,6 +2686,7 @@ impl Drop for PooledPeer {
                 *entry = entry.saturating_sub(1);
             }
         }
+        self.slot_available.notify_waiters();
     }
 }
 
@@ -2865,44 +2851,47 @@ fn first_vote_or_synthetic(votes: &[Tick], data: &TickData, tick: u32) -> Result
     })
 }
 
-/// Builds an all-zero `TickData` for an empty tick from one quorum vote.
-///
-/// `RequestTickData` only returns non-empty ticks. The vote supplies the
-/// timestamp and computor index; every transaction slot, timelock, and contract
-/// fee is zero by definition.
-fn empty_tick_data(vote: &Tick) -> TickData {
-    TickData {
-        computor_index: vote.computor_index,
-        epoch: vote.epoch,
-        tick: vote.tick,
-        millisecond: vote.millisecond,
-        second: vote.second,
-        minute: vote.minute,
-        hour: vote.hour,
-        day: vote.day,
-        month: vote.month,
-        year: vote.year,
-        timelock: [0; 32],
-        transaction_digests: vec![[0; 32]; TX_PER_TICK],
-        contract_fees: vec![0; MAX_CONTRACTS],
-        signature: [0; 64],
-    }
-}
-
-/// Synthesize an empty tick from any empty vote, or fail when the peer gave no
-/// empty vote at all.
+/// Synthesizes an empty tick only when a full aligned quorum of empty votes
+/// exists. A smaller empty group is not enough: Qubic finalizes an empty tick
+/// with the same 451-vote quorum as a non-empty tick, and a partial vote set
+/// must never be mistaken for an empty tick.
 fn empty_tick_from_votes(votes: &[Tick], tick: u32) -> Result<TickData> {
-    let Some(vote) = votes.iter().find(|vote| vote.is_empty_vote()) else {
-        return Err(Error::EndResponse(MessageType::RequestTickData));
-    };
-    let data = empty_tick_data(vote);
-    if data.tick != tick {
+    let mut groups = HashMap::<TickAlignment, Vec<&Tick>>::new();
+    for vote in votes {
+        if vote.tick != tick || !vote.is_empty_vote() {
+            continue;
+        }
+        groups.entry(vote.alignment()).or_default().push(vote);
+    }
+
+    let mut winners = Vec::new();
+    for group in groups.values() {
+        let unique = group
+            .iter()
+            .map(|vote| vote.computor_index)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        if unique >= QUORUM {
+            winners.push((unique, group));
+        }
+    }
+    if winners.is_empty() {
+        return Err(Error::MissingNonEmptyTick { tick });
+    }
+    // A split empty vote set is a conflicting quorum, not an empty tick.
+    if winners.len() > 1 {
         return Err(Error::Verification(format!(
-            "empty vote is for tick {}, requested {tick}",
-            data.tick
+            "tick {tick} has {} conflicting empty quorum groups",
+            winners.len()
         )));
     }
-    Ok(data)
+    let (_, group) = winners.pop().expect("one winner");
+    let vote = group
+        .iter()
+        .find(|vote| u32::from(vote.computor_index) == tick % COMPUTOR_COUNT as u32)
+        .copied()
+        .unwrap_or(group[0]);
+    Ok(TickData::empty_for_tick(tick, vote.epoch, vote))
 }
 
 #[cfg(test)]
@@ -4938,5 +4927,42 @@ mod tests {
             qubic::encode_tx_hash(&receipt.digest),
             receipt.peer
         );
+    }
+
+    fn empty_vote(computor_index: u16, tick_number: u32) -> Tick {
+        let mut vote = tick(computor_index, tick_number);
+        vote.transaction_digest = [0; 32];
+        vote
+    }
+
+    #[test]
+    fn empty_tick_requires_a_full_aligned_quorum() {
+        let votes = (0..QUORUM as u16)
+            .map(|index| empty_vote(index, TICK))
+            .collect::<Vec<_>>();
+        let data = empty_tick_from_votes(&votes, TICK).expect("empty quorum");
+        assert_eq!(data.tick, TICK);
+        assert_eq!(data.computor_index, (TICK % COMPUTOR_COUNT as u32) as u16);
+        assert_eq!(data.non_empty_transactions().count(), 0);
+
+        let short = &votes[..QUORUM - 1];
+        assert!(matches!(
+            empty_tick_from_votes(short, TICK),
+            Err(Error::MissingNonEmptyTick { .. })
+        ));
+    }
+
+    #[test]
+    fn empty_tick_rejects_split_timestamps() {
+        let mut votes = (0..QUORUM as u16)
+            .map(|index| empty_vote(index, TICK))
+            .collect::<Vec<_>>();
+        for (index, vote) in votes.iter_mut().enumerate().skip(QUORUM / 2) {
+            vote.millisecond = index as u16;
+        }
+        assert!(matches!(
+            empty_tick_from_votes(&votes, TICK),
+            Err(Error::MissingNonEmptyTick { .. })
+        ));
     }
 }

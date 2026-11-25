@@ -14,8 +14,8 @@ use qubic::crypto::k12::k12_32;
 use qubic::crypto::schnorrq;
 use qubic::logs::{CONTRACT_ERROR_MESSAGE, EventBody};
 use qubic::messages::{
-    COMPUTOR_COUNT, Computors, EMPTY_TICK_QUORUM, LOG_TX_PER_TICK, QUORUM, TICK_DATA_SIZE,
-    TX_PER_TICK, Tick, TickData, Transaction, ZERO_DIGEST,
+    COMPUTOR_COUNT, Computors, LOG_TX_PER_TICK, QUORUM, TICK_DATA_SIZE, TX_PER_TICK, Tick,
+    TickData, Transaction, ZERO_DIGEST,
 };
 use qubic::{LogEvent, PublicKey};
 use serde::Serialize;
@@ -41,12 +41,13 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Ticks this close to the head may not be archived yet. Never skip them;
-/// wait for a peer or the archive to publish the data instead.
+/// Ticks this close to the head may still be served by only some peers. Never
+/// skip them; wait for a peer to publish the data instead.
 const LIVE_HEAD_MARGIN: u32 = 256;
-/// Quorum votes for tick `N` complete while `N + 1` runs. Stay a few ticks
-/// behind the reported head so live ticks always have their full vote set.
-const LIVE_HEAD_LAG: u32 = 8;
+/// `RespondCurrentTickInfo.tick` is the tick core is about to process; the
+/// previous tick is finalized and has its full vote set. Never fetch the
+/// in-progress tick.
+const LIVE_HEAD_LAG: u32 = 1;
 
 #[derive(Clone)]
 pub struct IndexerConfig {
@@ -111,6 +112,9 @@ pub struct VerifiedTick {
     pub head: Head,
     pub tick: Tick,
     pub tick_data: TickData,
+    /// Quorum digest: the tick-data hash for a non-empty tick, zero for an
+    /// empty tick.
+    pub tick_digest: [u8; 32],
     pub votes: Vec<Tick>,
     pub transactions: Vec<Transaction>,
     pub computors: Computors,
@@ -219,7 +223,7 @@ impl PipelineTuning {
             // flight or buffered by the ordered writer.
             fetch_concurrency: env_usize("INDEXER_FETCH_CONCURRENCY", 32, 1, 128),
             fetch_window: env_usize("INDEXER_FETCH_WINDOW", 512, 1, 8192),
-            fetch_batch: env_usize("INDEXER_FETCH_BATCH", 32, 1, 256),
+            fetch_batch: env_usize("INDEXER_FETCH_BATCH", 32, 1, 64),
             batch_min_lag: env_usize("INDEXER_BATCH_MIN_LAG", 8, 1, 100_000),
             write_batch: env_usize("INDEXER_WRITE_BATCH", 128, 1, 4096),
             write_flush: Duration::from_millis(
@@ -487,7 +491,12 @@ impl<S: Store + 'static> Indexer<S> {
             peer.timeout = peer.timeout.min(Duration::from_secs(4));
             peer.retries = 0;
         }
-        let pool = NodePool::new(config.peers.clone());
+        let pool = NodePool::new(config.peers.clone()).with_connection_limit(env_usize(
+            "INDEXER_CONNECTIONS_PER_PEER",
+            2,
+            1,
+            16,
+        ));
         Ok(Self {
             store,
             pool,
@@ -1151,19 +1160,6 @@ impl<S: Store + 'static> Indexer<S> {
             return FetchAction::Retry;
         }
 
-        if let Error::Node(node::Error::ArchiveNotReady(_)) = &error {
-            retry
-                .send(RetryRequest {
-                    start: next,
-                    count: 1,
-                    attempt: attempt.saturating_add(1),
-                    delay: Duration::from_millis(500),
-                })
-                .await
-                .ok();
-            return FetchAction::Retry;
-        }
-
         if let Error::Node(node::Error::MissingNonEmptyTick { tick }) = &error {
             if attempt % 60 == 0 {
                 tracing::warn!(
@@ -1181,30 +1177,6 @@ impl<S: Store + 'static> Indexer<S> {
                 })
                 .await
                 .ok();
-            return FetchAction::Retry;
-        }
-
-        if let Error::Node(node::Error::Archive(_)) = &error {
-            *consecutive_failures += 1;
-            if attempt.saturating_add(1) >= self.config.max_tick_attempts.saturating_mul(5) {
-                tracing::error!(
-                    tick = next,
-                    attempts = attempt.saturating_add(1),
-                    "archive tick data is unavailable, skipping tick"
-                );
-                *consecutive_failures = 0;
-                return FetchAction::SkipTo(next.saturating_add(1));
-            }
-            retry
-                .send(RetryRequest {
-                    start: next,
-                    count: 1,
-                    attempt: attempt.saturating_add(1),
-                    delay: *backoff,
-                })
-                .await
-                .ok();
-            *backoff = (*backoff * 2).min(Duration::from_secs(2));
             return FetchAction::Retry;
         }
 
@@ -1330,8 +1302,8 @@ impl<S: Store + 'static> Indexer<S> {
             verified.tick.computor_index,
             verified.verification.as_str(),
         );
-        batch.signature = verified.tick.signature;
-        batch.tick_digest = verified.tick_data.digest();
+        batch.signature = verified.tick_data.signature;
+        batch.tick_digest = verified.tick_digest;
 
         let mut error_txs = HashMap::<u16, bool>::new();
         let mut tx_hashes = HashMap::<u16, String>::new();
@@ -1600,9 +1572,9 @@ fn quorum_evidence(
     }
 }
 
-/// Votes agree on the transaction digest. Per-computor salted header fields
-/// differ by design, so the digest is the only field a quorum can share.
-type VoteGroupKey = [u8; 32];
+/// Votes agree on the chain-state fields that Qubic compares against its
+/// etalon tick. Per-computor salted fields and signatures differ by design.
+type VoteGroupKey = qubic::messages::TickAlignment;
 
 /// Verifies quorum, transaction inclusion, log digests, and optionally
 /// SchnorrQ signatures.
@@ -1625,7 +1597,7 @@ fn verify_bundle_with(
     verify_signatures: bool,
     parallel_votes: bool,
 ) -> Result<VerifiedTick> {
-    let tick_data = bundle.tick_data.clone();
+    let mut tick_data = bundle.tick_data.clone();
     let tick_number = tick_data.tick;
     let epoch = if tick_data.epoch == 0 {
         bundle.tick.epoch
@@ -1677,18 +1649,28 @@ fn verify_bundle_with(
     }
 
     let unique_votes: Vec<&Tick> = by_computor.values().copied().collect();
-    let (consensus_digest, consensus_count) = select_consensus_group(
-        tick_number,
-        &unique_votes,
-        required_quorum,
-        |group, required| {
-            if verify_signatures {
-                verify_vote_group(group, &bundle.computors, required, parallel_votes).valid
-            } else {
-                group.len()
-            }
-        },
-    )?;
+    let (consensus_digest, consensus_count, canonical_vote) = {
+        let consensus = select_consensus_group(
+            tick_number,
+            &unique_votes,
+            required_quorum,
+            |group, required| {
+                if verify_signatures {
+                    verify_vote_group(group, &bundle.computors, required, parallel_votes).valid
+                } else {
+                    group.len()
+                }
+            },
+        )?;
+        let canonical = consensus
+            .votes
+            .iter()
+            .find(|vote| u32::from(vote.computor_index) == tick_number % COMPUTOR_COUNT as u32)
+            .copied()
+            .or_else(|| consensus.votes.first().copied())
+            .expect("a consensus group has at least one vote");
+        (consensus.digest, consensus.count, canonical.clone())
+    };
     let required = required_quorum(&consensus_digest);
     tracing::debug!(
         tick = tick_number,
@@ -1711,6 +1693,9 @@ fn verify_bundle_with(
             "empty tick {tick_number} carries non-empty transaction slots"
         )));
     }
+    if consensus_digest == ZERO_DIGEST {
+        tick_data = TickData::empty_for_tick(tick_number, epoch, &canonical_vote);
+    }
 
     if verify_signatures && consensus_digest != ZERO_DIGEST {
         verify_tick_data_signature(&bundle, &bundle.computors)?;
@@ -1718,7 +1703,10 @@ fn verify_bundle_with(
 
     // The stored header is the requested candidate, not one computor's vote.
     // Votes carry per-computor salted fields that are not chain state.
-    let candidate = bundle.tick.clone();
+    let mut candidate = canonical_vote;
+    candidate.computor_index = tick_data.computor_index;
+    candidate.epoch = tick_data.epoch;
+    candidate.tick = tick_number;
     debug_assert!(consensus_count >= required);
 
     let digest_to_index: HashMap<[u8; 32], u16> = tick_data
@@ -1840,6 +1828,7 @@ fn verify_bundle_with(
         head: bundle.head,
         tick: candidate,
         tick_data,
+        tick_digest: consensus_digest,
         votes: bundle.votes,
         transactions: bundle.transactions,
         computors: bundle.computors,
@@ -2267,17 +2256,9 @@ async fn fetch_worker(
     cancel: CancellationToken,
 ) {
     loop {
-        let item = {
-            let mut receiver = work.lock().await;
-            tokio::select! {
-                _ = cancel.cancelled() => return,
-                item = receiver.recv() => match item {
-                    Some(item) => item,
-                    None => return,
-                },
-            }
-        };
-
+        // Hold a connection before taking a batch. A worker waiting for a
+        // per-peer connection slot must not sit on work that an active worker
+        // could fetch.
         if peer.is_none() {
             let connection = tokio::select! {
                 _ = cancel.cancelled() => return,
@@ -2288,23 +2269,21 @@ async fn fetch_worker(
                 Err(error) => {
                     tracing::debug!(%error, "no peer available for fetch worker");
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    if results
-                        .send(FetchResult {
-                            start: item.start,
-                            count: item.count,
-                            attempt: item.attempt,
-                            outcomes: Vec::new(),
-                            batch_error: Some(Error::Node(error)),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
                     continue;
                 }
             }
         }
+
+        let item = {
+            let mut receiver = work.lock().await;
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                item = receiver.recv() => match item {
+                    Some(item) => item,
+                    None => return,
+                },
+            }
+        };
         let started = Instant::now();
         let head_snapshot = head.read().await.clone();
         let ticks = (item.start..item.start.saturating_add(item.count)).collect::<Vec<_>>();
@@ -2542,11 +2521,8 @@ fn node_error_is_peer_specific(error: &node::Error) -> bool {
 }
 
 fn required_quorum(digest: &[u8; 32]) -> usize {
-    if digest == &ZERO_DIGEST {
-        EMPTY_TICK_QUORUM
-    } else {
-        QUORUM
-    }
+    let _ = digest;
+    QUORUM
 }
 
 /// Picks the quorum group after deduplication without verifying signatures for
@@ -2558,33 +2534,37 @@ fn required_quorum(digest: &[u8; 32]) -> usize {
 /// largest candidate falls short, the next candidate is tried. Multiple
 /// verified candidates are a protocol error rather than a silent winner.
 #[doc(hidden)]
+pub struct ConsensusGroup<'a> {
+    pub digest: [u8; 32],
+    pub count: usize,
+    pub votes: Vec<&'a Tick>,
+}
+
 pub fn select_consensus_group<'a>(
     tick_number: u32,
     votes: &[&'a Tick],
     required_for: impl Fn(&[u8; 32]) -> usize,
     verified_count: impl Fn(&[&'a Tick], usize) -> usize,
-) -> Result<([u8; 32], usize)> {
+) -> Result<ConsensusGroup<'a>> {
     let mut groups = BTreeMap::<VoteGroupKey, Vec<&'a Tick>>::new();
     for vote in votes {
-        groups
-            .entry(vote.transaction_digest)
-            .or_default()
-            .push(*vote);
+        groups.entry(vote.alignment()).or_default().push(*vote);
     }
 
     let mut candidates = groups
         .into_iter()
-        .map(|(digest, votes)| {
+        .map(|(alignment, votes)| {
+            let digest = alignment.transaction_digest;
             let required = required_for(&digest);
-            (votes.len(), required, digest, votes)
+            (votes.len(), required, alignment, digest, votes)
         })
         .collect::<Vec<_>>();
-    // Descending size; the digest breaks ties deterministically.
+    // Descending size; the alignment breaks ties deterministically.
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then(a.2.cmp(&b.2)));
 
     let mut winner = None;
     let mut winners = 0usize;
-    for (raw, required, digest, group) in &candidates {
+    for (raw, required, _, digest, group) in &candidates {
         if *raw < *required {
             continue;
         }
@@ -2594,7 +2574,11 @@ pub fn select_consensus_group<'a>(
         }
         winners += 1;
         if winner.is_none() {
-            winner = Some((*digest, valid));
+            winner = Some(ConsensusGroup {
+                digest: *digest,
+                count: valid,
+                votes: group.clone(),
+            });
         }
     }
     if winners > 1 {
@@ -2605,7 +2589,7 @@ pub fn select_consensus_group<'a>(
     winner.ok_or_else(|| {
         let (best, required) = candidates
             .first()
-            .map(|(raw, required, _, _)| (*raw, *required))
+            .map(|(raw, required, _, _, _)| (*raw, *required))
             .unwrap_or((0, QUORUM));
         Error::Verification(format!(
             "tick {tick_number} has {best} aligned votes, needs {required}"
@@ -3040,17 +3024,20 @@ mod tests {
     #[test]
     fn dispatch_window_never_runs_past_the_head_or_window() {
         assert_eq!(dispatch_upper_bound(100, 1_000, 64), Some(163));
-        assert_eq!(dispatch_upper_bound(100, 120, 64), Some(112));
+        assert_eq!(dispatch_upper_bound(100, 120, 64), Some(119));
         assert_eq!(
             dispatch_upper_bound(117, 125, 1),
             Some(117),
-            "the live vote lag is reserved from the head"
+            "the in-progress tick is reserved from the head"
         );
         assert_eq!(dispatch_upper_bound(100, 99, 64), None);
-        assert_eq!(dispatch_upper_bound(u32::MAX - 1, u32::MAX, 64), None);
+        assert_eq!(
+            dispatch_upper_bound(u32::MAX - 1, u32::MAX, 64),
+            Some(u32::MAX - 1)
+        );
         assert_eq!(
             dispatch_upper_bound(u32::MAX - 9, u32::MAX, 64),
-            Some(u32::MAX - 8)
+            Some(u32::MAX - 1)
         );
     }
 

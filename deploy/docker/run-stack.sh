@@ -217,7 +217,6 @@ EOF
     -e "INDEXER_WRITE_BATCH=${INDEXER_WRITE_BATCH:-128}" \
     -e "INDEXER_WRITE_FLUSH_MS=${INDEXER_WRITE_FLUSH_MS:-250}" \
     -e "INDEXER_DISCOVER_PEERS=${INDEXER_DISCOVER_PEERS:-false}" \
-    -e "QUBIC_ARCHIVE_URL=${QUBIC_ARCHIVE_URL:-https://rpc.qubic.org/query/v1}" \
     -e "GLYPH_VERIFY_SIGNATURES=${GLYPH_VERIFY_SIGNATURES:-false}" \
     "$image" indexer >/dev/null
 

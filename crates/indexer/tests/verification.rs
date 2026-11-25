@@ -162,18 +162,18 @@ fn non_empty_tick_needs_451_aligned_votes() {
 }
 
 #[test]
-fn empty_tick_needs_226_votes_and_no_transactions() {
+fn empty_tick_needs_a_full_quorum_and_no_transactions() {
     let data = tick_data(&[]);
-    let votes = (0..226)
+    let votes = (0..451)
         .map(|index| vote(index, ZERO_DIGEST))
         .collect::<Vec<_>>();
     verify_bundle(
         bundle(data.clone(), votes, Vec::new(), empty_ranges(), Vec::new()),
         false,
     )
-    .expect("226 empty votes should reach quorum");
+    .expect("451 empty votes should reach quorum");
 
-    let votes = (0..225)
+    let votes = (0..450)
         .map(|index| vote(index, ZERO_DIGEST))
         .collect::<Vec<_>>();
     assert!(
@@ -187,7 +187,7 @@ fn empty_tick_needs_226_votes_and_no_transactions() {
     // A zero transaction digest with a non-zero transaction slot is a lie.
     let tx = transaction();
     let data = tick_data(&[(0, tx.hash())]);
-    let votes = (0..226)
+    let votes = (0..451)
         .map(|index| vote(index, ZERO_DIGEST))
         .collect::<Vec<_>>();
     assert!(
@@ -231,7 +231,7 @@ fn vote_digest_must_match_tick_data() {
 #[test]
 fn tampered_log_body_is_rejected() {
     let data = tick_data(&[]);
-    let votes = (0..226)
+    let votes = (0..451)
         .map(|index| vote(index, ZERO_DIGEST))
         .collect::<Vec<_>>();
     let mut ranges = empty_ranges();
@@ -253,7 +253,7 @@ fn tampered_log_body_is_rejected() {
 #[test]
 fn log_outside_declared_ranges_is_kept_with_a_warning() {
     let data = tick_data(&[]);
-    let votes = (0..226)
+    let votes = (0..451)
         .map(|index| vote(index, ZERO_DIGEST))
         .collect::<Vec<_>>();
     let body = vec![1, 2, 3];
@@ -314,10 +314,10 @@ fn largest_vote_group_is_selected_before_verification() {
     votes.extend((100..108).map(|index| vote(index, smaller)));
     let votes = votes.iter().collect::<Vec<_>>();
 
-    let (digest, count) =
+    let consensus =
         select_consensus_group(TICK, &votes, |_| 10, |group, _| group.len()).expect("consensus");
-    assert_eq!(digest, largest);
-    assert_eq!(count, 30);
+    assert_eq!(consensus.digest, largest);
+    assert_eq!(consensus.count, 30);
 }
 
 #[test]
@@ -331,7 +331,7 @@ fn invalid_largest_group_falls_back_to_valid_smaller_group() {
     let votes = votes.iter().collect::<Vec<_>>();
 
     // The largest group has the most votes but none of its signatures verify.
-    let (digest, count) = select_consensus_group(
+    let consensus = select_consensus_group(
         TICK,
         &votes,
         |_| 10,
@@ -344,8 +344,22 @@ fn invalid_largest_group_falls_back_to_valid_smaller_group() {
         },
     )
     .expect("fallback to the smaller valid group");
-    assert_eq!(digest, valid);
-    assert_eq!(count, 15);
+    assert_eq!(consensus.digest, valid);
+    assert_eq!(consensus.count, 15);
+}
+
+#[test]
+fn mismatched_timestamps_do_not_form_a_quorum() {
+    let digest = [0xAA; 32];
+    let mut votes = (0..20).map(|index| vote(index, digest)).collect::<Vec<_>>();
+    for vote in votes.iter_mut().skip(10) {
+        vote.millisecond = 999;
+    }
+    let votes = votes.iter().collect::<Vec<_>>();
+    assert!(
+        select_consensus_group(TICK, &votes, |_| 11, |group, _| group.len()).is_err(),
+        "two ten-vote timestamps must not satisfy an eleven-vote quorum"
+    );
 }
 
 #[test]

@@ -197,6 +197,22 @@ pub struct Tick {
     pub signature: [u8; 64],
 }
 
+/// Fields that must match for votes to count toward the same quorum.
+///
+/// A computor's salted fields and signature are unique to that computor, but
+/// the timestamp, previous state digests, and transaction digest are chain
+/// state. Qubic counts a vote only when it matches the etalon tick on these
+/// fields. Keeping the key explicit prevents unrelated zero-digest votes from
+/// being counted as an empty-tick quorum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TickAlignment {
+    pub timestamp: u64,
+    pub prev_spectrum_digest: [u8; 32],
+    pub prev_universe_digest: [u8; 32],
+    pub prev_computer_digest: [u8; 32],
+    pub transaction_digest: [u8; 32],
+}
+
 impl Tick {
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() != TICK_SIZE {
@@ -277,6 +293,24 @@ impl Tick {
         self.transaction_digest == ZERO_DIGEST
     }
 
+    /// The chain-state fields that must agree for a quorum.
+    pub fn alignment(&self) -> TickAlignment {
+        let timestamp = u64::from(self.millisecond)
+            | (u64::from(self.second) << 16)
+            | (u64::from(self.minute) << 24)
+            | (u64::from(self.hour) << 32)
+            | (u64::from(self.day) << 40)
+            | (u64::from(self.month) << 48)
+            | (u64::from(self.year) << 56);
+        TickAlignment {
+            timestamp,
+            prev_spectrum_digest: self.prev_spectrum_digest,
+            prev_universe_digest: self.prev_universe_digest,
+            prev_computer_digest: self.prev_computer_digest,
+            transaction_digest: self.transaction_digest,
+        }
+    }
+
     /// Timestamp encoded by the tick as a Unix timestamp in milliseconds.
     pub fn timestamp_millis(&self) -> i64 {
         let year = 2000i32 + self.year as i32;
@@ -315,6 +349,28 @@ pub struct TickData {
 }
 
 impl TickData {
+    /// Builds the canonical payload for a tick whose quorum transaction digest
+    /// is zero. Core invalidates the real tick-data row for empty ticks, so the
+    /// payload has zero transaction slots, timelock, fees, and signature.
+    pub fn empty_for_tick(tick: u32, epoch: u16, vote: &Tick) -> Self {
+        Self {
+            computor_index: (tick % COMPUTOR_COUNT as u32) as u16,
+            epoch,
+            tick,
+            millisecond: vote.millisecond,
+            second: vote.second,
+            minute: vote.minute,
+            hour: vote.hour,
+            day: vote.day,
+            month: vote.month,
+            year: vote.year,
+            timelock: [0; 32],
+            transaction_digests: vec![[0; 32]; TX_PER_TICK],
+            contract_fees: vec![0; MAX_CONTRACTS],
+            signature: [0; 64],
+        }
+    }
+
     pub fn decode(payload: &[u8]) -> Result<Self> {
         if payload.len() != TICK_DATA_SIZE {
             return Err(Error::InvalidPacket(format!(

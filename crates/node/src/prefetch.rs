@@ -13,7 +13,7 @@
 
 use super::*;
 use qubic::messages::{
-    COMPUTOR_COUNT, EMPTY_TICK_QUORUM, LogRanges, TX_PER_TICK, Tick, TickData, Transaction,
+    COMPUTOR_COUNT, LogRanges, QUORUM, TX_PER_TICK, Tick, TickData, Transaction,
     request_all_log_ranges, request_logs, request_quorum_tick, request_tick_data,
     request_tick_transactions,
 };
@@ -22,8 +22,10 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Bound a batch so one worker cannot buffer an unbounded number of votes or
-/// log probes. The dispatcher uses a smaller default.
-const MAX_PREFETCH_TICKS: usize = 256;
+/// log probes. Qubic's peer response queue holds 65,536 packets; a batch of 64
+/// leaves room for the peer's other clients while keeping every vote response
+/// addressable.
+const MAX_PREFETCH_TICKS: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 enum MainStream {
@@ -182,96 +184,6 @@ impl Peer {
             }
         }
 
-        if !missing.is_empty() {
-            let archive = self.archive.clone();
-            let head = match archive.as_ref() {
-                Some(archive) => match archive.head().await {
-                    Ok(head) => Some(head),
-                    Err(error) => {
-                        tracing::warn!(%error, "public archive head is unavailable");
-                        None
-                    }
-                },
-                None => None,
-            };
-            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
-            let mut tasks = tokio::task::JoinSet::new();
-            for (index, tick) in missing {
-                let archive = archive.clone();
-                let fallback = fallback.clone();
-                let semaphore = semaphore.clone();
-                tasks.spawn(async move {
-                    let _permit = semaphore
-                        .acquire()
-                        .await
-                        .expect("tick-data semaphore is never closed");
-                    let archived = match archive.as_ref() {
-                        Some(archive) => match head {
-                            Some(head) => archive.tick_data_at(tick, head).await,
-                            None => {
-                                Err(Error::ArchiveNotReady("archive head is unavailable".into()))
-                            }
-                        },
-                        None => Err(Error::ArchiveNotAvailable(
-                            "archive is not configured".into(),
-                        )),
-                    };
-                    match archived {
-                        Ok(data) => (index, tick, Ok(data)),
-                        Err(archive_error) => {
-                            let Some(fallback) = fallback.as_ref() else {
-                                return (index, tick, Err(archive_error));
-                            };
-                            match fallback.tick_data(tick).await {
-                                Ok(data) => (index, tick, Ok(data)),
-                                Err(peer_error) => {
-                                    tracing::warn!(
-                                        tick,
-                                        archive = %archive_error,
-                                        peers = %peer_error,
-                                        "no source supplied missing tick data"
-                                    );
-                                    (index, tick, Err(peer_error))
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            while let Some(joined) = tasks.join_next().await {
-                match joined {
-                    Ok((index, _tick, Ok(tick_data))) => {
-                        if let Some(part) = parts[index].as_mut() {
-                            part.tick_data = Some(tick_data);
-                        }
-                    }
-                    Ok((index, tick, Err(_error))) => {
-                        let empty_votes = parts[index].as_ref().is_some_and(|part| {
-                            !part.votes.is_empty()
-                                && part.votes.iter().all(|vote| vote.is_empty_vote())
-                                && part
-                                    .votes
-                                    .iter()
-                                    .map(|vote| vote.computor_index)
-                                    .collect::<std::collections::HashSet<_>>()
-                                    .len()
-                                    >= EMPTY_TICK_QUORUM
-                        });
-                        if empty_votes {
-                            if let Some(part) = parts[index].as_mut() {
-                                part.tick_data = empty_tick_from_votes(&part.votes, tick).ok();
-                            }
-                        } else {
-                            results[index] = Some(Err(Error::MissingNonEmptyTick { tick }));
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "tick-data fallback task failed");
-                    }
-                }
-            }
-        }
-
         if !missing_votes.is_empty() {
             if let Some(fallback) = fallback.as_ref() {
                 let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
@@ -302,6 +214,67 @@ impl Peer {
                         Err(error) => {
                             tracing::warn!(%error, "vote fallback task failed");
                         }
+                    }
+                }
+            }
+        }
+
+        if !missing.is_empty() {
+            let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(8));
+            let mut tasks = tokio::task::JoinSet::new();
+            for (index, tick) in missing {
+                let fallback = fallback.clone();
+                let semaphore = semaphore.clone();
+                tasks.spawn(async move {
+                    let _permit = semaphore
+                        .acquire()
+                        .await
+                        .expect("tick-data semaphore is never closed");
+                    let Some(fallback) = fallback.as_ref() else {
+                        return (index, tick, Err(Error::NoPeers));
+                    };
+                    match fallback.tick_data(tick).await {
+                        Ok(data) => (index, tick, Ok(data)),
+                        Err(error) => {
+                            tracing::warn!(
+                                tick,
+                                %error,
+                                "no peer supplied missing tick data"
+                            );
+                            (index, tick, Err(error))
+                        }
+                    }
+                });
+            }
+            while let Some(joined) = tasks.join_next().await {
+                match joined {
+                    Ok((index, _tick, Ok(tick_data))) => {
+                        if let Some(part) = parts[index].as_mut() {
+                            part.tick_data = Some(tick_data);
+                        }
+                    }
+                    Ok((index, tick, Err(_error))) => {
+                        let empty_votes = parts[index].as_ref().is_some_and(|part| {
+                            !part.votes.is_empty()
+                                && part.votes.iter().all(|vote| vote.is_empty_vote())
+                                && part
+                                    .votes
+                                    .iter()
+                                    .map(|vote| vote.computor_index)
+                                    .collect::<std::collections::HashSet<_>>()
+                                    .len()
+                                    >= QUORUM
+                        });
+                        if empty_votes {
+                            if let Some(part) = parts[index].as_mut() {
+                                part.tick_data = empty_tick_from_votes(&part.votes, tick).ok();
+                            }
+                        } else {
+                            results[index] = Some(Err(Error::MissingNonEmptyTick { tick }));
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "tick-data fallback task failed");
                     }
                 }
             }
@@ -1014,32 +987,4 @@ fn finish_decoded(part: MainParts) -> Result<DecodedTick> {
         transactions: part.transactions,
         warnings: Vec::new(),
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::net::SocketAddr;
-
-    use super::*;
-
-    #[tokio::test]
-    #[ignore = "connects to a live Qubic peer and the public archive"]
-    async fn prefetch_recovers_missing_tick_data_from_archive() {
-        let config = PeerConfig::new("198.27.75.81:21841".parse::<SocketAddr>().unwrap())
-            .with_archive_url("https://rpc.qubic.org/query/v1");
-        let mut peer = Peer::connect(config).await.expect("peer");
-        let head = peer.head().await.expect("head");
-        let computors = peer.computors().await.expect("computors");
-        let bundles = peer
-            .prefetch_bundles(&[92_261_883], head, computors, None)
-            .await
-            .expect("prefetch");
-        let bundle = bundles
-            .into_iter()
-            .next()
-            .expect("one bundle")
-            .expect("tick");
-        assert_eq!(bundle.tick_data.tick, 92_261_883);
-        assert!(bundle.tick_data.non_empty_transactions().count() > 0);
-    }
 }

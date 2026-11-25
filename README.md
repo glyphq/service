@@ -141,12 +141,12 @@ Relevant settings:
 | --- | --- | --- |
 | `INDEXER_FETCH_CONCURRENCY` | `32` | Fetch workers, balanced across healthy peers |
 | `INDEXER_FETCH_WINDOW` | `512` | Maximum tick bundles in flight or buffered |
+| `INDEXER_CONNECTIONS_PER_PEER` | `2` | Concurrent TCP connections to one peer |
 | `INDEXER_WRITE_BATCH` | `128` | Maximum ticks per ClickHouse insert batch |
 | `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before a partial batch is flushed |
 | `INDEXER_VERIFY_CONCURRENCY` | CPU count minus one | Concurrent signature-verification tasks |
 | `INDEXER_POLL_MS` | `750` | Head poll interval when caught up |
-| `INDEXER_MAX_TICK_ATTEMPTS` | `4` | Skip a tick when every peer and the archive report that its tick data does not exist |
-| `QUBIC_ARCHIVE_URL` | `https://rpc.qubic.org/query/v1` | Qubic Query API used when peers no longer serve a tick's data |
+| `INDEXER_MAX_TICK_ATTEMPTS` | `4` | Skip a tick when every peer reports that its tick data does not exist |
 | `GLYPH_VERIFY_SIGNATURES` | `false` | Verify SchnorrQ signatures in addition to quorum digests |
 
 The indexer pipelines tick data, quorum votes, and tick transactions on one
@@ -165,13 +165,10 @@ all ~451 votes caps catch-up near one tick per second. Pass `--verify-signatures
 `GLYPH_VERIFY_SIGNATURES=true`) when you want cryptographic evidence from the votes,
 tick data, and transactions in addition to the quorum agreement.
 
-Some finalized ticks are absent from every peer's tick-data storage even though their
-votes and transactions remain. The indexer recovers those ticks from the Qubic Query
-API configured by `QUBIC_ARCHIVE_URL` and checks the reconstructed tick-data digest
-against the quorum vote digest. Truly empty ticks are synthesized from their empty
-quorum votes without a network round trip. If both paths fail and the tick is still
-unavailable after `INDEXER_MAX_TICK_ATTEMPTS`, the indexer logs and skips it so the
-pipeline keeps moving. Transient failures such as timeouts and not-synchronized peers
+Tick data comes only from peers. Truly empty ticks are synthesized from their empty
+quorum votes, and a tick is never marked empty while any vote is non-empty. If a
+non-empty tick's data is not available from any peer yet, the indexer waits instead of
+writing an empty tick. Transient failures such as timeouts and not-synchronized peers
 keep retrying.
 
 ## Configuration

@@ -116,6 +116,7 @@ mod tests {
                 contract_fees: Vec::new(),
                 signature: [0; 64],
             },
+            tick_digest: [0; 32],
             votes: vec![vote; votes],
             transactions: Vec::new(),
             computors: Computors {

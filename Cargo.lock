@@ -1358,12 +1358,9 @@ name = "node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
- "chrono",
  "hex",
  "qubic",
  "rand 0.9.5",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
