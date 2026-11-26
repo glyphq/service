@@ -24,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::ApiError;
 use crate::advanced::DecodedTransaction;
+use crate::peer::EntityInvalidator;
 use crate::webhook::Webhooks;
 
 /// The request path performs the first broadcast after inserting the entry.
@@ -79,6 +80,7 @@ pub struct Mempool {
     pool: NodePool,
     gateway: Arc<GatewayStore>,
     webhooks: Arc<Webhooks>,
+    invalidator: EntityInvalidator,
     config: Arc<MempoolConfig>,
     cancel: CancellationToken,
 }
@@ -89,6 +91,7 @@ impl Mempool {
         pool: NodePool,
         gateway: Arc<GatewayStore>,
         webhooks: Arc<Webhooks>,
+        invalidator: EntityInvalidator,
         config: MempoolConfig,
         cancel: CancellationToken,
     ) -> Self {
@@ -97,6 +100,7 @@ impl Mempool {
             pool,
             gateway,
             webhooks,
+            invalidator,
             config: Arc::new(config),
             cancel,
         }
@@ -278,6 +282,13 @@ impl Mempool {
                 continue;
             }
             if let Some(tick) = indexed.get(entry.hash.as_str()) {
+                // The index can expose a transaction before the writer has
+                // published its committed event. Drop balance, history, and
+                // lifecycle caches before the confirmed status becomes visible
+                // so every confirmed read is backed by post-commit data.
+                self.invalidator.invalidate(&entry.source, *tick);
+                self.invalidator.invalidate(&entry.destination, *tick);
+                self.invalidator.invalidate_transaction(&entry.hash);
                 entry.status = MempoolStatus::Confirmed;
                 entry.confirmed_tick = Some(*tick);
                 entry.confirmed_at = Some(now);
@@ -431,6 +442,7 @@ pub fn accepted(
     let broadcast = entry.broadcast_peers > 0;
     let broadcast_peers = entry.broadcast_peers;
     let status = entry.status.as_str();
+    let confirmed = entry.status == MempoolStatus::Confirmed;
     (
         StatusCode::ACCEPTED,
         [(header::CACHE_CONTROL, "no-store")],
@@ -441,7 +453,7 @@ pub fn accepted(
                 "status": status,
                 "broadcast": broadcast,
                 "broadcast_peers": broadcast_peers,
-                "confirmed": false,
+                "confirmed": confirmed,
                 "head_tick": head_tick,
                 "warnings": warnings,
                 "links": {

@@ -69,9 +69,8 @@ pub struct AppState {
     pub live_cache: Arc<peer::LiveCache>,
     /// Deduplicates background entity and wallet refreshes per identity.
     pub refreshes: Arc<peer::RefreshCoordinator>,
-    /// Identities changed by a committed tick, with the highest dirty tick.
-    /// Cached entities older than this tick must not be served.
-    pub dirty_entities: Arc<Mutex<HashMap<String, u32>>>,
+    /// Identities changed by a committed tick or confirmed broadcast.
+    pub invalidator: peer::EntityInvalidator,
     /// Cached index-wide counts. `network_stats` runs several `FINAL` counts,
     /// so multiple dashboard reads within a few seconds should share one query.
     pub stats_cache: Arc<tokio::sync::Mutex<Option<(Instant, store::NetworkStats)>>>,
@@ -81,6 +80,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(store: Arc<dyn Store>) -> Self {
+        let live_cache = Arc::new(peer::LiveCache::default());
         Self {
             store,
             hub: None,
@@ -96,9 +96,9 @@ impl AppState {
             gateway: None,
             mempool: None,
             webhooks: None,
-            live_cache: Arc::new(peer::LiveCache::default()),
+            invalidator: peer::EntityInvalidator::new(live_cache.clone()),
+            live_cache,
             refreshes: Arc::new(peer::RefreshCoordinator::default()),
-            dirty_entities: Arc::new(Mutex::new(HashMap::new())),
             stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
             metrics: Arc::new(metrics::Metrics::default()),
         }
@@ -111,35 +111,16 @@ impl AppState {
     /// Mark an identity as changed by a committed tick. Existing memory
     /// entries are dropped so the next read fetches a post-commit entity.
     pub fn invalidate_identity(&self, identity: &str, tick: u32) {
-        if identity.is_empty() {
-            return;
-        }
-        {
-            let mut dirty = self.dirty_entities.lock().expect("dirty identity lock");
-            let entry = dirty.entry(identity.to_string()).or_insert(tick);
-            *entry = (*entry).max(tick);
-        }
-        self.live_cache.remove(&entity_cache::cache_key(identity));
-        self.live_cache.remove(&wallet::wallet_cache_key(identity));
+        self.invalidator.invalidate(identity, tick);
     }
 
     pub fn dirty_entity_tick(&self, identity: &str) -> Option<u32> {
-        self.dirty_entities
-            .lock()
-            .expect("dirty identity lock")
-            .get(identity)
-            .copied()
+        self.invalidator.dirty_tick(identity)
     }
 
     /// Clears the dirty marker once an entity has been observed at or after it.
     pub fn clear_dirty_entity(&self, identity: &str, tick: u32) {
-        let mut dirty = self.dirty_entities.lock().expect("dirty identity lock");
-        if dirty
-            .get(identity)
-            .is_some_and(|dirty_tick| *dirty_tick <= tick)
-        {
-            dirty.remove(identity);
-        }
+        self.invalidator.clear(identity, tick);
     }
 
     /// Returns index-wide counts, reusing a recent snapshot. The mutex is held
@@ -446,6 +427,8 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         .unwrap_or(8)
         .clamp(1, 8);
     let pool = NodePool::new(peers.clone());
+    let live_cache = Arc::new(peer::LiveCache::default());
+    let invalidator = peer::EntityInvalidator::new(live_cache.clone());
     let archive = archive_from_env();
     let price_interval = std::env::var("PRICE_POLL_MS")
         .ok()
@@ -499,6 +482,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
                             pool.clone(),
                             gateway.clone(),
                             webhooks.clone(),
+                            invalidator.clone(),
                             mempool_config,
                             cancel.clone(),
                         ));
@@ -540,9 +524,9 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         gateway,
         mempool,
         webhooks,
-        live_cache: Arc::new(peer::LiveCache::default()),
+        live_cache,
+        invalidator,
         refreshes: Arc::new(peer::RefreshCoordinator::default()),
-        dirty_entities: Arc::new(Mutex::new(HashMap::new())),
         stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
         metrics: Arc::new(metrics::Metrics::default()),
     };

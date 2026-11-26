@@ -116,6 +116,13 @@ impl LiveCache {
         self.entries.lock().expect("live cache lock").remove(key);
     }
 
+    pub fn remove_prefix(&self, prefix: &str) {
+        self.entries
+            .lock()
+            .expect("live cache lock")
+            .retain(|key, _| !key.starts_with(prefix));
+    }
+
     /// Returns a cached value with its age, even when it is older than any
     /// freshness TTL. Callers use this for stale-while-revalidate.
     pub fn peek(&self, key: &str) -> Option<(Value, Duration)> {
@@ -218,6 +225,73 @@ impl Drop for RefreshGuard {
     }
 }
 
+/// Shared live-balance invalidation state.
+///
+/// Handlers, the committed-event subscriber, and the mempool confirmer all mark
+/// identities here. Reads compare the observed entity tick with the dirty tick,
+/// so a stale refresh cannot win a race with a confirmed transfer.
+#[derive(Clone)]
+pub struct EntityInvalidator {
+    cache: Arc<LiveCache>,
+    dirty: Arc<Mutex<HashMap<String, u32>>>,
+    generation: Arc<AtomicU64>,
+}
+
+impl EntityInvalidator {
+    pub fn new(cache: Arc<LiveCache>) -> Self {
+        Self {
+            cache,
+            dirty: Arc::new(Mutex::new(HashMap::new())),
+            generation: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn invalidate(&self, identity: &str, tick: u32) {
+        if identity.is_empty() {
+            return;
+        }
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        {
+            let mut dirty = self.dirty.lock().expect("dirty identity lock");
+            let entry = dirty.entry(identity.to_string()).or_insert(tick);
+            *entry = (*entry).max(tick);
+        }
+        self.cache.remove(&format!("entity:{identity}"));
+        self.cache.remove(&format!("wallet:{identity}"));
+        self.cache.remove(&format!("wallet-assets:{identity}"));
+    }
+
+    pub fn dirty_tick(&self, identity: &str) -> Option<u32> {
+        self.dirty
+            .lock()
+            .expect("dirty identity lock")
+            .get(identity)
+            .copied()
+    }
+
+    pub fn clear(&self, identity: &str, tick: u32) {
+        let mut dirty = self.dirty.lock().expect("dirty identity lock");
+        if dirty
+            .get(identity)
+            .is_some_and(|dirty_tick| *dirty_tick <= tick)
+        {
+            dirty.remove(identity);
+        }
+    }
+
+    /// Drop transaction-shaped reads that could still describe this hash as
+    /// pending after it is confirmed.
+    pub fn invalidate_transaction(&self, hash: &str) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.cache.remove_prefix(&format!("lifecycle:{hash}:"));
+        self.cache.remove_prefix("transactions?");
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,5 +320,38 @@ mod tests {
             assert_eq!(task.await.expect("task"), serde_json::json!({ "ok": true }));
         }
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn invalidator_drops_identity_entries_and_advances_generation() {
+        let cache = Arc::new(LiveCache::default());
+        cache.put("entity:alice", serde_json::json!({"balance": 1}));
+        cache.put("wallet:alice", serde_json::json!({"balance": 1}));
+        cache.put("wallet-assets:alice", serde_json::json!({}));
+        cache.put(
+            "lifecycle:hash:0",
+            serde_json::json!({"state": "broadcast"}),
+        );
+        cache.put("transactions?epoch=1:0", serde_json::json!([]));
+
+        let invalidator = EntityInvalidator::new(cache.clone());
+        let generation = invalidator.generation();
+        invalidator.invalidate("alice", 10);
+
+        assert_eq!(invalidator.generation(), generation + 1);
+        assert_eq!(invalidator.dirty_tick("alice"), Some(10));
+        assert!(cache.peek("entity:alice").is_none());
+        assert!(cache.peek("wallet:alice").is_none());
+        assert!(cache.peek("wallet-assets:alice").is_none());
+
+        invalidator.invalidate_transaction("hash");
+        assert_eq!(invalidator.generation(), generation + 2);
+        assert!(cache.peek("lifecycle:hash:0").is_none());
+        assert!(cache.peek("transactions?epoch=1:0").is_none());
+
+        invalidator.clear("alice", 9);
+        assert_eq!(invalidator.dirty_tick("alice"), Some(10));
+        invalidator.clear("alice", 10);
+        assert_eq!(invalidator.dirty_tick("alice"), None);
     }
 }

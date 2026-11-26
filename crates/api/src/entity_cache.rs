@@ -4,7 +4,7 @@
 //! refresh happens in the background. Only a completely unknown identity waits
 //! for the peer, and that wait is bounded.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use qubic::PublicKey;
@@ -228,18 +228,33 @@ pub async fn cached(state: &AppState, identity: &str) -> Result<Option<EntityRes
     }))
 }
 
-/// Returns an entity immediately when cached, otherwise performs one bounded
-/// peer lookup.
+/// Returns an entity immediately when cached, otherwise performs bounded peer
+/// lookups until a peer reaches the latest committed tick.
 pub async fn get_or_fetch(state: &AppState, identity: &str) -> Result<EntityResult, ApiError> {
     if let Some(result) = cached(state, identity).await? {
         return Ok(result);
     }
-    match tokio::time::timeout(FIRST_FETCH_TIMEOUT, refresh(state, identity)).await {
-        Ok(result) => result,
-        Err(_) => Err(ApiError::unavailable(format!(
-            "entity lookup for {identity} timed out"
-        ))),
+    let deadline = Instant::now() + FIRST_FETCH_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let result = match tokio::time::timeout(remaining, refresh(state, identity)).await {
+            Ok(result) => result?,
+            Err(_) => break,
+        };
+        let behind = state
+            .dirty_entity_tick(identity)
+            .is_some_and(|tick| result.entity.tick < tick);
+        if !behind {
+            return Ok(result);
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
+    Err(ApiError::unavailable(format!(
+        "entity lookup for {identity} timed out waiting for a peer to reach the committed tick"
+    )))
 }
 
 /// Starts a background refresh unless one is already running for this identity.

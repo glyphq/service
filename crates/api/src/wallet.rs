@@ -281,16 +281,27 @@ async fn wallet(
     }
     let cache_key = wallet_cache_key(&identity);
     if let Some((mut value, age)) = state.live_cache.peek(&cache_key) {
-        let stale = age >= WALLET_FRESH;
-        let refreshing = stale && spawn_wallet_refresh(state.clone(), identity.clone(), key);
-        decorate_wallet_cache(&mut value, stale, age.as_secs(), refreshing);
-        return Ok((
-            [(
-                header::CACHE_CONTROL,
-                HeaderValue::from_static(CACHE_HEADER),
-            )],
-            Json(value),
-        ));
+        let peer_tick = value
+            .get("meta")
+            .and_then(|meta| meta.get("peer_tick"))
+            .and_then(Value::as_u64);
+        let behind = peer_tick.is_some_and(|tick| {
+            state
+                .dirty_entity_tick(&identity)
+                .is_some_and(|dirty| tick < u64::from(dirty))
+        });
+        if !behind {
+            let stale = age >= WALLET_FRESH;
+            let refreshing = stale && spawn_wallet_refresh(state.clone(), identity.clone(), key);
+            decorate_wallet_cache(&mut value, stale, age.as_secs(), refreshing);
+            return Ok((
+                [(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(CACHE_HEADER),
+                )],
+                Json(value),
+            ));
+        }
     }
 
     let (body, cacheable) = build_wallet(&state, &identity, key).await?;

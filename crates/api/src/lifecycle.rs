@@ -56,7 +56,7 @@ async fn lifecycle(
     let hash = hash.trim().to_ascii_lowercase();
     let digest =
         qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
-    let cache_key = format!("lifecycle:{hash}");
+    let cache_key = format!("lifecycle:{hash}:{}", state.invalidator.generation());
     if let Some(value) = state.live_cache.get(&cache_key, Duration::from_secs(2)) {
         return Ok(([(header::CACHE_CONTROL, RECENT)], Json(value)));
     }

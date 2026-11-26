@@ -690,10 +690,11 @@ async fn transactions(
         params.epoch, params.tick, identity
     );
     let page = params.page().resolve(&fingerprint)?;
+    let generation = state.invalidator.generation();
     let body = state
         .live_cache
         .get_or_insert(
-            format!("{fingerprint}:{}:{}", page.limit, page.offset),
+            format!("{fingerprint}:{}:{}:{generation}", page.limit, page.offset),
             Duration::from_secs(2),
             || async {
                 let mut rows = fetch_transactions_page(&state, &filter, &page).await?;
@@ -867,12 +868,13 @@ async fn identity_transactions(
     let _ = qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
     let page = params.resolve(&format!("identities/{identity}/transactions"))?;
+    let generation = state.invalidator.generation();
     let body = state
         .live_cache
         .get_or_insert(
             format!(
-                "identity_transactions:{identity}:{}:{}",
-                page.limit, page.offset
+                "identity_transactions:{identity}:{}:{}:{generation}",
+                page.limit, page.offset,
             ),
             Duration::from_secs(2),
             || async {
@@ -902,12 +904,13 @@ async fn identity_activity(
     qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
     let page = params.resolve(&format!("identities/{identity}/activity"))?;
+    let generation = state.invalidator.generation();
     let body = state
         .live_cache
         .get_or_insert(
             format!(
-                "identity_activity:{identity}:{}:{}",
-                page.limit, page.offset
+                "identity_activity:{identity}:{}:{}:{generation}",
+                page.limit, page.offset,
             ),
             Duration::from_secs(2),
             || async {
@@ -936,10 +939,14 @@ async fn identity_events(
     qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
     let page = params.resolve(&format!("identities/{identity}/events"))?;
+    let generation = state.invalidator.generation();
     let body = state
         .live_cache
         .get_or_insert(
-            format!("identity_events:{identity}:{}:{}", page.limit, page.offset),
+            format!(
+                "identity_events:{identity}:{}:{}:{generation}",
+                page.limit, page.offset
+            ),
             Duration::from_secs(2),
             || async {
                 let mut rows = state

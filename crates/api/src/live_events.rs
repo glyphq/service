@@ -13,7 +13,12 @@ use tokio_util::sync::CancellationToken;
 use crate::AppState;
 
 pub fn spawn(state: AppState, cancel: CancellationToken) -> Option<tokio::task::JoinHandle<()>> {
-    bus::BusConfig::from_env()?;
+    if bus::BusConfig::from_env().is_none() {
+        tracing::warn!(
+            "NATS_URL is not configured; live balances will wait for the freshness TTL after commits"
+        );
+        return None;
+    }
     Some(tokio::spawn(async move {
         while !cancel.is_cancelled() {
             if let Err(error) = consume(&state, &cancel).await {
@@ -34,6 +39,10 @@ async fn consume(state: &AppState, cancel: &CancellationToken) -> anyhow::Result
         bus::BusConfig::from_env().ok_or_else(|| anyhow::anyhow!("NATS_URL is not configured"))?;
     let bus = bus::Bus::connect(config).await?;
     let mut subscriber = bus.client().subscribe(bus::COMMITTED_SUBJECT).await?;
+    tracing::info!(
+        subject = bus::COMMITTED_SUBJECT,
+        "subscribed to committed events"
+    );
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
