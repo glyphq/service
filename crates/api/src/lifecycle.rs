@@ -91,18 +91,31 @@ async fn lifecycle(
         )));
     }
 
-    let target_tick = indexed
-        .as_ref()
-        .map(|row| row.tick)
+    let indexed_tick = indexed.as_ref().map(|row| row.tick);
+    let network_tick = network.as_ref().map(|transaction| transaction.tick);
+    let target_tick = indexed_tick
         .or_else(|| mempool.as_ref().map(|entry| entry.tick))
-        .or_else(|| network.as_ref().map(|transaction| transaction.tick));
-    let included_tick = indexed
-        .as_ref()
-        .map(|row| row.tick)
-        .or_else(|| mempool.as_ref().and_then(|entry| entry.confirmed_tick))
-        .or_else(|| network.as_ref().map(|transaction| transaction.tick));
+        .or(network_tick);
+    // "confirmed" means the explorer index can already serve the transaction
+    // and its balances. A peer that knows the hash is reported separately
+    // until the writer commits the tick.
+    let included_tick = indexed_tick.or_else(|| {
+        mempool.as_ref().and_then(|entry| {
+            entry.confirmed_tick.or_else(|| {
+                (entry.status == store::gateway::MempoolStatus::Confirmed).then_some(entry.tick)
+            })
+        })
+    });
+    let network_seen = indexed.is_none() && network_tick.is_some();
+    if let Some(row) = &indexed {
+        // Serving a confirmed transaction is the user-visible confirmation
+        // point. Drop stale balances before returning so the next wallet or
+        // identity read reflects the committed tick.
+        state.invalidator.invalidate(&row.source, row.tick);
+        state.invalidator.invalidate(&row.destination, row.tick);
+    }
     let current = current_tick(&state).await;
-    let money_flew = match included_tick {
+    let money_flew = match indexed_tick.or(network_tick) {
         Some(tick) => peer_money_flew(&state, tick, &digest).await,
         None => None,
     };
@@ -139,6 +152,7 @@ async fn lifecycle(
         included_tick,
         target_tick,
         current,
+        network_seen,
     );
     let confirmations = included_tick
         .zip(current)
@@ -149,6 +163,17 @@ async fn lifecycle(
         "state": state_name,
         "target_tick": target_tick,
         "included_tick": included_tick,
+        "indexed": indexed.is_some(),
+        "network_included_tick": network_tick,
+        "confirmation_source": if indexed.is_some() {
+            "index"
+        } else if included_tick.is_some() {
+            "tracking"
+        } else if network_seen {
+            "peer"
+        } else {
+            "none"
+        },
         "current_tick": current,
         "confirmations": confirmations,
         "money_flew": money_flew,
@@ -167,6 +192,7 @@ async fn lifecycle(
             mempool.as_ref(),
             target_tick,
             included_tick,
+            network_tick,
             current,
         ),
     });
@@ -179,6 +205,7 @@ async fn lifecycle(
             "note": "money_flew is only known when a peer running the tx-status add-on answers. It is null otherwise, not false."
         }
     });
+    let cache_key = format!("lifecycle:{hash}:{}", state.invalidator.generation());
     state.live_cache.put(cache_key, body.clone());
     Ok(([(header::CACHE_CONTROL, RECENT)], Json(body)))
 }
@@ -189,6 +216,7 @@ fn lifecycle_state(
     included_tick: Option<u32>,
     target_tick: Option<u32>,
     current_tick: Option<u32>,
+    network_seen: bool,
 ) -> &'static str {
     if indexed || included_tick.is_some() {
         return "confirmed";
@@ -202,6 +230,9 @@ fn lifecycle_state(
             store::gateway::MempoolStatus::Failed => "failed",
             store::gateway::MempoolStatus::Cancelled => "cancelled",
         };
+    }
+    if network_seen {
+        return "network_seen";
     }
     if let (Some(target), Some(current)) = (target_tick, current_tick) {
         if target <= current {
@@ -256,6 +287,7 @@ fn timeline_json(
     mempool: Option<&store::gateway::MempoolEntry>,
     target_tick: Option<u32>,
     included_tick: Option<u32>,
+    network_tick: Option<u32>,
     current_tick: Option<u32>,
 ) -> Vec<Value> {
     let mut timeline = Vec::new();
@@ -295,6 +327,12 @@ fn timeline_json(
             timeline.push(json!({
                 "stage": "included",
                 "tick": tick,
+            }));
+        } else if let Some(tick) = network_tick {
+            timeline.push(json!({
+                "stage": "network_seen",
+                "tick": tick,
+                "source": "peer",
             }));
         }
     }
@@ -790,5 +828,17 @@ mod tests {
     fn target_tick_in_the_past_is_always_high_risk() {
         let recommendation = risk_recommendation(1.0, Some(-1), None, None);
         assert_eq!(recommendation, "rebuild with a future target tick");
+    }
+
+    #[test]
+    fn lifecycle_confirms_only_when_the_explorer_can_serve_the_transaction() {
+        assert_eq!(
+            lifecycle_state(false, None, None, Some(7), Some(8), true),
+            "network_seen"
+        );
+        assert_eq!(
+            lifecycle_state(false, None, Some(7), Some(7), Some(8), false),
+            "confirmed"
+        );
     }
 }

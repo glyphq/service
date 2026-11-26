@@ -234,6 +234,7 @@ impl Drop for RefreshGuard {
 pub struct EntityInvalidator {
     cache: Arc<LiveCache>,
     dirty: Arc<Mutex<HashMap<String, u32>>>,
+    applied: Arc<Mutex<HashMap<String, u32>>>,
     generation: Arc<AtomicU64>,
 }
 
@@ -242,6 +243,7 @@ impl EntityInvalidator {
         Self {
             cache,
             dirty: Arc::new(Mutex::new(HashMap::new())),
+            applied: Arc::new(Mutex::new(HashMap::new())),
             generation: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -249,6 +251,14 @@ impl EntityInvalidator {
     pub fn invalidate(&self, identity: &str, tick: u32) {
         if identity.is_empty() {
             return;
+        }
+        {
+            let mut applied = self.applied.lock().expect("applied identity lock");
+            let entry = applied.entry(identity.to_string()).or_insert(0);
+            if tick <= *entry {
+                return;
+            }
+            *entry = tick;
         }
         self.generation.fetch_add(1, Ordering::Relaxed);
         {
@@ -350,6 +360,9 @@ mod tests {
         assert!(cache.peek("transactions?epoch=1:0").is_none());
 
         invalidator.clear("alice", 9);
+        assert_eq!(invalidator.dirty_tick("alice"), Some(10));
+        invalidator.invalidate("alice", 9);
+        assert_eq!(invalidator.generation(), generation + 2);
         assert_eq!(invalidator.dirty_tick("alice"), Some(10));
         invalidator.clear("alice", 10);
         assert_eq!(invalidator.dirty_tick("alice"), None);
