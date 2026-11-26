@@ -23,14 +23,19 @@ use node::{AssetRecordResponse, Peer};
 use qubic::PublicKey;
 use qubic::messages::{
     ASSET_REQUEST_ANY_OWNER, ASSET_REQUEST_ANY_OWNERSHIP_MANAGING_CONTRACT,
-    ASSET_REQUEST_OWNERSHIP, AssetIssuanceRecord, AssetRecord, AssetRecordKind, EntityRecord,
-    RequestAssets, RespondEntity, RespondIssuedAssets, RespondOwnedAssets, RespondPossessedAssets,
+    ASSET_REQUEST_OWNERSHIP, AssetIssuanceRecord, AssetRecord, AssetRecordKind, RequestAssets,
+    RespondIssuedAssets, RespondOwnedAssets, RespondPossessedAssets,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::dto::PageParams;
 use crate::{ApiError, AppState};
+
+const WALLET_FRESH: Duration = Duration::from_secs(60);
+const ASSET_FRESH: Duration = Duration::from_secs(60);
+const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
+const CACHE_HEADER: &str = "public, max-age=30, stale-while-revalidate=60";
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -153,24 +158,8 @@ fn issuance_fields(record: &AssetIssuanceRecord) -> Value {
     })
 }
 
-fn entity_value(response: &RespondEntity) -> Value {
-    let entity: &EntityRecord = &response.entity;
-    json!({
-        "spectrum_index": response.spectrum_index,
-        "tick": response.tick,
-        "public_key": PublicKey(entity.public_key).to_hex(),
-        "balance": entity.incoming_amount.saturating_sub(entity.outgoing_amount),
-        "incoming_amount": entity.incoming_amount,
-        "outgoing_amount": entity.outgoing_amount,
-        "incoming_transfers": entity.number_of_incoming_transfers,
-        "outgoing_transfers": entity.number_of_outgoing_transfers,
-        "latest_incoming_tick": entity.latest_incoming_transfer_tick,
-        "latest_outgoing_tick": entity.latest_outgoing_transfer_tick,
-    })
-}
-
-fn truncation_warning(response: &RespondEntity) -> Option<&'static str> {
-    (response.spectrum_index < 0)
+fn truncation_warning(entity: &crate::entity_cache::CachedEntity) -> Option<&'static str> {
+    (entity.spectrum_index < 0)
         .then_some("identity has no spectrum entry on the peer; peer balances are unavailable")
 }
 
@@ -285,70 +274,259 @@ async fn wallet(
     Path(identity): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (identity, key) = parse_identity(&identity)?;
-    let cache_key = format!("wallet:{identity}");
-    if let Some(value) = state.live_cache.get(&cache_key, Duration::from_secs(5)) {
+    if state.peers.is_empty() {
+        return Err(ApiError::unavailable(
+            "no QUBIC_PEERS configured for peer-backed routes",
+        ));
+    }
+    let cache_key = wallet_cache_key(&identity);
+    if let Some((mut value, age)) = state.live_cache.peek(&cache_key) {
+        let stale = age >= WALLET_FRESH;
+        let refreshing = stale && spawn_wallet_refresh(state.clone(), identity.clone(), key);
+        decorate_wallet_cache(&mut value, stale, age.as_secs(), refreshing);
         return Ok((
             [(
                 header::CACHE_CONTROL,
-                HeaderValue::from_static("public, max-age=2, stale-while-revalidate=5"),
+                HeaderValue::from_static(CACHE_HEADER),
             )],
             Json(value),
         ));
     }
-    let (local, entity_response, issued, owned, possessed, recent) = tokio::join!(
-        state.store.identity(&identity),
-        state.pool.entity(key.0),
-        state.pool.issued_assets(key.0),
-        state.pool.owned_assets(key.0),
-        state.pool.possessed_assets(key.0),
-        state.store.transactions_for_identity(&identity, 10, 0),
+
+    let (body, cacheable) = build_wallet(&state, &identity, key).await?;
+    if cacheable {
+        state.live_cache.put(cache_key, body.clone());
+    }
+    Ok((
+        [(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(CACHE_HEADER),
+        )],
+        Json(body),
+    ))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedAssets {
+    issued: Vec<Value>,
+    owned: Vec<Value>,
+    possessed: Vec<Value>,
+    observed_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl CachedAssets {
+    fn age_seconds(&self) -> u64 {
+        (chrono::Utc::now() - self.observed_at).num_seconds().max(0) as u64
+    }
+
+    fn data(&self) -> Value {
+        json!({
+            "issued": self.issued,
+            "owned": self.owned,
+            "possessed": self.possessed,
+        })
+    }
+
+    fn counts(&self) -> Value {
+        json!({
+            "issued": self.issued.len(),
+            "owned": self.owned.len(),
+            "possessed": self.possessed.len(),
+        })
+    }
+}
+
+struct AssetRead {
+    assets: CachedAssets,
+    stale: bool,
+    refreshing: bool,
+    warning: Option<String>,
+    cacheable: bool,
+}
+
+fn wallet_cache_key(identity: &str) -> String {
+    format!("wallet:{identity}")
+}
+
+fn assets_cache_key(identity: &str) -> String {
+    format!("wallet-assets:{identity}")
+}
+
+fn decorate_wallet_cache(value: &mut Value, stale: bool, age_seconds: u64, refreshing: bool) {
+    if let Some(meta) = value.get_mut("meta").and_then(Value::as_object_mut) {
+        meta.insert("cached".into(), json!(true));
+        meta.insert("stale".into(), json!(stale));
+        meta.insert("age_seconds".into(), json!(age_seconds));
+        meta.insert("refreshing".into(), json!(refreshing));
+    }
+}
+
+async fn build_wallet(
+    state: &AppState,
+    identity: &str,
+    key: PublicKey,
+) -> Result<(Value, bool), ApiError> {
+    let (local, entity, recent) = tokio::join!(
+        state.store.identity(identity),
+        crate::entity_cache::get_or_fetch(state, identity),
+        state.store.transactions_for_identity(identity, 10, 0),
     );
     let local = local?;
-    let entity_response = entity_response.map_err(|error| {
-        ApiError::unavailable(format!("entity lookup failed for {identity}: {error}"))
-    })?;
-    let warning = truncation_warning(&entity_response);
+    let entity = entity?;
+    let recent = recent?;
+    let warning = truncation_warning(&entity.entity);
     if warning.is_some() && local.is_none() {
         return Err(ApiError::not_found(format!(
             "identity {identity} is neither indexed nor in the peer spectrum"
         )));
     }
 
-    let issued = issued
-        .map_err(|error| ApiError::unavailable(format!("issued asset lookup failed: {error}")))?;
-    let owned = owned
-        .map_err(|error| ApiError::unavailable(format!("owned asset lookup failed: {error}")))?;
-    let possessed = possessed.map_err(|error| {
-        ApiError::unavailable(format!("possessed asset lookup failed: {error}"))
-    })?;
-    let recent = recent?;
-
+    let assets = load_assets(state, identity, key).await;
+    let warning = warning
+        .map(str::to_string)
+        .or_else(|| assets.warning.clone());
     let body = json!({
         "data": {
             "identity": identity,
             "public_key": key.to_hex(),
-            "entity": entity_value(&entity_response),
-            "assets": {
-                "issued": issued_list(&issued),
-                "owned": owned_list(&owned),
-                "possessed": possessed_list(&possessed),
-            },
+            "entity": entity.entity.data(),
+            "assets": assets.assets.data(),
             "recent": recent,
         },
         "meta": {
             "source": "peer+index",
-            "peer_tick": entity_response.tick,
+            "peer_tick": entity.entity.tick,
+            "entity_source": entity.meta.source,
+            "entity_stale": entity.meta.stale,
+            "entity_age_seconds": entity.meta.age_seconds,
+            "assets_source": if assets.stale { "snapshot" } else { "peer" },
+            "assets_stale": assets.stale,
+            "assets_age_seconds": assets.assets.age_seconds(),
+            "assets_refreshing": assets.refreshing,
+            "cached": false,
+            "stale": entity.meta.stale || assets.stale,
+            "age_seconds": entity.meta.age_seconds.max(assets.assets.age_seconds()),
+            "refreshing": entity.meta.refreshing || assets.refreshing,
             "warning": warning,
         }
     });
-    state.live_cache.put(cache_key, body.clone());
-    Ok((
-        [(
-            header::CACHE_CONTROL,
-            HeaderValue::from_static("public, max-age=2, stale-while-revalidate=5"),
-        )],
-        Json(body),
-    ))
+    Ok((body, assets.cacheable))
+}
+
+fn spawn_wallet_refresh(state: AppState, identity: String, key: PublicKey) -> bool {
+    let Some(guard) = state
+        .refreshes
+        .try_start(format!("wallet-refresh:{identity}"))
+    else {
+        return false;
+    };
+    tokio::spawn(async move {
+        let _guard = guard;
+        match build_wallet(&state, &identity, key).await {
+            Ok((body, true)) => state.live_cache.put(wallet_cache_key(&identity), body),
+            Ok((_, false)) => {}
+            Err(error) => tracing::debug!(%identity, %error, "background wallet refresh failed"),
+        }
+    });
+    true
+}
+
+async fn fetch_assets(state: &AppState, key: PublicKey) -> Result<CachedAssets, node::Error> {
+    let (issued, owned, possessed) = tokio::join!(
+        state.pool.issued_assets(key.0),
+        state.pool.owned_assets(key.0),
+        state.pool.possessed_assets(key.0),
+    );
+    Ok(CachedAssets {
+        issued: issued_list(&issued?),
+        owned: owned_list(&owned?),
+        possessed: possessed_list(&possessed?),
+        observed_at: chrono::Utc::now(),
+    })
+}
+
+async fn load_assets(state: &AppState, identity: &str, key: PublicKey) -> AssetRead {
+    let cache_key = assets_cache_key(identity);
+    if let Some((value, age)) = state.live_cache.peek(&cache_key) {
+        if let Ok(assets) = serde_json::from_value::<CachedAssets>(value) {
+            if age < ASSET_FRESH {
+                return AssetRead {
+                    assets,
+                    stale: false,
+                    refreshing: false,
+                    warning: None,
+                    cacheable: true,
+                };
+            }
+            let refreshing = spawn_assets_refresh(state.clone(), identity.to_string(), key);
+            return AssetRead {
+                assets,
+                stale: true,
+                refreshing,
+                warning: None,
+                cacheable: true,
+            };
+        }
+    }
+
+    match tokio::time::timeout(ASSET_FETCH_TIMEOUT, fetch_assets(state, key)).await {
+        Ok(Ok(assets)) => {
+            state.live_cache.put(
+                cache_key,
+                serde_json::to_value(&assets).unwrap_or(Value::Null),
+            );
+            AssetRead {
+                assets,
+                stale: false,
+                refreshing: false,
+                warning: None,
+                cacheable: true,
+            }
+        }
+        Ok(Err(error)) => AssetRead {
+            assets: empty_assets(),
+            stale: true,
+            refreshing: false,
+            warning: Some(format!("asset lookup failed: {error}")),
+            cacheable: false,
+        },
+        Err(_) => AssetRead {
+            assets: empty_assets(),
+            stale: true,
+            refreshing: false,
+            warning: Some("asset lookup timed out".into()),
+            cacheable: false,
+        },
+    }
+}
+
+fn empty_assets() -> CachedAssets {
+    CachedAssets {
+        issued: Vec::new(),
+        owned: Vec::new(),
+        possessed: Vec::new(),
+        observed_at: chrono::Utc::now(),
+    }
+}
+
+fn spawn_assets_refresh(state: AppState, identity: String, key: PublicKey) -> bool {
+    let Some(guard) = state
+        .refreshes
+        .try_start(format!("wallet-assets-refresh:{identity}"))
+    else {
+        return false;
+    };
+    tokio::spawn(async move {
+        let _guard = guard;
+        match fetch_assets(&state, key).await {
+            Ok(assets) => state.live_cache.put(
+                assets_cache_key(&identity),
+                serde_json::to_value(&assets).unwrap_or(Value::Null),
+            ),
+            Err(error) => tracing::debug!(%identity, %error, "background asset refresh failed"),
+        }
+    });
+    true
 }
 
 async fn wallet_assets(
@@ -368,29 +546,34 @@ async fn wallet_assets(
             )));
         }
     };
+    if state.peers.is_empty() {
+        return Err(ApiError::unavailable(
+            "no QUBIC_PEERS configured for peer-backed routes",
+        ));
+    }
 
-    let mut peer = connect(&state).await?;
-    let mut issued = Vec::new();
-    let mut owned = Vec::new();
-    let mut possessed = Vec::new();
-    if matches!(kind, "all" | "issued") {
-        issued = issued_list(&peer.issued_assets(key.0).await.map_err(|error| {
-            ApiError::unavailable(format!("issued asset lookup failed: {error}"))
-        })?);
-    }
-    if matches!(kind, "all" | "owned") {
-        owned = owned_list(&peer.owned_assets(key.0).await.map_err(|error| {
-            ApiError::unavailable(format!("owned asset lookup failed: {error}"))
-        })?);
-    }
-    if matches!(kind, "all" | "possessed") {
-        possessed = possessed_list(&peer.possessed_assets(key.0).await.map_err(|error| {
-            ApiError::unavailable(format!("possessed asset lookup failed: {error}"))
-        })?);
-    }
+    let assets = load_assets(&state, &identity, key).await;
+    let issued = if matches!(kind, "all" | "issued") {
+        assets.assets.issued.clone()
+    } else {
+        Vec::new()
+    };
+    let owned = if matches!(kind, "all" | "owned") {
+        assets.assets.owned.clone()
+    } else {
+        Vec::new()
+    };
+    let possessed = if matches!(kind, "all" | "possessed") {
+        assets.assets.possessed.clone()
+    } else {
+        Vec::new()
+    };
 
     Ok((
-        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        [(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(CACHE_HEADER),
+        )],
         Json(json!({
             "data": {
                 "identity": identity,
@@ -399,13 +582,17 @@ async fn wallet_assets(
                 "possessed": possessed,
             },
             "meta": {
-                "source": "peer",
+                "source": if assets.stale { "snapshot" } else { "peer" },
                 "kind": kind,
+                "stale": assets.stale,
+                "age_seconds": assets.assets.age_seconds(),
+                "refreshing": assets.refreshing,
                 "counts": {
                     "issued": issued.len(),
                     "owned": owned.len(),
                     "possessed": possessed.len(),
-                }
+                },
+                "warning": assets.warning,
             }
         })),
     ))
@@ -416,54 +603,46 @@ async fn wallet_snapshot(
     Path(identity): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let (identity, key) = parse_identity(&identity)?;
-    let mut peer = connect(&state).await?;
-    let head = peer.head().await.ok();
-    let entity_response = state.pool.entity(key.0).await.map_err(|error| {
-        ApiError::unavailable(format!("entity lookup failed for {identity}: {error}"))
-    })?;
-    let issued = peer
-        .issued_assets(key.0)
-        .await
-        .map_err(|error| ApiError::unavailable(format!("issued asset lookup failed: {error}")))?;
-    let owned = peer
-        .owned_assets(key.0)
-        .await
-        .map_err(|error| ApiError::unavailable(format!("owned asset lookup failed: {error}")))?;
-    let possessed = peer.possessed_assets(key.0).await.map_err(|error| {
-        ApiError::unavailable(format!("possessed asset lookup failed: {error}"))
-    })?;
-
-    let issued = issued_list(&issued);
-    let owned = owned_list(&owned);
-    let possessed = possessed_list(&possessed);
-    let warning = truncation_warning(&entity_response);
-    let epoch = head.as_ref().map(|head| head.epoch);
-    let peer_tick = entity_response.tick;
+    if state.peers.is_empty() {
+        return Err(ApiError::unavailable(
+            "no QUBIC_PEERS configured for peer-backed routes",
+        ));
+    }
+    let (entity, assets, head) = tokio::join!(
+        crate::entity_cache::get_or_fetch(&state, &identity),
+        load_assets(&state, &identity, key),
+        tokio::time::timeout(Duration::from_millis(750), state.pool.head()),
+    );
+    let entity = entity?;
+    let warning = truncation_warning(&entity.entity)
+        .map(str::to_string)
+        .or_else(|| assets.warning.clone());
+    let epoch = head.ok().and_then(Result::ok).map(|head| head.epoch);
+    let peer_tick = entity.entity.tick;
 
     Ok((
-        [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
+        [(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static(CACHE_HEADER),
+        )],
         Json(json!({
             "data": {
                 "identity": identity,
                 "public_key": key.to_hex(),
                 "peer_tick": peer_tick,
                 "epoch": epoch,
-                "entity": entity_value(&entity_response),
-                "assets": {
-                    "issued": issued,
-                    "owned": owned,
-                    "possessed": possessed,
-                },
-                "counts": {
-                    "issued": issued.len(),
-                    "owned": owned.len(),
-                    "possessed": possessed.len(),
-                }
+                "entity": entity.entity.data(),
+                "assets": assets.assets.data(),
+                "counts": assets.assets.counts(),
             },
             "meta": {
-                "source": "peer",
+                "source": entity.meta.source,
                 "peer_tick": peer_tick,
                 "epoch": epoch,
+                "stale": entity.meta.stale || assets.stale,
+                "age_seconds": entity.meta.age_seconds.max(assets.assets.age_seconds()),
+                "refreshing": entity.meta.refreshing || assets.refreshing,
+                "assets_source": if assets.stale { "snapshot" } else { "peer" },
                 "warning": warning,
             }
         })),

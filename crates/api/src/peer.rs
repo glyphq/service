@@ -5,7 +5,7 @@
 //! and to keep dashboards from turning every refresh into a burst of peer
 //! traffic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -112,6 +112,15 @@ impl LiveCache {
         );
     }
 
+    /// Returns a cached value with its age, even when it is older than any
+    /// freshness TTL. Callers use this for stale-while-revalidate.
+    pub fn peek(&self, key: &str) -> Option<(Value, Duration)> {
+        let entries = self.entries.lock().expect("live cache lock");
+        entries
+            .get(key)
+            .map(|entry| (entry.value.clone(), entry.stored_at.elapsed()))
+    }
+
     /// Returns a cached value, or runs `build` once for concurrent callers of
     /// the same key.
     pub async fn get_or_insert<F, Fut, E>(
@@ -163,6 +172,45 @@ impl LiveCache {
         if Arc::strong_count(flight) == 1 {
             flights.remove(key);
         }
+    }
+}
+
+/// Coordinates at most one background refresh per logical key.
+///
+/// A [`RefreshGuard`] removes the key on drop, including on cancellation or
+/// early return, so a failed refresh cannot wedge future attempts.
+#[derive(Debug, Default)]
+pub struct RefreshCoordinator {
+    active: Mutex<HashSet<String>>,
+}
+
+impl RefreshCoordinator {
+    pub fn try_start(self: &Arc<Self>, key: impl Into<String>) -> Option<RefreshGuard> {
+        let key = key.into();
+        let mut active = self.active.lock().expect("refresh coordinator lock");
+        if !active.insert(key.clone()) {
+            return None;
+        }
+        Some(RefreshGuard {
+            coordinator: self.clone(),
+            key,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct RefreshGuard {
+    coordinator: Arc<RefreshCoordinator>,
+    key: String,
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.coordinator
+            .active
+            .lock()
+            .expect("refresh coordinator lock")
+            .remove(&self.key);
     }
 }
 

@@ -2338,12 +2338,31 @@ impl NodePool {
         }
         let mut best: Option<RespondEntity> = None;
         let mut last_error = None;
-        while let Some(joined) = tasks.join_next().await {
+        let mut grace_deadline = None;
+        loop {
+            let joined = if let Some(deadline) = grace_deadline {
+                tokio::select! {
+                    joined = tasks.join_next() => joined,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        tasks.abort_all();
+                        break;
+                    }
+                }
+            } else {
+                tasks.join_next().await
+            };
+            let Some(joined) = joined else {
+                break;
+            };
             match joined {
                 Ok(Ok((entity, addr, latency))) => {
                     self.manager.record_success(addr, latency);
                     if best.as_ref().is_none_or(|best| entity.tick > best.tick) {
                         best = Some(entity);
+                    }
+                    if grace_deadline.is_none() {
+                        grace_deadline =
+                            Some(tokio::time::Instant::now() + Duration::from_millis(250));
                     }
                 }
                 Ok(Err((error, addr))) => {
@@ -2352,6 +2371,9 @@ impl NodePool {
                 }
                 Err(_) => last_error = Some(Error::NoPeers),
             }
+        }
+        if best.is_some() {
+            tasks.abort_all();
         }
         best.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
     }
@@ -2386,12 +2408,31 @@ impl NodePool {
         }
         let mut best: Option<RespondEntity> = None;
         let mut last_error = None;
-        while let Some(joined) = tasks.join_next().await {
+        let mut grace_deadline = None;
+        loop {
+            let joined = if let Some(deadline) = grace_deadline {
+                tokio::select! {
+                    joined = tasks.join_next() => joined,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        tasks.abort_all();
+                        break;
+                    }
+                }
+            } else {
+                tasks.join_next().await
+            };
+            let Some(joined) = joined else {
+                break;
+            };
             match joined {
                 Ok(Ok((entity, addr, latency))) => {
                     self.manager.record_success(addr, latency);
                     if best.as_ref().is_none_or(|best| entity.tick > best.tick) {
                         best = Some(entity);
+                    }
+                    if grace_deadline.is_none() {
+                        grace_deadline =
+                            Some(tokio::time::Instant::now() + Duration::from_millis(250));
                     }
                 }
                 Ok(Err((error, addr))) => {
@@ -2400,6 +2441,9 @@ impl NodePool {
                 }
                 Err(_) => last_error = Some(Error::NoPeers),
             }
+        }
+        if best.is_some() {
+            tasks.abort_all();
         }
         best.ok_or_else(|| last_error.unwrap_or(Error::NoPeers))
     }

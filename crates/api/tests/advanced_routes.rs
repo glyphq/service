@@ -76,6 +76,7 @@ fn indexed_hash() -> String {
 struct MockStore {
     transactions: Vec<TransactionRow>,
     identity_rows: Vec<IdentityRow>,
+    entity_snapshots: std::collections::HashMap<String, store::EntitySnapshot>,
 }
 
 impl MockStore {
@@ -97,6 +98,7 @@ impl MockStore {
                     .expect("valid timestamp"),
             }],
             identity_rows: Vec::new(),
+            entity_snapshots: std::collections::HashMap::new(),
         }
     }
 
@@ -128,6 +130,12 @@ impl MockStore {
             first_seen_tick: 5,
             last_seen_tick: 7,
         });
+        self
+    }
+
+    fn with_entity_snapshot(mut self, snapshot: store::EntitySnapshot) -> Self {
+        self.entity_snapshots
+            .insert(snapshot.identity.clone(), snapshot);
         self
     }
 }
@@ -212,6 +220,9 @@ impl Store for MockStore {
             .iter()
             .find(|row| row.identity == identity)
             .cloned())
+    }
+    async fn entity_snapshot(&self, identity: &str) -> StoreResult<Option<store::EntitySnapshot>> {
+        Ok(self.entity_snapshots.get(identity).cloned())
     }
     async fn stats(&self) -> StoreResult<Value> {
         Ok(json!({}))
@@ -908,7 +919,7 @@ async fn wallet_overview_joins_peer_entity_assets_and_index() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         headers[header::CACHE_CONTROL],
-        "public, max-age=2, stale-while-revalidate=5"
+        "public, max-age=30, stale-while-revalidate=60"
     );
     assert_eq!(body["data"]["identity"], identity(&WALLET_KEY));
     assert_eq!(
@@ -948,6 +959,75 @@ async fn wallet_overview_joins_peer_entity_assets_and_index() {
 }
 
 #[tokio::test]
+async fn identity_reports_cached_spectrum_balance() {
+    let peer = spawn_mock_peer().await;
+    let wallet_identity = identity(&WALLET_KEY);
+    let snapshot = store::EntitySnapshot {
+        identity: wallet_identity.clone(),
+        public_key: qubic::PublicKey(WALLET_KEY).to_hex(),
+        spectrum_index: 42,
+        tick: TICK,
+        incoming_amount: 500,
+        outgoing_amount: 250,
+        incoming_transfers: 3,
+        outgoing_transfers: 2,
+        latest_incoming_tick: TICK,
+        latest_outgoing_tick: TICK,
+        observed_at: chrono::Utc::now(),
+    };
+    let state = state_with_peer(
+        Arc::new(
+            MockStore::new()
+                .with_identity(&wallet_identity)
+                .with_entity_snapshot(snapshot),
+        ),
+        peer,
+    );
+    let (status, body, _) = get(state, &format!("/v1/identities/{wallet_identity}")).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["balance"], 1);
+    assert_eq!(body["data"]["indexed_balance"], 1);
+    assert_eq!(body["data"]["actual_balance"], 250);
+    assert_eq!(body["data"]["spectrum_balance"], 250);
+    assert_eq!(body["data"]["balance_source"], "spectrum_snapshot");
+    assert_eq!(body["data"]["spectrum_tick"], TICK);
+    assert_eq!(body["meta"]["actual_balance_stale"], false);
+}
+
+#[tokio::test]
+async fn wallet_overview_second_read_uses_cache() {
+    let peer = spawn_mock_peer().await;
+    let state = state_with_peer(Arc::new(MockStore::new()), peer);
+    let uri = format!("/v1/wallets/{}", identity(&WALLET_KEY));
+
+    let (status, first, _) = get(state.clone(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["meta"]["cached"], false);
+
+    let (status, second, _) = get(state, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["meta"]["cached"], true);
+    assert_eq!(second["data"]["entity"]["balance"], 250);
+}
+
+#[tokio::test]
+async fn live_identity_second_read_uses_cache() {
+    let peer = spawn_mock_peer().await;
+    let state = state_with_peer(Arc::new(MockStore::new()), peer);
+    let uri = format!("/v1/live/identities/{}", identity(&WALLET_KEY));
+
+    let (status, first, _) = get(state.clone(), &uri).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["meta"]["source"], "peer");
+
+    let (status, second, _) = get(state, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["meta"]["source"], "cache");
+    assert_eq!(second["meta"]["stale"], false);
+}
+
+#[tokio::test]
 async fn wallet_without_spectrum_entry_is_not_found_unless_indexed() {
     let peer = spawn_mock_peer().await;
     let missing = identity(&MISSING_KEY);
@@ -981,7 +1061,10 @@ async fn wallet_assets_filters_by_kind() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        headers[header::CACHE_CONTROL],
+        "public, max-age=30, stale-while-revalidate=60"
+    );
     assert_eq!(body["data"]["issued"].as_array().unwrap().len(), 2);
     assert_eq!(body["data"]["owned"].as_array().unwrap().len(), 0);
     assert_eq!(body["data"]["possessed"].as_array().unwrap().len(), 0);
@@ -1000,7 +1083,10 @@ async fn wallet_snapshot_reports_peer_head_and_counts() {
     .await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert_eq!(
+        headers[header::CACHE_CONTROL],
+        "public, max-age=30, stale-while-revalidate=60"
+    );
     assert_eq!(body["data"]["peer_tick"], TICK);
     assert_eq!(body["data"]["epoch"], 240);
     assert_eq!(body["data"]["counts"]["issued"], 2);

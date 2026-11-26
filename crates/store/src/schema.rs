@@ -233,6 +233,30 @@ ALTER TABLE {database}.identities
 MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild'
 "#;
 
+/// Last observed peer spectrum entity for one identity. This is deliberately
+/// separate from `identities`: the indexed identity row is a net-flow
+/// aggregate, while this table records the authoritative live balance and
+/// spectrum metadata returned by a peer.
+pub const CREATE_ENTITY_SNAPSHOTS: &str = r#"
+CREATE TABLE IF NOT EXISTS {database}.entity_snapshots
+(
+    identity String,
+    public_key String,
+    spectrum_index Int32,
+    tick UInt32,
+    incoming_amount Int64,
+    outgoing_amount Int64,
+    incoming_transfers UInt64,
+    outgoing_transfers UInt64,
+    latest_incoming_tick UInt32,
+    latest_outgoing_tick UInt32,
+    observed_at DateTime64(3, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY identity
+"#;
+
 /// `top_identities` orders by transfer count, so keep an activity-sorted copy
 /// that can be scanned from the high end for small limits.
 pub const CREATE_IDENTITIES_BY_ACTIVITY: &str = r#"
@@ -384,6 +408,7 @@ pub const ALL: &[&str] = &[
     CREATE_EVENT_PARTICIPANTS_BY_TICK,
     CREATE_IDENTITIES,
     ALTER_IDENTITIES_SETTINGS,
+    CREATE_ENTITY_SNAPSHOTS,
     CREATE_IDENTITIES_BY_ACTIVITY,
     CREATE_INGEST_STATE,
     CREATE_COMPUTORS,

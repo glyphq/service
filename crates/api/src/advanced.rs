@@ -191,39 +191,25 @@ async fn entity(
     Path(identity): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
     let identity = identity.to_ascii_uppercase();
-    let key = qubic::PublicKey::from_identity(&identity)
+    let _ = qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
-    let response = state
-        .pool
-        .entity(key.0)
-        .await
-        .map_err(|error| ApiError::unavailable(format!("entity lookup failed: {error}")))?;
-    if response.spectrum_index < 0 {
+    let result = crate::entity_cache::get_or_fetch(&state, &identity).await?;
+    if result.entity.spectrum_index < 0 {
         return Err(ApiError::not_found(format!(
             "identity {identity} is not in the current spectrum"
         )));
     }
-    let entity = response.entity;
+    let mut meta = result.meta.value(&result.entity);
+    meta["entity_tick"] = json!(result.entity.tick);
+    meta["entity_observed_at"] = json!(result.entity.observed_at);
     Ok((
         [(
             axum::http::header::CACHE_CONTROL,
-            "public, max-age=2, stale-while-revalidate=5",
+            "public, max-age=30, stale-while-revalidate=60",
         )],
         Json(json!({
-            "data": {
-                "identity": identity,
-                "public_key": qubic::PublicKey(entity.public_key).to_hex(),
-                "spectrum_index": response.spectrum_index,
-                "tick": response.tick,
-                "incoming_amount": entity.incoming_amount,
-                "outgoing_amount": entity.outgoing_amount,
-                "balance": entity.incoming_amount.saturating_sub(entity.outgoing_amount),
-                "incoming_transfers": entity.number_of_incoming_transfers,
-                "outgoing_transfers": entity.number_of_outgoing_transfers,
-                "latest_incoming_tick": entity.latest_incoming_transfer_tick,
-                "latest_outgoing_tick": entity.latest_outgoing_transfer_tick,
-            },
-            "meta": { "source": "peer" }
+            "data": result.entity.data(),
+            "meta": meta,
         })),
     ))
 }

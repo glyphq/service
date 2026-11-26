@@ -19,6 +19,7 @@ use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 
 pub mod advanced;
 pub mod dto;
+pub mod entity_cache;
 pub mod error;
 pub mod identity;
 pub mod lifecycle;
@@ -65,6 +66,8 @@ pub struct AppState {
     pub webhooks: Option<Arc<webhook::Webhooks>>,
     /// Short-lived cache for peer-backed reads.
     pub live_cache: Arc<peer::LiveCache>,
+    /// Deduplicates background entity and wallet refreshes per identity.
+    pub refreshes: Arc<peer::RefreshCoordinator>,
     /// Cached index-wide counts. `network_stats` runs several `FINAL` counts,
     /// so multiple dashboard reads within a few seconds should share one query.
     pub stats_cache: Arc<tokio::sync::Mutex<Option<(Instant, store::NetworkStats)>>>,
@@ -90,6 +93,7 @@ impl AppState {
             mempool: None,
             webhooks: None,
             live_cache: Arc::new(peer::LiveCache::default()),
+            refreshes: Arc::new(peer::RefreshCoordinator::default()),
             stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
             metrics: Arc::new(metrics::Metrics::default()),
         }
@@ -498,6 +502,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         mempool,
         webhooks,
         live_cache: Arc::new(peer::LiveCache::default()),
+        refreshes: Arc::new(peer::RefreshCoordinator::default()),
         stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
         metrics: Arc::new(metrics::Metrics::default()),
     });

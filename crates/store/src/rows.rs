@@ -9,9 +9,10 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActivityBucket, AssetRow, AssetTransferRow, ComputorRow, CounterpartyRow, EpochMetadata,
-    EpochRow, EventParticipantRow, EventRow, EventTypeCount, FlowBucket, IdentityActivityRow,
-    IdentityRow, IdentityTotals, PricePointRow, QuorumEvidenceRow, Result, TickRow, TransactionRow,
+    ActivityBucket, AssetRow, AssetTransferRow, ComputorRow, CounterpartyRow, EntitySnapshot,
+    EpochMetadata, EpochRow, EventParticipantRow, EventRow, EventTypeCount, FlowBucket,
+    IdentityActivityRow, IdentityRow, IdentityTotals, PricePointRow, QuorumEvidenceRow, Result,
+    TickRow, TransactionRow,
 };
 
 /// RowBinary encodes `FixedString(N)` as N raw bytes. Serde's array impl only
@@ -461,6 +462,57 @@ pub(crate) struct IdentitySelect {
     pub transfer_count: u64,
     pub first_seen_tick: u32,
     pub last_seen_tick: u32,
+}
+
+#[derive(Debug, Row, Serialize)]
+pub(crate) struct EntitySnapshotInsert {
+    pub identity: String,
+    pub public_key: String,
+    pub spectrum_index: i32,
+    pub tick: u32,
+    pub incoming_amount: i64,
+    pub outgoing_amount: i64,
+    pub incoming_transfers: u64,
+    pub outgoing_transfers: u64,
+    pub latest_incoming_tick: u32,
+    pub latest_outgoing_tick: u32,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub observed_at: DateTime<Utc>,
+    pub version: u64,
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct EntitySnapshotSelect {
+    pub identity: String,
+    pub public_key: String,
+    pub spectrum_index: i32,
+    pub tick: u32,
+    pub incoming_amount: i64,
+    pub outgoing_amount: i64,
+    pub incoming_transfers: u64,
+    pub outgoing_transfers: u64,
+    pub latest_incoming_tick: u32,
+    pub latest_outgoing_tick: u32,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub observed_at: DateTime<Utc>,
+}
+
+impl From<EntitySnapshotSelect> for EntitySnapshot {
+    fn from(row: EntitySnapshotSelect) -> Self {
+        Self {
+            identity: row.identity,
+            public_key: row.public_key,
+            spectrum_index: row.spectrum_index,
+            tick: row.tick,
+            incoming_amount: row.incoming_amount,
+            outgoing_amount: row.outgoing_amount,
+            incoming_transfers: row.incoming_transfers,
+            outgoing_transfers: row.outgoing_transfers,
+            latest_incoming_tick: row.latest_incoming_tick,
+            latest_outgoing_tick: row.latest_outgoing_tick,
+            observed_at: row.observed_at,
+        }
+    }
 }
 
 #[derive(Debug, Row, Deserialize)]

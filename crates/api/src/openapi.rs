@@ -602,7 +602,7 @@ fn paths() -> Value {
                     "operationId": "getIdentity",
                     "tags": ["Identities"],
                     "summary": "Get identity",
-                    "description": "Observed QU flow.",
+                    "description": "Indexed QU flow plus the last cached peer spectrum balance when available. `balance` is indexed net flow and must not be used as an authoritative wallet balance; use `actual_balance` or `spectrum_balance`.",
                     "parameters": [identity_param()],
                     "responses": {
                         "200": { "description": "Identity summary", "content": { "application/json": { "schema": data_envelope("Identity") } } },
@@ -752,7 +752,7 @@ fn paths() -> Value {
                     "operationId": "getWallet",
                     "tags": ["Wallets"],
                     "summary": "Get wallet",
-                    "description": "Indexed identity, recent transactions, and peer asset lists.",
+                    "description": "Indexed identity, recent transactions, cached peer entity, and cached asset lists. Entity and assets are fresh for 60 seconds and served stale while refreshing.",
                     "parameters": [identity_param()],
                     "responses": {
                         "200": { "description": "Wallet overview", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/WalletOverview" }, "meta": { "type": "object" } } } } } },
@@ -767,7 +767,7 @@ fn paths() -> Value {
                     "operationId": "listWalletAssets",
                     "tags": ["Wallets"],
                     "summary": "List wallet assets",
-                    "description": "Issued, owned, and possessed.",
+                    "description": "Issued, owned, and possessed asset lists, cached for 60 seconds and served stale while refreshing.",
                     "parameters": [
                         identity_param(),
                         { "name": "kind", "in": "query", "required": false, "schema": { "type": "string", "enum": ["issued", "owned", "possessed", "all"], "default": "all" } }
@@ -784,7 +784,7 @@ fn paths() -> Value {
                     "operationId": "getLiveWallet",
                     "tags": ["Live"],
                     "summary": "Get live wallet",
-                    "description": "Point-in-time peer snapshot; not cached.",
+                    "description": "Peer spectrum entity and asset snapshot, cached for 60 seconds and served stale while refreshing.",
                     "parameters": [identity_param()],
                     "responses": {
                         "200": { "description": "Wallet snapshot", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/WalletSnapshot" }, "meta": { "type": "object" } } } } } },
@@ -949,7 +949,7 @@ fn paths() -> Value {
                     "operationId": "getLiveIdentity",
                     "tags": ["Live"],
                     "summary": "Get live identity",
-                    "description": "Peer spectrum record, cached for up to two seconds.",
+                    "description": "Peer spectrum record. Fresh for 60 seconds, then served immediately from the last persisted snapshot while a peer refresh runs in the background.",
                     "parameters": [identity_param()],
                     "responses": {
                         "200": { "description": "Live identity record from the peer", "content": { "application/json": { "schema": data_envelope("LiveIdentity") } } },
@@ -1722,6 +1722,12 @@ fn schemas() -> Value {
                     "properties": {
                         "identity": { "type": "string" }, "public_key": { "type": "string" },
                         "balance": { "type": "integer", "format": "int64" },
+                        "indexed_balance": { "type": "integer", "format": "int64", "description": "Net QU flow derived from indexed events" },
+                        "actual_balance": { "type": ["integer", "null"], "format": "int64", "description": "Last cached peer spectrum balance" },
+                        "spectrum_balance": { "type": ["integer", "null"], "format": "int64", "description": "Alias of actual_balance" },
+                        "spectrum_tick": { "type": ["integer", "null"] },
+                        "spectrum_observed_at": { "type": ["string", "null"], "format": "date-time" },
+                        "balance_source": { "type": "string", "enum": ["spectrum_snapshot", "indexed_net_flow"] },
                         "incoming_amount": { "type": "integer", "format": "int64" },
                         "outgoing_amount": { "type": "integer", "format": "int64" },
                         "transfer_count": { "type": "integer", "format": "int64" },
@@ -1793,7 +1799,9 @@ fn schemas() -> Value {
                         "incoming_transfers": { "type": "integer" },
                         "outgoing_transfers": { "type": "integer" },
                         "latest_incoming_tick": { "type": "integer" },
-                        "latest_outgoing_tick": { "type": "integer" }
+                        "latest_outgoing_tick": { "type": "integer" },
+                        "observed_at": { "type": "string", "format": "date-time" },
+                        "balance_source": { "type": "string", "enum": ["spectrum", "unavailable"] }
                     }
                 },
                 "LiveIdentity": {
@@ -1810,7 +1818,9 @@ fn schemas() -> Value {
                         "incoming_transfers": { "type": "integer" },
                         "outgoing_transfers": { "type": "integer" },
                         "latest_incoming_tick": { "type": "integer" },
-                        "latest_outgoing_tick": { "type": "integer" }
+                        "latest_outgoing_tick": { "type": "integer" },
+                        "observed_at": { "type": "string", "format": "date-time" },
+                        "balance_source": { "type": "string", "enum": ["spectrum", "unavailable"] }
                     }
                 },
                 "TickTransactionStatus": {

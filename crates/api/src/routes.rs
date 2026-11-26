@@ -965,17 +965,54 @@ async fn identity(
     let identity = identity.to_ascii_uppercase();
     let _ = qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
-    let row = state
-        .store
-        .identity(&identity)
-        .await?
-        .ok_or_else(|| ApiError::not_found(format!("identity {identity} is not indexed")))?;
+    let (row, snapshot) = tokio::join!(
+        state.store.identity(&identity),
+        state.store.entity_snapshot(&identity),
+    );
+    let row =
+        row?.ok_or_else(|| ApiError::not_found(format!("identity {identity} is not indexed")))?;
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::debug!(%identity, %error, "identity entity snapshot read failed");
+            None
+        }
+    };
+    let mut data = serde_json::to_value(&row)
+        .map_err(|error| ApiError::internal(format!("identity encoding failed: {error}")))?;
+    data["indexed_balance"] = json!(row.balance);
+    let stale = snapshot
+        .as_ref()
+        .is_none_or(|snapshot| (chrono::Utc::now() - snapshot.observed_at).num_seconds() >= 60);
+    match snapshot
+        .as_ref()
+        .filter(|snapshot| snapshot.spectrum_index >= 0)
+    {
+        Some(snapshot) => {
+            data["actual_balance"] = json!(snapshot.balance());
+            data["spectrum_balance"] = json!(snapshot.balance());
+            data["spectrum_tick"] = json!(snapshot.tick);
+            data["spectrum_observed_at"] = json!(snapshot.observed_at);
+            data["balance_source"] = json!("spectrum_snapshot");
+        }
+        None => {
+            data["actual_balance"] = Value::Null;
+            data["spectrum_balance"] = Value::Null;
+            data["spectrum_tick"] = Value::Null;
+            data["spectrum_observed_at"] = Value::Null;
+            data["balance_source"] = json!("indexed_net_flow");
+        }
+    }
+    if stale {
+        crate::entity_cache::spawn_refresh(state.clone(), identity.clone());
+    }
     Ok((
         [(header::CACHE_CONTROL, AGGREGATE)],
         Json(json!({
-            "data": row,
+            "data": data,
             "meta": {
-                "notice": "balance is the net QU flow observed in the indexed epoch range",
+                "notice": "balance is indexed net QU flow; actual_balance is the last peer spectrum balance when available",
+                "actual_balance_stale": stale,
                 "links": {
                     "wallet": format!("/v1/wallets/{identity}"),
                     "assets": format!("/v1/identities/{identity}/assets"),

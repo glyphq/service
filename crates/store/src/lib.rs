@@ -125,6 +125,31 @@ pub struct IdentityRow {
     pub last_seen_tick: u32,
 }
 
+/// Last peer-reported spectrum entity for an identity.
+///
+/// Unlike [`IdentityRow::balance`], which is the net QU flow observed in the
+/// indexed range, this is the authoritative live balance from the spectrum.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntitySnapshot {
+    pub identity: String,
+    pub public_key: String,
+    pub spectrum_index: i32,
+    pub tick: u32,
+    pub incoming_amount: i64,
+    pub outgoing_amount: i64,
+    pub incoming_transfers: u64,
+    pub outgoing_transfers: u64,
+    pub latest_incoming_tick: u32,
+    pub latest_outgoing_tick: u32,
+    pub observed_at: DateTime<Utc>,
+}
+
+impl EntitySnapshot {
+    pub fn balance(&self) -> i64 {
+        self.incoming_amount.saturating_sub(self.outgoing_amount)
+    }
+}
+
 /// Aggregated QU activity derived from the stored log events. Rebuilding from
 /// events avoids replaying the chain when an epoch is re-indexed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -644,6 +669,20 @@ pub trait Store: Send + Sync {
         Err(Error::Config("activity storage unsupported".into()))
     }
     async fn identity(&self, identity: &str) -> Result<Option<IdentityRow>>;
+    /// Last observed peer spectrum entity, or `None` if this identity has
+    /// never been refreshed.
+    async fn entity_snapshot(&self, identity: &str) -> Result<Option<EntitySnapshot>> {
+        let _ = identity;
+        Ok(None)
+    }
+    /// Persist a peer spectrum entity observation. The newest observation
+    /// wins by `observed_at`.
+    async fn put_entity_snapshot(&self, snapshot: &EntitySnapshot) -> Result<()> {
+        let _ = snapshot;
+        Err(Error::Config(
+            "entity snapshot storage is not supported by this store".into(),
+        ))
+    }
     /// Load several identities in one round trip. The default keeps mocks and
     /// alternate stores working; ClickHouse overrides it with a batched query.
     async fn identities_by_id(
@@ -1751,6 +1790,38 @@ LIMIT ? OFFSET ?
             .fetch_optional::<rows::IdentitySelect>()
             .await?;
         Ok(row.map(Into::into))
+    }
+
+    async fn entity_snapshot(&self, identity: &str) -> Result<Option<EntitySnapshot>> {
+        let row = self
+            .client
+            .query(
+                "SELECT ?fields FROM entity_snapshots \
+                 WHERE identity = ? ORDER BY version DESC LIMIT 1",
+            )
+            .bind(identity)
+            .fetch_optional::<rows::EntitySnapshotSelect>()
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn put_entity_snapshot(&self, snapshot: &EntitySnapshot) -> Result<()> {
+        let version = snapshot.observed_at.timestamp_millis().max(1) as u64;
+        let row = rows::EntitySnapshotInsert {
+            identity: snapshot.identity.clone(),
+            public_key: snapshot.public_key.clone(),
+            spectrum_index: snapshot.spectrum_index,
+            tick: snapshot.tick,
+            incoming_amount: snapshot.incoming_amount,
+            outgoing_amount: snapshot.outgoing_amount,
+            incoming_transfers: snapshot.incoming_transfers,
+            outgoing_transfers: snapshot.outgoing_transfers,
+            latest_incoming_tick: snapshot.latest_incoming_tick,
+            latest_outgoing_tick: snapshot.latest_outgoing_tick,
+            observed_at: snapshot.observed_at,
+            version,
+        };
+        writer::insert_all(&self.client, "entity_snapshots", &[row]).await
     }
 
     async fn identities_by_id(
