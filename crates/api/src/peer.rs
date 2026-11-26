@@ -112,6 +112,10 @@ impl LiveCache {
         );
     }
 
+    pub fn remove(&self, key: &str) {
+        self.entries.lock().expect("live cache lock").remove(key);
+    }
+
     /// Returns a cached value with its age, even when it is older than any
     /// freshness TTL. Callers use this for stale-while-revalidate.
     pub fn peek(&self, key: &str) -> Option<(Value, Duration)> {

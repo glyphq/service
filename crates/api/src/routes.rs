@@ -965,34 +965,36 @@ async fn identity(
     let identity = identity.to_ascii_uppercase();
     let _ = qubic::PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
-    let (row, snapshot) = tokio::join!(
+    let (row, entity) = tokio::join!(
         state.store.identity(&identity),
-        state.store.entity_snapshot(&identity),
+        crate::entity_cache::cached(&state, &identity),
     );
     let row =
         row?.ok_or_else(|| ApiError::not_found(format!("identity {identity} is not indexed")))?;
-    let snapshot = match snapshot {
-        Ok(snapshot) => snapshot,
+    let entity = match entity {
+        Ok(Some(entity)) => Some(entity),
+        Ok(None) => crate::entity_cache::get_or_fetch(&state, &identity)
+            .await
+            .ok(),
         Err(error) => {
-            tracing::debug!(%identity, %error, "identity entity snapshot read failed");
+            tracing::debug!(%identity, %error, "identity entity cache read failed");
             None
         }
     };
     let mut data = serde_json::to_value(&row)
         .map_err(|error| ApiError::internal(format!("identity encoding failed: {error}")))?;
     data["indexed_balance"] = json!(row.balance);
-    let stale = snapshot
+    let stale = entity.as_ref().is_none_or(|entity| entity.meta.stale);
+    match entity
         .as_ref()
-        .is_none_or(|snapshot| (chrono::Utc::now() - snapshot.observed_at).num_seconds() >= 60);
-    match snapshot
-        .as_ref()
-        .filter(|snapshot| snapshot.spectrum_index >= 0)
+        .filter(|entity| entity.entity.spectrum_index >= 0)
     {
-        Some(snapshot) => {
-            data["actual_balance"] = json!(snapshot.balance());
-            data["spectrum_balance"] = json!(snapshot.balance());
-            data["spectrum_tick"] = json!(snapshot.tick);
-            data["spectrum_observed_at"] = json!(snapshot.observed_at);
+        Some(entity) => {
+            let entity = &entity.entity;
+            data["actual_balance"] = json!(entity.balance);
+            data["spectrum_balance"] = json!(entity.balance);
+            data["spectrum_tick"] = json!(entity.tick);
+            data["spectrum_observed_at"] = json!(entity.observed_at);
             data["balance_source"] = json!("spectrum_snapshot");
         }
         None => {

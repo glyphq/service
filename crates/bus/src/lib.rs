@@ -233,16 +233,31 @@ pub struct TickEvent {
     pub transactions: u32,
     pub events: u32,
     pub verification: String,
+    /// Identities whose observable state may have changed in this tick.
+    #[serde(default)]
+    pub identities: Vec<String>,
 }
 
 impl TickEvent {
     pub fn from_batch(batch: &TickBatch) -> Self {
+        let mut identities = std::collections::BTreeSet::new();
+        for identity in &batch.identities {
+            identities.insert(identity.identity.clone());
+        }
+        for transaction in &batch.transactions {
+            identities.insert(transaction.source.clone());
+            identities.insert(transaction.destination.clone());
+        }
+        for participant in &batch.event_participants {
+            identities.insert(participant.identity.clone());
+        }
         Self {
             epoch: batch.epoch,
             tick: batch.tick,
             transactions: batch.transactions.len() as u32,
             events: batch.events.len() as u32,
             verification: batch.verification.clone(),
+            identities: identities.into_iter().collect(),
         }
     }
 }
@@ -251,6 +266,44 @@ impl TickEvent {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn committed_event_lists_every_touched_identity() {
+        let mut batch = TickBatch::new(241, 92_274_000, Utc::now(), 7, "quorum");
+        batch.transactions.push(store::TransactionRow {
+            epoch: batch.epoch,
+            tick: batch.tick,
+            tx_index: 0,
+            hash: "00".into(),
+            source: "SOURCE".into(),
+            destination: "DESTINATION".into(),
+            amount: 1,
+            input_type: 0,
+            input_data: String::new(),
+            status: "success".into(),
+            timestamp: batch.timestamp,
+        });
+        batch.event_participants.push(store::EventParticipantRow {
+            epoch: batch.epoch,
+            tick: batch.tick,
+            log_id: 1,
+            identity: "PARTICIPANT".into(),
+            role: "source".into(),
+            tx_hash: "00".into(),
+            tx_index: 0,
+            timestamp: batch.timestamp,
+        });
+
+        let event = TickEvent::from_batch(&batch);
+        assert_eq!(
+            event.identities,
+            vec![
+                "DESTINATION".to_string(),
+                "PARTICIPANT".to_string(),
+                "SOURCE".to_string()
+            ]
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires a local NATS JetStream server on NATS_URL"]

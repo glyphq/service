@@ -164,6 +164,13 @@ pub async fn cached(state: &AppState, identity: &str) -> Result<Option<EntityRes
         let Ok(entity) = serde_json::from_value::<CachedEntity>(value) else {
             return Ok(None);
         };
+        if state
+            .dirty_entity_tick(identity)
+            .is_some_and(|tick| entity.tick < tick)
+        {
+            return Ok(None);
+        }
+        state.clear_dirty_entity(identity, entity.tick);
         if entity.age_seconds() < ENTITY_FRESH.as_secs() {
             return Ok(Some(EntityResult {
                 meta: EntityMeta {
@@ -197,6 +204,13 @@ pub async fn cached(state: &AppState, identity: &str) -> Result<Option<EntityRes
     let Some(snapshot) = snapshot else {
         return Ok(None);
     };
+    if state
+        .dirty_entity_tick(identity)
+        .is_some_and(|tick| snapshot.tick < tick)
+    {
+        return Ok(None);
+    }
+    state.clear_dirty_entity(identity, snapshot.tick);
     let entity = CachedEntity::from_snapshot(&snapshot);
     let age = entity.age_seconds();
     let value = serde_json::to_value(&entity)
@@ -251,9 +265,24 @@ async fn refresh(state: &AppState, identity: &str) -> Result<EntityResult, ApiEr
         .await
         .map_err(|error| ApiError::unavailable(format!("entity lookup failed: {error}")))?;
     let entity = CachedEntity::from_response(identity, &response);
+    let behind = state
+        .dirty_entity_tick(identity)
+        .is_some_and(|tick| entity.tick < tick);
+    if behind {
+        return Ok(EntityResult {
+            meta: EntityMeta {
+                source: "peer",
+                stale: true,
+                age_seconds: 0,
+                refreshing: false,
+            },
+            entity,
+        });
+    }
     if let Err(error) = state.store.put_entity_snapshot(&entity.snapshot()).await {
         tracing::warn!(%identity, %error, "entity snapshot was not persisted");
     }
+    state.clear_dirty_entity(identity, entity.tick);
     let value = serde_json::to_value(&entity)
         .map_err(|error| ApiError::internal(format!("entity encoding failed: {error}")))?;
     state.live_cache.put(cache_key(identity), value);

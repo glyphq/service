@@ -344,7 +344,7 @@ struct AssetRead {
     cacheable: bool,
 }
 
-fn wallet_cache_key(identity: &str) -> String {
+pub(crate) fn wallet_cache_key(identity: &str) -> String {
     format!("wallet:{identity}")
 }
 

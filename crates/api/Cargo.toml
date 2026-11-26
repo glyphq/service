@@ -10,6 +10,7 @@ qubic = { path = "../qubic" }
 store = { path = "../store" }
 node = { path = "../node" }
 archive = { path = "../archive" }
+bus = { path = "../bus" }
 scalar_api_reference = "0.2"
 anyhow.workspace = true
 async-stream.workspace = true

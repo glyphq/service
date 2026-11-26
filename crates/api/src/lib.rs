@@ -23,6 +23,7 @@ pub mod entity_cache;
 pub mod error;
 pub mod identity;
 pub mod lifecycle;
+pub mod live_events;
 pub mod market;
 pub mod mempool;
 pub mod metrics;
@@ -68,6 +69,9 @@ pub struct AppState {
     pub live_cache: Arc<peer::LiveCache>,
     /// Deduplicates background entity and wallet refreshes per identity.
     pub refreshes: Arc<peer::RefreshCoordinator>,
+    /// Identities changed by a committed tick, with the highest dirty tick.
+    /// Cached entities older than this tick must not be served.
+    pub dirty_entities: Arc<Mutex<HashMap<String, u32>>>,
     /// Cached index-wide counts. `network_stats` runs several `FINAL` counts,
     /// so multiple dashboard reads within a few seconds should share one query.
     pub stats_cache: Arc<tokio::sync::Mutex<Option<(Instant, store::NetworkStats)>>>,
@@ -94,6 +98,7 @@ impl AppState {
             webhooks: None,
             live_cache: Arc::new(peer::LiveCache::default()),
             refreshes: Arc::new(peer::RefreshCoordinator::default()),
+            dirty_entities: Arc::new(Mutex::new(HashMap::new())),
             stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
             metrics: Arc::new(metrics::Metrics::default()),
         }
@@ -101,6 +106,40 @@ impl AppState {
 
     pub fn uptime_seconds(&self) -> u64 {
         self.started_at.elapsed().as_secs()
+    }
+
+    /// Mark an identity as changed by a committed tick. Existing memory
+    /// entries are dropped so the next read fetches a post-commit entity.
+    pub fn invalidate_identity(&self, identity: &str, tick: u32) {
+        if identity.is_empty() {
+            return;
+        }
+        {
+            let mut dirty = self.dirty_entities.lock().expect("dirty identity lock");
+            let entry = dirty.entry(identity.to_string()).or_insert(tick);
+            *entry = (*entry).max(tick);
+        }
+        self.live_cache.remove(&entity_cache::cache_key(identity));
+        self.live_cache.remove(&wallet::wallet_cache_key(identity));
+    }
+
+    pub fn dirty_entity_tick(&self, identity: &str) -> Option<u32> {
+        self.dirty_entities
+            .lock()
+            .expect("dirty identity lock")
+            .get(identity)
+            .copied()
+    }
+
+    /// Clears the dirty marker once an entity has been observed at or after it.
+    pub fn clear_dirty_entity(&self, identity: &str, tick: u32) {
+        let mut dirty = self.dirty_entities.lock().expect("dirty identity lock");
+        if dirty
+            .get(identity)
+            .is_some_and(|dirty_tick| *dirty_tick <= tick)
+        {
+            dirty.remove(identity);
+        }
     }
 
     /// Returns index-wide counts, reusing a recent snapshot. The mutex is held
@@ -486,7 +525,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
     } else {
         (None, None, None, Vec::new())
     };
-    let app = router(AppState {
+    let state = AppState {
         store,
         hub: Some(hub),
         peers,
@@ -503,9 +542,12 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         webhooks,
         live_cache: Arc::new(peer::LiveCache::default()),
         refreshes: Arc::new(peer::RefreshCoordinator::default()),
+        dirty_entities: Arc::new(Mutex::new(HashMap::new())),
         stats_cache: Arc::new(tokio::sync::Mutex::new(None)),
         metrics: Arc::new(metrics::Metrics::default()),
-    });
+    };
+    let live_events_task = live_events::spawn(state.clone(), cancel.clone());
+    let app = router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "glyph api listening");
     axum::serve(listener, app)
@@ -520,6 +562,9 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         let _ = task.await;
     }
     for task in mempool_tasks {
+        let _ = task.await;
+    }
+    if let Some(task) = live_events_task {
         let _ = task.await;
     }
     Ok(())

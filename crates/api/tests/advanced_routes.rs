@@ -1015,16 +1015,22 @@ async fn wallet_overview_second_read_uses_cache() {
 async fn live_identity_second_read_uses_cache() {
     let peer = spawn_mock_peer().await;
     let state = state_with_peer(Arc::new(MockStore::new()), peer);
-    let uri = format!("/v1/live/identities/{}", identity(&WALLET_KEY));
+    let wallet_identity = identity(&WALLET_KEY);
+    let uri = format!("/v1/live/identities/{wallet_identity}");
 
     let (status, first, _) = get(state.clone(), &uri).await;
     assert_eq!(status, StatusCode::OK, "{first}");
     assert_eq!(first["meta"]["source"], "peer");
 
-    let (status, second, _) = get(state, &uri).await;
+    let (status, second, _) = get(state.clone(), &uri).await;
     assert_eq!(status, StatusCode::OK, "{second}");
     assert_eq!(second["meta"]["source"], "cache");
     assert_eq!(second["meta"]["stale"], false);
+
+    state.invalidate_identity(&wallet_identity, TICK);
+    let (status, third, _) = get(state, &uri).await;
+    assert_eq!(status, StatusCode::OK, "{third}");
+    assert_eq!(third["meta"]["source"], "peer");
 }
 
 #[tokio::test]

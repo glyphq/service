@@ -1806,7 +1806,10 @@ LIMIT ? OFFSET ?
     }
 
     async fn put_entity_snapshot(&self, snapshot: &EntitySnapshot) -> Result<()> {
-        let version = snapshot.observed_at.timestamp_millis().max(1) as u64;
+        // Spectrum balances change by tick. Versioning by tick means a peer
+        // that lags behind cannot overwrite a newer observation even if it is
+        // written later.
+        let version = u64::from(snapshot.tick).max(1);
         let row = rows::EntitySnapshotInsert {
             identity: snapshot.identity.clone(),
             public_key: snapshot.public_key.clone(),
