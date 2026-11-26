@@ -31,6 +31,9 @@ const ADDON_TIMEOUT: Duration = Duration::from_millis(400);
 /// one-second tick, a target further away than this is likely to be dropped.
 const PENDING_HORIZON_TICKS: u32 = 600;
 const RISK_SAMPLE_TICKS: u32 = 120;
+/// A lifecycle read only refreshes balances for a recent confirmation. Older
+/// transaction pages are already reflected by the committed-event invalidation.
+const CONFIRMATION_INVALIDATION_TICKS: u32 = 10;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -107,14 +110,19 @@ async fn lifecycle(
         })
     });
     let network_seen = indexed.is_none() && network_tick.is_some();
-    if let Some(row) = &indexed {
-        // Serving a confirmed transaction is the user-visible confirmation
-        // point. Drop stale balances before returning so the next wallet or
-        // identity read reflects the committed tick.
-        state.invalidator.invalidate(&row.source, row.tick);
-        state.invalidator.invalidate(&row.destination, row.tick);
-    }
     let current = current_tick(&state).await;
+    if let Some(row) = &indexed {
+        let recent = current.is_none_or(|current| {
+            row.tick.saturating_add(CONFIRMATION_INVALIDATION_TICKS) >= current
+        });
+        if recent {
+            // Serving a confirmed transaction is the user-visible confirmation
+            // point. Drop stale balances before returning so the next wallet or
+            // identity read reflects the committed tick.
+            state.invalidator.invalidate(&row.source, row.tick);
+            state.invalidator.invalidate(&row.destination, row.tick);
+        }
+    }
     let money_flew = match indexed_tick.or(network_tick) {
         Some(tick) => peer_money_flew(&state, tick, &digest).await,
         None => None,
