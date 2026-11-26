@@ -376,7 +376,7 @@ fn paths() -> Value {
                     "operationId": "getTransactionLifecycle",
                     "tags": ["Transactions"],
                     "summary": "Get transaction lifecycle",
-                    "description": "Indexed, tracked, and peer state with events, effects, and money-flow.",
+                    "description": "Indexed, tracked, and peer state with events, effects, and money-flow. `state` is `confirmed` only when the explorer index or mempool can serve the transaction; a peer-only hit is `network_seen` until the writer commits it.",
                     "parameters": [transaction_hash_param()],
                     "responses": { "200": { "description": "Transaction lifecycle", "content": { "application/json": { "schema": { "type": "object" } } } }, "400": { "description": "Invalid hash" }, "404": { "description": "Unknown transaction" } }
                 }
