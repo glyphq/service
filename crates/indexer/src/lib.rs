@@ -205,8 +205,6 @@ struct PipelineTuning {
     fetch_concurrency: usize,
     fetch_window: usize,
     fetch_batch_max: usize,
-    fetch_batch_initial: usize,
-    batch_min_lag: usize,
     write_batch: usize,
     write_flush: Duration,
     archive_concurrency: usize,
@@ -234,8 +232,6 @@ impl PipelineTuning {
             fetch_concurrency: env_usize("INDEXER_FETCH_CONCURRENCY", 32, 1, 128),
             fetch_window: env_usize("INDEXER_FETCH_WINDOW", 512, 1, 8192),
             fetch_batch_max: env_usize("INDEXER_FETCH_BATCH", 32, 1, 64),
-            fetch_batch_initial: env_usize("INDEXER_FETCH_BATCH_INITIAL", 4, 1, 64),
-            batch_min_lag: env_usize("INDEXER_BATCH_MIN_LAG", 8, 1, 100_000),
             write_batch: env_usize("INDEXER_WRITE_BATCH", 128, 1, 4096),
             write_flush: Duration::from_millis(
                 env_usize("INDEXER_WRITE_FLUSH_MS", 250, 10, 10_000) as u64,
@@ -263,23 +259,27 @@ struct AdaptiveBatch {
 }
 
 impl AdaptiveBatch {
-    fn new(initial: usize, max: usize) -> Self {
+    fn new(max: usize) -> Self {
         let max = u32::try_from(max.max(1)).unwrap_or(u32::MAX);
-        let initial = u32::try_from(initial.max(1)).unwrap_or(1).min(max);
         Self {
-            current: AtomicU32::new(initial),
+            current: AtomicU32::new(max),
             max,
         }
+    }
+
+    /// A failed batch halves the request size, but a single slow or incomplete
+    /// tick must not collapse live fetching into one request per tick. One
+    /// tick per request cannot keep up with the chain and makes every delayed
+    /// tick a multi-second head-of-line stall.
+    fn floor(&self) -> u32 {
+        self.max.clamp(1, 4)
     }
 
     fn current(&self) -> u32 {
         self.current.load(Ordering::Acquire).max(1)
     }
 
-    fn on_success(&self, ticks: usize) {
-        if ticks < 2 {
-            return;
-        }
+    fn on_success(&self, _ticks: usize) {
         let next = self.current().saturating_add(1).min(self.max);
         self.current.fetch_max(next, Ordering::AcqRel);
     }
@@ -288,8 +288,8 @@ impl AdaptiveBatch {
         if ticks < 2 {
             return;
         }
-        let next = u32::try_from(ticks).unwrap_or(u32::MAX).max(1) / 2;
-        self.current.fetch_min(next.max(1), Ordering::AcqRel);
+        let next = (u32::try_from(ticks).unwrap_or(u32::MAX) / 2).max(self.floor());
+        self.current.fetch_min(next, Ordering::AcqRel);
     }
 }
 
@@ -718,10 +718,7 @@ impl<S: Store + 'static> Indexer<S> {
         let work_rx = Arc::new(AsyncMutex::new(work_rx));
         let (result_tx, mut result_rx) = mpsc::channel::<FetchResult>(channel_capacity);
         let (retry_tx, retry_rx) = mpsc::channel::<RetryRequest>(channel_capacity);
-        let adaptive = Arc::new(AdaptiveBatch::new(
-            tuning.fetch_batch_initial,
-            tuning.fetch_batch_max,
-        ));
+        let adaptive = Arc::new(AdaptiveBatch::new(tuning.fetch_batch_max));
         let mut peer_configs = self.pool.peer_configs().to_vec();
         if std::env::var("INDEXER_DISCOVER_PEERS").is_ok_and(|value| value == "true") {
             let mut seen = peer_configs
@@ -781,7 +778,6 @@ impl<S: Store + 'static> Indexer<S> {
             pipeline_cancel.clone(),
             tuning.fetch_window,
             adaptive.clone(),
-            tuning.batch_min_lag,
         ));
         let verify_semaphore = Arc::new(tokio::sync::Semaphore::new(tuning.verify_concurrency));
 
@@ -2440,7 +2436,6 @@ async fn dispatch_loop(
     cancel: CancellationToken,
     window: usize,
     adaptive: Arc<AdaptiveBatch>,
-    batch_min_lag: usize,
 ) {
     let mut retries = std::collections::VecDeque::<(Instant, u32, u32, u32)>::new();
     let mut assigned_upto = None;
@@ -2561,12 +2556,7 @@ async fn dispatch_loop(
         if pending.load(Ordering::Acquire) < window {
             if let Some(upper) = dispatch_upper_bound(next_write_tick, head_tick, window) {
                 if next_tick >= next_write_tick && next_tick <= upper {
-                    let lag = head_tick.saturating_sub(next_write_tick) as usize;
-                    let desired = if lag >= batch_min_lag {
-                        adaptive.current() as usize
-                    } else {
-                        1
-                    };
+                    let desired = adaptive.current() as usize;
                     let available = window.saturating_sub(pending.load(Ordering::Acquire));
                     let mut count = desired
                         .min(available)
@@ -2789,9 +2779,6 @@ async fn fetch_worker(
                             pool.record_log_failure(addr);
                         }
                     }
-                }
-                if matches!(outcome, Err(Error::IncompleteTick { .. })) {
-                    peer_failed = true;
                 }
                 outcomes[position] = Some(outcome);
             }
@@ -3413,19 +3400,25 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_batch_grows_on_success_and_halves_on_failure() {
-        let adaptive = AdaptiveBatch::new(4, 8);
-        assert_eq!(adaptive.current(), 4);
-        for _ in 0..10 {
-            adaptive.on_success(4);
-        }
+    fn adaptive_batch_starts_full_and_keeps_a_floor() {
+        let adaptive = AdaptiveBatch::new(16);
+        assert_eq!(adaptive.current(), 16);
+        adaptive.on_failure(16);
         assert_eq!(adaptive.current(), 8);
         adaptive.on_failure(8);
         assert_eq!(adaptive.current(), 4);
-        adaptive.on_failure(1);
-        assert_eq!(adaptive.current(), 4, "single-tick retries do not shrink");
         adaptive.on_failure(4);
-        assert_eq!(adaptive.current(), 2);
+        assert_eq!(
+            adaptive.current(),
+            4,
+            "live batching never collapses to one"
+        );
+        adaptive.on_success(4);
+        assert_eq!(adaptive.current(), 5);
+        for _ in 0..20 {
+            adaptive.on_success(4);
+        }
+        assert_eq!(adaptive.current(), 16);
     }
 
     fn golden_computors() -> Computors {
@@ -3694,8 +3687,7 @@ mod tests {
             retry_rx,
             cancel.clone(),
             4,
-            Arc::new(AdaptiveBatch::new(1, 1)),
-            1,
+            Arc::new(AdaptiveBatch::new(1)),
         ));
         tokio::time::sleep(Duration::from_millis(10)).await;
         cancel.cancel();
@@ -3734,8 +3726,7 @@ mod tests {
             retry_rx,
             cancel.clone(),
             256,
-            Arc::new(AdaptiveBatch::new(16, 16)),
-            1,
+            Arc::new(AdaptiveBatch::new(16)),
         ));
 
         let mut seen = Vec::new();
@@ -3784,8 +3775,7 @@ mod tests {
             retry_rx,
             cancel.clone(),
             256,
-            Arc::new(AdaptiveBatch::new(16, 16)),
-            32,
+            Arc::new(AdaptiveBatch::new(16)),
         ));
 
         let mut seen = Vec::new();
@@ -3802,7 +3792,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatcher_uses_single_ticks_at_the_head() {
+    async fn dispatcher_fetches_every_available_tick_at_the_head() {
         let head = Arc::new(AsyncRwLock::new(Head {
             epoch: 1,
             tick: 108,
@@ -3824,8 +3814,7 @@ mod tests {
             retry_rx,
             cancel.clone(),
             256,
-            Arc::new(AdaptiveBatch::new(16, 16)),
-            32,
+            Arc::new(AdaptiveBatch::new(16)),
         ));
 
         let item = tokio::time::timeout(Duration::from_secs(1), work_rx.recv())
@@ -3834,6 +3823,6 @@ mod tests {
             .expect("work item");
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
-        assert_eq!((item.start, item.count), (100, 1));
+        assert_eq!((item.start, item.count), (100, 8));
     }
 }

@@ -1985,14 +1985,6 @@ impl NodePool {
             if candidates.is_empty() {
                 return Err(Error::NoPeers);
             }
-            if let Some(preferred) = *self.log_peer.lock().expect("log peer mutex poisoned") {
-                if let Some(index) = candidates
-                    .iter()
-                    .position(|config| config.addr == preferred)
-                {
-                    candidates.swap(0, index);
-                }
-            }
             let mut last_error = None;
             while !candidates.is_empty() {
                 let Some((config, index)) = self.reserve_best_available(&candidates) else {
@@ -2829,19 +2821,22 @@ impl NodePool {
         let mut last_error = None;
         // Log latency varies by an order of magnitude between peers, and a
         // preferred peer that has gone slow must not delay every batch behind
-        // it. Race a small number of peers and keep the first complete proof
-        // for each tick. The semaphore still bounds total log connections.
+        // it. Race every configured peer and keep the first complete proof for
+        // each tick. The semaphore still bounds total log connections, and the
+        // per-attempt budget keeps an incomplete live tick from blocking the
+        // ordered writer for the old fixed eight seconds.
+        let budget = log_batch_timeout(tick_data.len());
         let mut tasks = tokio::task::JoinSet::new();
-        for config in candidates.into_iter().take(3) {
+        for config in candidates {
             let addr = config.addr;
             let subset = tick_data.to_vec();
             tasks.spawn(async move {
-                let fetched = tokio::time::timeout(Duration::from_secs(8), async {
+                let fetched = tokio::time::timeout(budget, async {
                     let mut peer = Peer::connect(config).await?;
                     peer.complete_logs_batch(&subset).await
                 })
                 .await
-                .unwrap_or_else(|_| Err(Error::Timeout(Duration::from_secs(8))));
+                .unwrap_or(Err(Error::Timeout(budget)));
                 (addr, fetched)
             });
         }
@@ -2940,6 +2935,15 @@ fn unique_votes(votes: &[Tick]) -> usize {
         }
     }
     seen.iter().filter(|seen| **seen).count()
+}
+
+/// Budget for racing complete log proofs from every peer. A single fresh tick
+/// gets a little over two seconds; larger repair batches get more time without
+/// ever returning to the old unbounded eight-second stall.
+fn log_batch_timeout(ticks: usize) -> Duration {
+    Duration::from_secs(2)
+        .saturating_add(Duration::from_millis(ticks.clamp(1, 32) as u64 * 150))
+        .min(Duration::from_secs(6))
 }
 
 /// A peer connection that releases its slot in the pool's per-peer load

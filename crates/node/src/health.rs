@@ -364,7 +364,10 @@ impl PeerManager {
         let fraction = (age.as_secs_f64() / window).min(1.0);
         let bonus = self.policy.exploration_bonus.as_secs_f64() * 1_000.0 * fraction;
         let fetch = entry.fetch_ms_per_tick.unwrap_or(0.0);
-        let log_penalty = f64::from(entry.log_failures) * 60_000.0;
+        // A fresh tick can legitimately have logs still pending. Keep that a
+        // short-lived ranking penalty instead of parking an otherwise fast
+        // peer for a minute after one incomplete response.
+        let log_penalty = f64::from(entry.log_failures) * 2_000.0;
         (latency + fetch + penalty + log_penalty - bonus).max(0.0)
     }
 }

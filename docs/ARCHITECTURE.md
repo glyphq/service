@@ -160,7 +160,10 @@ Ingestion is a bounded prefetch pipeline, not a serial tick loop.
    head and cached computors through `Peer::bundle_with`, then requests `TickData`,
    `QuorumTick` votes, `TickTransactions`, and log ranges. Any request that returns
    `EndResponse` is retried or treated as empty only where the protocol says empty is
-   valid.
+   valid. Live requests start at the full `INDEXER_FETCH_BATCH` size and only halve on
+   batch-level failures, so a brief stall never collapses the pipeline into one
+   multi-second request per tick. Log repair races every configured peer with a bounded
+   timeout; incomplete logs do not discard the main tick connection.
 5. Compute the quorum group by matching vote digests. A non-empty tick needs 451
    matching votes, an empty tick needs 226. Refuse to write a below-threshold tick.
 6. Verify the data tier. The `TickData` digest must match the quorum digest. Every
@@ -196,6 +199,7 @@ Default tuning, overridable by environment:
 | --- | --- | --- |
 | `INDEXER_FETCH_CONCURRENCY` | 32 | 1..128 |
 | `INDEXER_FETCH_WINDOW` | 512 | 1..8192 |
+| `INDEXER_FETCH_BATCH` | 32 | 1..64 |
 | `INDEXER_WRITE_BATCH` | 128 | 1..4096 |
 | `INDEXER_WRITE_FLUSH_MS` | 250 | 10..10000 |
 

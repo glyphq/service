@@ -49,6 +49,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Cursor key advanced after a tick has been fully persisted.
 pub const CURSOR_HEAD: &str = "head";
+/// Recent-event pages scan this many ticks. At typical mainnet density this
+/// covers hundreds of thousands of logs while keeping the deduplicating sort
+/// bounded.
+const RECENT_EVENT_TICK_WINDOW: u32 = 2_048;
+/// Recent-transaction pages only need a few hundred ticks even for deep pages.
+const RECENT_TRANSACTION_TICK_WINDOW: u32 = 256;
 /// Cursor key holding the typed [`IngestCursor`] JSON document.
 pub const CURSOR_INGEST: &str = "ingest";
 
@@ -1466,19 +1472,34 @@ LIMIT ? OFFSET ?
     }
 
     async fn recent_events(&self, limit: u32, offset: u64) -> Result<Vec<EventRow>> {
-        // `by_recent` orders by (tick, log_id), so a reverse scan already
-        // produces the requested order. LIMIT 1 BY collapses replayed rows
-        // before the page is cut.
+        // An unbounded global sort over every event needs gigabytes once an
+        // epoch holds millions of logs. Rows are inserted in tick order, so a
+        // recent tick window is enough for the newest page and keeps the
+        // lookup bounded. The window is deliberately wider than one page.
+        let latest = self
+            .client
+            .query("SELECT max(tick) AS tick FROM ticks")
+            .fetch_optional::<rows::TickNumberSelect>()
+            .await?;
+        let Some(latest) = latest else {
+            return Ok(Vec::new());
+        };
+        if latest.tick == 0 {
+            return Ok(Vec::new());
+        }
+        let from_tick = latest.tick.saturating_sub(RECENT_EVENT_TICK_WINDOW);
         let rows = self
             .client
             .query(
                 r#"
 SELECT ?fields FROM events
+WHERE tick >= ?
 ORDER BY tick DESC, log_id DESC, version DESC
 LIMIT 1 BY epoch, log_id
 LIMIT ? OFFSET ?
 "#,
             )
+            .bind(from_tick)
             .bind(limit)
             .bind(offset)
             .fetch_all::<rows::EventSelect>()
@@ -1488,18 +1509,33 @@ LIMIT ? OFFSET ?
 
     async fn recent_transactions(&self, limit: u32, offset: u64) -> Result<Vec<TransactionRow>> {
         // The table order is (tick, tx_index), which the mixed DESC/ASC sort
-        // cannot scan directly. ClickHouse uses it to bound the top-K sort;
-        // deep offsets still read more of the table.
+        // cannot scan directly. Bound the scan to recent ticks so a deep
+        // offset or a busy epoch cannot turn a page request into a full-table
+        // sort.
+        let latest = self
+            .client
+            .query("SELECT max(tick) AS tick FROM ticks")
+            .fetch_optional::<rows::TickNumberSelect>()
+            .await?;
+        let Some(latest) = latest else {
+            return Ok(Vec::new());
+        };
+        if latest.tick == 0 {
+            return Ok(Vec::new());
+        }
+        let from_tick = latest.tick.saturating_sub(RECENT_TRANSACTION_TICK_WINDOW);
         let rows = self
             .client
             .query(
                 r#"
 SELECT ?fields FROM transactions
+WHERE tick >= ?
 ORDER BY tick DESC, tx_index ASC, version DESC
 LIMIT 1 BY tick, tx_index
 LIMIT ? OFFSET ?
 "#,
             )
+            .bind(from_tick)
             .bind(limit)
             .bind(offset)
             .fetch_all::<rows::TransactionSelect>()

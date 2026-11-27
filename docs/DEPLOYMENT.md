@@ -115,7 +115,8 @@ and the stack is reachable only from the same machine.
 | `INDEXER_PROGRESS_EVERY` | `100` | Log progress every N indexed ticks. |
 | `INDEXER_FETCH_CONCURRENCY` | `32` | Concurrent peer connections used by fetch workers. Raise for backfill, lower on a small host. |
 | `INDEXER_FETCH_WINDOW` | `512` | Maximum ticks in flight or buffered before the ordered writer. Memory scales with this value. |
-| `INDEXER_CONNECTIONS_PER_PEER` | `2` | Concurrent TCP connections to one peer. Qubic peers close excess connections from one address. |
+| `INDEXER_FETCH_BATCH` | `32` | Maximum ticks per peer fetch batch. Starts at the maximum and halves on batch-level failures, with a floor of 4. |
+| `INDEXER_PEER_CONNECTIONS` | `4` | Concurrent TCP connections to one peer. Qubic peers close excess connections from one address. |
 | `INDEXER_WRITE_BATCH` | `128` | Maximum ticks per ClickHouse insert batch. |
 | `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before an idle partial batch is flushed. |
 | `INDEXER_DISCOVER_PEERS` | `false` | Append IPv4 peers advertised through `ExchangePublicPeers`, using port `21841`. |

@@ -86,8 +86,15 @@ async fn explorer_overview(
         return Ok((cache_header(), Json(value)));
     }
 
+    // The stats read is cached for five seconds and gives the head needed to
+    // bound the whale scan. Running it first avoids sorting every historical
+    // transfer just to return the newest overview.
+    let stats = state.network_stats().await?;
+    let whale_since = stats
+        .head
+        .as_ref()
+        .map(|head| head.tick.saturating_sub(10_000));
     let (
-        stats,
         ticks,
         transactions,
         events,
@@ -98,7 +105,6 @@ async fn explorer_overview(
         whales,
         latest_price,
     ) = tokio::join!(
-        state.network_stats(),
         state.store.ticks(None, limit, 0),
         state.store.recent_transactions(limit, 0),
         state.store.recent_events(limit, 0),
@@ -106,10 +112,11 @@ async fn explorer_overview(
         state.store.active_identity_buckets(interval, 24),
         state.store.top_identities(limit),
         state.store.contracts(limit, 0),
-        state.store.whale_transactions(whale_min, None, limit),
+        state
+            .store
+            .whale_transactions(whale_min, whale_since, limit),
         state.store.latest_price(),
     );
-    let stats = stats?;
     let ticks = ticks?;
     let transactions = transactions?;
     let events = events?;
@@ -167,6 +174,7 @@ async fn explorer_overview(
             "interval_seconds": interval,
             "limit": limit,
             "whale_min_amount": whale_min,
+            "whale_since_tick": whale_since,
             "generated_at": Utc::now(),
         }
     });

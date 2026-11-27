@@ -141,7 +141,8 @@ Relevant settings:
 | --- | --- | --- |
 | `INDEXER_FETCH_CONCURRENCY` | `32` | Fetch workers, balanced across healthy peers |
 | `INDEXER_FETCH_WINDOW` | `512` | Maximum tick bundles in flight or buffered |
-| `INDEXER_CONNECTIONS_PER_PEER` | `2` | Concurrent TCP connections to one peer |
+| `INDEXER_FETCH_BATCH` | `32` | Maximum ticks per peer fetch batch; halves on failure and floors at 4 |
+| `INDEXER_PEER_CONNECTIONS` | `4` | Concurrent TCP connections to one peer |
 | `INDEXER_WRITE_BATCH` | `128` | Maximum ticks per ClickHouse insert batch |
 | `INDEXER_WRITE_FLUSH_MS` | `250` | Maximum delay before a partial batch is flushed |
 | `INDEXER_VERIFY_CONCURRENCY` | CPU count minus one | Concurrent signature-verification tasks |
