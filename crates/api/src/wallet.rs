@@ -83,12 +83,12 @@ impl TransfersQuery {
 
 /// One ownership holder after ranking and truncation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct Holder {
+pub(crate) struct Holder {
     identity: String,
     shares: i64,
 }
 
-async fn connect(state: &AppState) -> Result<Peer, ApiError> {
+pub(crate) async fn connect(state: &AppState) -> Result<Peer, ApiError> {
     if state.peers.is_empty() {
         return Err(ApiError::unavailable(
             "no QUBIC_PEERS configured for peer-backed routes",
@@ -101,7 +101,7 @@ async fn connect(state: &AppState) -> Result<Peer, ApiError> {
         .map_err(|error| ApiError::unavailable(format!("peer connection failed: {error}")))
 }
 
-fn parse_identity(input: &str) -> Result<(String, PublicKey), ApiError> {
+pub(crate) fn parse_identity(input: &str) -> Result<(String, PublicKey), ApiError> {
     let identity = input.trim().to_ascii_uppercase();
     let key = PublicKey::from_identity(&identity)
         .map_err(|error| ApiError::invalid_identity(error.to_string()))?;
@@ -112,7 +112,7 @@ fn parse_identity(input: &str) -> Result<(String, PublicKey), ApiError> {
 ///
 /// Qubic asset names are uppercase ASCII letters or digits. Input is
 /// uppercased first so a lower-case path segment is still accepted.
-fn normalize_asset_name(input: &str) -> Result<String, ApiError> {
+pub(crate) fn normalize_asset_name(input: &str) -> Result<String, ApiError> {
     let name = input.trim().to_ascii_uppercase();
     if name.is_empty() || name.len() > 7 {
         return Err(ApiError::bad_request(
@@ -372,7 +372,7 @@ fn decorate_wallet_cache(value: &mut Value, stale: bool, age_seconds: u64, refre
     }
 }
 
-async fn build_wallet(
+pub(crate) async fn build_wallet(
     state: &AppState,
     identity: &str,
     key: PublicKey,
@@ -396,7 +396,7 @@ async fn build_wallet(
     let warning = warning
         .map(str::to_string)
         .or_else(|| assets.warning.clone());
-    let body = json!({
+    let mut body = json!({
         "data": {
             "identity": identity,
             "public_key": key.to_hex(),
@@ -421,6 +421,9 @@ async fn build_wallet(
             "warning": warning,
         }
     });
+    if let Some(data) = body.get_mut("data") {
+        state.labels.enrich_wallet(data, identity);
+    }
     Ok((body, assets.cacheable))
 }
 
@@ -665,31 +668,10 @@ async fn asset_holders(
     Path((issuer, name)): Path<(String, String)>,
     Query(params): Query<HoldersQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let (issuer, issuer_key) = parse_identity(&issuer)?;
+    let (issuer, _) = parse_identity(&issuer)?;
     let name = normalize_asset_name(&name)?;
-    let asset_name = encode_asset_name(&name)?;
     let limit = params.limit.unwrap_or(100).clamp(1, 1000);
-
-    let request = RequestAssets::ByFilter {
-        request_type: ASSET_REQUEST_OWNERSHIP,
-        flags: ASSET_REQUEST_ANY_OWNER | ASSET_REQUEST_ANY_OWNERSHIP_MANAGING_CONTRACT,
-        ownership_managing_contract: 0,
-        possession_managing_contract: 0,
-        issuer: issuer_key.0,
-        asset_name,
-        owner: [0u8; 32],
-        possessor: [0u8; 32],
-    };
-    let mut peer = connect(&state).await?;
-    let records = peer
-        .asset_records(&request)
-        .await
-        .map_err(|error| ApiError::unavailable(format!("asset holder lookup failed: {error}")))?;
-    let entries = records
-        .iter()
-        .map(AssetRecordResponse::record)
-        .filter_map(ownership_holder);
-    let (holders, truncated) = rank_holders(entries, limit);
+    let (holders, truncated) = holders_for(&state, &issuer, &name, limit).await?;
 
     Ok((
         [(header::CACHE_CONTROL, HeaderValue::from_static("no-store"))],
@@ -705,6 +687,37 @@ async fn asset_holders(
             }
         })),
     ))
+}
+
+/// Ownership holders for an asset, ranked by shares.
+pub(crate) async fn holders_for(
+    state: &AppState,
+    issuer: &str,
+    name: &str,
+    limit: u32,
+) -> Result<(Vec<Holder>, bool), ApiError> {
+    let (_, issuer_key) = parse_identity(issuer)?;
+    let asset_name = encode_asset_name(name)?;
+    let request = RequestAssets::ByFilter {
+        request_type: ASSET_REQUEST_OWNERSHIP,
+        flags: ASSET_REQUEST_ANY_OWNER | ASSET_REQUEST_ANY_OWNERSHIP_MANAGING_CONTRACT,
+        ownership_managing_contract: 0,
+        possession_managing_contract: 0,
+        issuer: issuer_key.0,
+        asset_name,
+        owner: [0u8; 32],
+        possessor: [0u8; 32],
+    };
+    let mut peer = connect(state).await?;
+    let records = peer
+        .asset_records(&request)
+        .await
+        .map_err(|error| ApiError::unavailable(format!("asset holder lookup failed: {error}")))?;
+    let entries = records
+        .iter()
+        .map(AssetRecordResponse::record)
+        .filter_map(ownership_holder);
+    Ok(rank_holders(entries, limit))
 }
 
 /// Ownership and possession transfers for one asset, newest first.

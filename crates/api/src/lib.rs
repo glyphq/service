@@ -18,11 +18,16 @@ use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetReques
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 
 pub mod advanced;
+pub mod batch;
+pub mod contracts;
 pub mod crypto;
 pub mod dto;
 pub mod entity_cache;
 pub mod error;
+pub mod exports;
+pub mod graph;
 pub mod identity;
+pub mod labels;
 pub mod lifecycle;
 pub mod lifecycle_link;
 pub mod lifecycle_stream;
@@ -32,6 +37,7 @@ pub mod mempool;
 pub mod metrics;
 pub mod network;
 pub mod openapi;
+pub mod overview;
 pub mod peer;
 pub mod prices;
 pub mod routes;
@@ -71,6 +77,8 @@ pub struct AppState {
     pub webhooks: Option<Arc<webhook::Webhooks>>,
     /// Encrypted, expiring links for the transaction lifecycle stream.
     pub lifecycle_links: Option<Arc<lifecycle_link::LifecycleLinks>>,
+    /// Operator-maintained presentation labels.
+    pub labels: Arc<labels::Labels>,
     /// Short-lived cache for peer-backed reads.
     pub live_cache: Arc<peer::LiveCache>,
     /// Deduplicates background entity and wallet refreshes per identity.
@@ -103,6 +111,7 @@ impl AppState {
             mempool: None,
             webhooks: None,
             lifecycle_links: None,
+            labels: Arc::new(labels::Labels::from_env()),
             invalidator: peer::EntityInvalidator::new(live_cache.clone()),
             live_cache,
             refreshes: Arc::new(peer::RefreshCoordinator::default()),
@@ -217,6 +226,12 @@ pub fn router(state: AppState) -> Router {
         .merge(network::router())
         .merge(lifecycle::router())
         .merge(lifecycle_stream::router())
+        .merge(labels::router())
+        .merge(overview::router())
+        .merge(contracts::router())
+        .merge(exports::router())
+        .merge(batch::router())
+        .merge(graph::router())
         .merge(market::router())
         .merge(prices::router())
         .merge(stream::router())
@@ -486,6 +501,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
                     Ok(()) => {
                         let webhooks = Arc::new(webhook::Webhooks::new(
                             gateway.clone(),
+                            store.clone(),
                             webhook_config,
                             cancel.clone(),
                         ));
@@ -537,6 +553,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         mempool,
         webhooks,
         lifecycle_links,
+        labels: Arc::new(labels::Labels::from_env()),
         live_cache,
         invalidator,
         refreshes: Arc::new(peer::RefreshCoordinator::default()),

@@ -132,6 +132,7 @@ fn tags() -> Value {
         { "name": "Identities", "description": "History, flow, counterparties." },
         { "name": "Wallets", "description": "Balances and asset holdings." },
         { "name": "Assets", "description": "Issuances, transfers, holders." },
+        { "name": "Contracts", "description": "Observed contract indices, events, and dividends." },
         { "name": "Prices", "description": "QUBIC/USDT series." },
         { "name": "Market", "description": "External market reference." },
         { "name": "Analytics", "description": "Network aggregates." },
@@ -151,7 +152,7 @@ fn tag_groups() -> Value {
     json!([
         { "name": "Overview", "tags": ["Status", "Search"] },
         { "name": "Chain Data", "tags": ["Epochs", "Ticks", "Transactions", "Events", "Archive"] },
-        { "name": "Accounts & Assets", "tags": ["Identities", "Wallets", "Assets"] },
+        { "name": "Accounts & Assets", "tags": ["Identities", "Wallets", "Assets", "Contracts"] },
         { "name": "Broadcast & Delivery", "tags": ["Broadcast", "Webhooks"] },
         { "name": "Network", "tags": ["Network", "Revenue", "Oracles"] },
         { "name": "Markets & Analytics", "tags": ["Prices", "Market", "Analytics"] },
@@ -706,6 +707,54 @@ fn paths() -> Value {
                     }
                 }
             },
+            "/v1/identities/{identity}/balance-history": {
+                "get": {
+                    "operationId": "getIdentityBalanceHistory",
+                    "tags": ["Identities"],
+                    "summary": "Get cumulative balance history",
+                    "description": "Zero-filled indexed transfer buckets in chronological order with a cumulative net delta. This is not the live spectrum balance.",
+                    "parameters": [
+                        identity_param(),
+                        { "name": "interval", "in": "query", "schema": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 3600 } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 168 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Cumulative flow buckets" },
+                        "400": { "description": "Invalid identity or interval" },
+                        "404": { "description": "The index has no ticks yet" }
+                    }
+                }
+            },
+            "/v1/identities/{identity}/graph": {
+                "get": {
+                    "operationId": "getIdentityGraph",
+                    "tags": ["Identities"],
+                    "summary": "Get identity graph",
+                    "description": "Bounded relationship graph derived from aggregated counterparty transfers.",
+                    "parameters": [
+                        identity_param(),
+                        { "name": "depth", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 2, "default": 1 } },
+                        { "name": "direction", "in": "query", "schema": { "type": "string", "enum": ["all", "incoming", "outgoing"], "default": "all" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 } }
+                    ],
+                    "responses": { "200": { "description": "Nodes and edges" }, "400": { "description": "Invalid identity or direction" } }
+                }
+            },
+            "/v1/graph": {
+                "get": {
+                    "operationId": "getGraph",
+                    "tags": ["Identities"],
+                    "summary": "Get identity graph by query",
+                    "description": "Query-parameter alias of the identity graph route.",
+                    "parameters": [
+                        { "name": "identity", "in": "query", "required": true, "schema": { "type": "string" } },
+                        { "name": "depth", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 2, "default": 1 } },
+                        { "name": "direction", "in": "query", "schema": { "type": "string", "enum": ["all", "incoming", "outgoing"], "default": "all" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 } }
+                    ],
+                    "responses": { "200": { "description": "Nodes and edges" }, "400": { "description": "Missing or invalid identity" } }
+                }
+            },
             "/v1/identities/{identity}/events": {
                 "get": {
                     "operationId": "listIdentityEvents",
@@ -834,9 +883,148 @@ fn paths() -> Value {
                     "operationId": "search",
                     "tags": ["Search"],
                     "summary": "Search",
-                    "description": "Resolve ticks, hashes, identities, and assets.",
-                    "parameters": [{ "name": "q", "in": "query", "required": true, "schema": { "type": "string" } }],
+                    "description": "Resolve ticks, epochs, contracts, hashes and hash prefixes, identities and identity prefixes, assets, asset names, and operator labels.",
+                    "parameters": [
+                        { "name": "q", "in": "query", "required": true, "schema": { "type": "string" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 } }
+                    ],
                     "responses": { "200": { "description": "Typed matches", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SearchResults" } } } }, "400": { "description": "Missing query" } }
+                }
+            },
+            "/v1/labels": {
+                "get": {
+                    "operationId": "listLabels",
+                    "tags": ["Search"],
+                    "summary": "List operator labels",
+                    "description": "Presentation labels for identities, assets, and contract indices.",
+                    "parameters": [
+                        { "name": "q", "in": "query", "schema": { "type": "string" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 100 } }
+                    ],
+                    "responses": { "200": { "description": "Label registry entries" } }
+                }
+            },
+            "/v1/batch": {
+                "post": {
+                    "operationId": "batchReads",
+                    "tags": ["Search"],
+                    "summary": "Batch independent reads",
+                    "description": "Up to 100 typed reads per request. Each result carries its own status.",
+                    "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["requests"], "properties": { "requests": { "type": "array", "maxItems": 100, "items": { "type": "object", "required": ["type"], "properties": { "id": { "type": "string" }, "type": { "type": "string" }, "hash": { "type": "string" }, "tick": { "type": "integer" }, "epoch": { "type": "integer" }, "identity": { "type": "string" }, "issuer": { "type": "string" }, "name": { "type": "string" }, "contract_index": { "type": "integer" }, "limit": { "type": "integer" }, "offset": { "type": "integer" } } } } } } } } },
+                    "responses": { "200": { "description": "Per-request results" }, "400": { "description": "Invalid batch" } }
+                }
+            },
+            "/v1/explorer/overview": {
+                "get": {
+                    "operationId": "explorerOverview",
+                    "tags": ["Search"],
+                    "summary": "Explorer overview",
+                    "description": "Head, recent collections, analytics, top identities, contracts, whales, price, and market in one response.",
+                    "parameters": [
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 } },
+                        { "name": "interval", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 86400, "default": 3600 } },
+                        { "name": "min_amount", "in": "query", "schema": { "type": "integer", "minimum": 1 } }
+                    ],
+                    "responses": { "200": { "description": "Composite overview" } }
+                }
+            },
+            "/v1/identities/{identity}/overview": {
+                "get": {
+                    "operationId": "identityOverview",
+                    "tags": ["Search"],
+                    "summary": "Identity overview",
+                    "description": "One identity with flow buckets, counterparties, recent transactions, activity, and events.",
+                    "parameters": [identity_param(), { "name": "window", "in": "query", "schema": { "type": "integer", "minimum": 3600, "maximum": 2592000, "default": 86400 } }, { "name": "interval", "in": "query", "schema": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 3600 } }, { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 } }],
+                    "responses": { "200": { "description": "Identity, flow, counterparties, transactions, activity, and events" }, "404": { "description": "Identity not found" } }
+                }
+            },
+            "/v1/wallets/{identity}/overview": {
+                "get": {
+                    "operationId": "walletOverview",
+                    "tags": ["Wallets"],
+                    "summary": "Wallet overview",
+                    "description": "Wallet identity overview with a peer-backed wallet and asset section when peers are configured.",
+                    "parameters": [identity_param(), { "name": "window", "in": "query", "schema": { "type": "integer", "minimum": 3600, "maximum": 2592000, "default": 86400 } }, { "name": "interval", "in": "query", "schema": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 3600 } }, { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 } }],
+                    "responses": { "200": { "description": "Wallet overview including the peer wallet section when available" }, "404": { "description": "Identity not found" } }
+                }
+            },
+            "/v1/assets/{issuer}/{name}/overview": {
+                "get": {
+                    "operationId": "assetOverview",
+                    "tags": ["Assets"],
+                    "summary": "Asset overview",
+                    "description": "Issuance, transfer statistics, recent transfers, and ranked holders.",
+                    "parameters": [issuer_param(), { "name": "name", "in": "path", "required": true, "schema": { "type": "string" } }, { "name": "holder_limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 50 } }],
+                    "responses": { "200": { "description": "Issuance, stats, transfers, and holders" }, "404": { "description": "Asset not indexed" } }
+                }
+            },
+            "/v1/contracts": {
+                "get": {
+                    "operationId": "listContracts",
+                    "tags": ["Contracts"],
+                    "summary": "List observed contracts",
+                    "description": "Contract indices discovered from decoded events and dividend rows. Names come from optional operator labels.",
+                    "parameters": [limit_param(), offset_param()],
+                    "responses": { "200": { "description": "Contracts ordered by event count" } }
+                }
+            },
+            "/v1/contracts/dividends": {
+                "get": {
+                    "operationId": "listAllDividends",
+                    "tags": ["Contracts"],
+                    "summary": "List dividend epochs across contracts",
+                    "description": "Tick-level dividend rows grouped into one result per epoch and contract.",
+                    "parameters": [
+                        { "name": "epoch", "in": "query", "schema": { "type": "integer" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 } },
+                        { "name": "offset", "in": "query", "schema": { "type": "integer", "minimum": 0 } },
+                        { "name": "include", "in": "query", "schema": { "type": "string" }, "description": "Pass distributions to expand tick-level rows." }
+                    ],
+                    "responses": { "200": { "description": "Dividend rows grouped by epoch and contract" } }
+                }
+            },
+            "/v1/contracts/{contract_index}": {
+                "get": {
+                    "operationId": "getContract",
+                    "tags": ["Contracts"],
+                    "summary": "Contract overview",
+                    "description": "Observed contract summary with recent events and epoch-grouped dividends.",
+                    "parameters": [{ "name": "contract_index", "in": "path", "required": true, "schema": { "type": "integer" } }],
+                    "responses": { "200": { "description": "Summary, recent events, and dividends" }, "404": { "description": "Contract not observed" } }
+                }
+            },
+            "/v1/contracts/{contract_index}/events": {
+                "get": {
+                    "operationId": "listContractEvents",
+                    "tags": ["Contracts"],
+                    "summary": "List contract events",
+                    "description": "Decoded events emitted by one contract index, newest first.",
+                    "parameters": [{ "name": "contract_index", "in": "path", "required": true, "schema": { "type": "integer" } }, limit_param(), offset_param()],
+                    "responses": { "200": { "description": "Contract events" } }
+                }
+            },
+            "/v1/contracts/{contract_index}/dividends": {
+                "get": {
+                    "operationId": "listContractDividends",
+                    "tags": ["Contracts"],
+                    "summary": "List contract dividends",
+                    "description": "Dividend distributions for one contract grouped by epoch, optionally expanded per tick.",
+                    "parameters": [{ "name": "contract_index", "in": "path", "required": true, "schema": { "type": "integer" } }, { "name": "epoch", "in": "query", "schema": { "type": "integer" } }, limit_param(), offset_param(), { "name": "include", "in": "query", "schema": { "type": "string" } }],
+                    "responses": { "200": { "description": "Dividend epochs" } }
+                }
+            },
+            "/v1/export/{resource}": {
+                "get": {
+                    "operationId": "exportCollection",
+                    "tags": ["Search"],
+                    "summary": "Export a bounded collection",
+                    "description": "CSV or NDJSON snapshot of transactions, events, identities, assets, contracts, or dividends.",
+                    "parameters": [
+                        { "name": "resource", "in": "path", "required": true, "schema": { "type": "string", "enum": ["transactions", "events", "identities", "assets", "contracts", "dividends"] } },
+                        { "name": "format", "in": "query", "schema": { "type": "string", "enum": ["csv", "ndjson"], "default": "csv" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 10000, "default": 1000 } }
+                    ],
+                    "responses": { "200": { "description": "Export body", "content": { "text/csv": { "schema": { "type": "string" } }, "application/x-ndjson": { "schema": { "type": "string" } } } }, "404": { "description": "Unknown resource" } }
                 }
             },
             "/v1/transactions/batch": {
@@ -888,17 +1076,54 @@ fn paths() -> Value {
                     "responses": { "200": { "description": "Event type counts, highest first", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/EventTypePage" } } } } }
                 }
             },
+            "/v1/analytics/whales": {
+                "get": {
+                    "operationId": "listWhales",
+                    "tags": ["Analytics"],
+                    "summary": "List whale transfers",
+                    "description": "Indexed transactions at or above the operator whale threshold.",
+                    "parameters": [
+                        { "name": "min_amount", "in": "query", "schema": { "type": "integer", "minimum": 1 }, "description": "Defaults to GLYPH_WHALE_MIN_AMOUNT." },
+                        { "name": "since_tick", "in": "query", "schema": { "type": "integer" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 25 } }
+                    ],
+                    "responses": { "200": { "description": "Transactions at or above the threshold, newest tick first" } }
+                }
+            },
+            "/v1/analytics/active-identities": {
+                "get": {
+                    "operationId": "listActiveIdentities",
+                    "tags": ["Analytics"],
+                    "summary": "Unique active identities per bucket",
+                    "description": "Distinct identities seen in transfers and event participants per time bucket.",
+                    "parameters": [
+                        { "name": "interval", "in": "query", "schema": { "type": "integer", "minimum": 60, "maximum": 86400, "default": 3600 } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 24 } }
+                    ],
+                    "responses": { "200": { "description": "Activity buckets, newest first" } }
+                }
+            },
+            "/v1/analytics/network": {
+                "get": {
+                    "operationId": "getAnalyticsNetwork",
+                    "tags": ["Analytics"],
+                    "summary": "Index-wide network counts",
+                    "description": "Head, epoch, tick, transaction, event, and identity counts from the index.",
+                    "responses": { "200": { "description": "Head and collection counts" } }
+                }
+            },
             // Streaming
             "/v1/stream": {
                 "get": {
                     "operationId": "streamAll",
                     "tags": ["Stream"],
                     "summary": "Stream all events",
-                    "description": "SSE feed for ticks, transactions, events, prices, and market.",
+                    "description": "SSE feed for ticks, transactions, whale transfers, events, prices, and market. Supports Last-Event-ID and since_tick replay.",
                     "parameters": [
-                        { "name": "types", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated subset of tick,transaction,event,price,market. The poll interval is set on the server with STREAM_POLL_MS." },
+                        { "name": "types", "in": "query", "schema": { "type": "string" }, "description": "Comma-separated subset of tick,transaction,whale,event,price,market. The poll interval is set on the server with STREAM_POLL_MS." },
                         { "name": "identity", "in": "query", "schema": { "type": "string" }, "description": "Only emit transactions and events that mention this identity. Tick, price, and market events are suppressed while this filter is set." },
-                        { "name": "asset", "in": "query", "schema": { "type": "string" }, "description": "Only emit asset events for {issuer}/{name}." }
+                        { "name": "asset", "in": "query", "schema": { "type": "string" }, "description": "Only emit asset events for {issuer}/{name}." },
+                        { "name": "since_tick", "in": "query", "schema": { "type": "integer" }, "description": "Replay indexed ticks after this tick before switching to live events. Capped at 500 ticks." }
                     ],
                     "responses": {
                         "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
@@ -1085,6 +1310,20 @@ fn paths() -> Value {
                     }
                 }
             },
+            "/v1/ticks/{tick}/votes": {
+                "get": {
+                    "operationId": "listTickVotes",
+                    "tags": ["Archive"],
+                    "summary": "List archived quorum votes",
+                    "description": "Vote computor indices, signatures, and a signer bitmap. Votes require `ARCHIVE_VOTES=true`.",
+                    "parameters": [tick_param()],
+                    "responses": {
+                        "200": { "description": "Archived votes and bitmap" },
+                        "404": { "description": "Tick or votes not archived" },
+                        "503": { "description": "Archive not configured or unreadable" }
+                    }
+                }
+            },
             "/v1/live/contracts/{contract_index}/query": {
                 "post": {
                     "operationId": "queryContract",
@@ -1128,7 +1367,7 @@ fn paths() -> Value {
                     "operationId": "registerWebhook",
                     "tags": ["Webhooks"],
                     "summary": "Register webhook",
-                    "description": "Signed single-attempt delivery for tracked transaction events. Secrets and full URLs are never returned.",
+                    "description": "Signed single-attempt delivery for transaction lifecycle, on-chain event, and whale events. Secrets and full URLs are never returned.",
                     "requestBody": {
                         "required": true,
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/WebhookRegistration" } } }
@@ -1176,6 +1415,30 @@ fn paths() -> Value {
                         },
                         "404": { "description": "Webhook not found" }
                     }
+                }
+            },
+            "/v1/webhooks/{id}/test": {
+                "post": {
+                    "operationId": "testWebhook",
+                    "tags": ["Webhooks"],
+                    "summary": "Queue a synthetic delivery",
+                    "description": "Queues a webhook.test payload through the normal signed dispatcher.",
+                    "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+                    "responses": { "202": { "description": "Test delivery queued" }, "404": { "description": "Webhook not found" } }
+                }
+            },
+            "/v1/webhooks/{id}/replay": {
+                "post": {
+                    "operationId": "replayWebhook",
+                    "tags": ["Webhooks"],
+                    "summary": "Replay stored deliveries",
+                    "description": "Re-queues stored deliveries with their original payloads.",
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+                        { "name": "event", "in": "query", "schema": { "type": "string" } },
+                        { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 } }
+                    ],
+                    "responses": { "202": { "description": "Deliveries queued" }, "404": { "description": "Webhook not found" } }
                 }
             },
             // Prices and market
@@ -1309,11 +1572,13 @@ fn schemas() -> Value {
                         "secret": { "type": "string", "minLength": 16, "description": "HMAC signing key." },
                         "events": {
                             "type": "array",
-                            "description": "Events to deliver. Empty means all.",
-                            "items": { "type": "string", "enum": ["transaction.queued", "transaction.broadcast", "transaction.confirmed", "transaction.expired", "transaction.failed"] }
+                            "description": "Events to deliver. Empty means all. Supports transaction lifecycle events, onchain, onchain.*, onchain.<type>, and event.<type>.",
+                            "items": { "type": "string" }
                         },
                         "transaction_hashes": { "type": "array", "description": "Hashes to match. Empty means all.", "items": { "type": "string" } },
-                        "identity": { "type": "string", "description": "Source identity to match. Empty means all." }
+                        "identity": { "type": "string", "description": "Source identity or on-chain participant to match. Empty means all." },
+                        "asset": { "type": "string", "description": "Optional {issuer}/{name} filter for on-chain asset events." },
+                        "contract_index": { "type": "integer", "minimum": 0, "description": "Optional contract index filter for on-chain events." }
                     }
                 },
                 "Webhook": {
@@ -1325,6 +1590,8 @@ fn schemas() -> Value {
                         "events": { "type": "array", "items": { "type": "string" } },
                         "transaction_hashes": { "type": "array", "items": { "type": "string" } },
                         "identity": { "type": "string", "description": "Empty matches all identities." },
+                        "asset": { "type": "string" },
+                        "contract_index": { "type": "integer" },
                         "active": { "type": "boolean" },
                         "created_at": { "type": "string", "format": "date-time" },
                         "updated_at": { "type": "string", "format": "date-time" }
@@ -1336,7 +1603,7 @@ fn schemas() -> Value {
                     "properties": {
                         "id": { "type": "string" },
                         "webhook_id": { "type": "string" },
-                        "event": { "type": "string", "enum": ["transaction.queued", "transaction.broadcast", "transaction.confirmed", "transaction.expired", "transaction.failed"] },
+                        "event": { "type": "string", "description": "Lifecycle, onchain.<type>, onchain.whale, or webhook.test." },
                         "transaction_hash": { "type": "string" },
                         "status": { "type": "string", "enum": ["pending", "sending", "delivered", "failed"] },
                         "attempt": { "type": "integer", "description": "0 before claim, 1 after the single attempt." },
@@ -2176,6 +2443,9 @@ mod tests {
             "/v1/identities/{identity}/activity",
             "/v1/identities/{identity}/counterparties",
             "/v1/identities/{identity}/flow",
+            "/v1/identities/{identity}/balance-history",
+            "/v1/identities/{identity}/graph",
+            "/v1/graph",
             "/v1/identities/{identity}/events",
             "/v1/assets",
             "/v1/assets/{issuer}/{name}",
@@ -2203,6 +2473,7 @@ mod tests {
             "/v1/transactions/validate",
             "/v1/live/ticks/{tick}/transactions",
             "/v1/ticks/{tick}/raw",
+            "/v1/ticks/{tick}/votes",
             "/v1/live/contracts/{contract_index}/query",
             "/v1/prices",
             "/v1/prices/history",
@@ -2210,9 +2481,26 @@ mod tests {
             "/v1/prices/snapshot",
             "/v1/market",
             "/v1/search",
+            "/v1/labels",
+            "/v1/batch",
+            "/v1/explorer/overview",
+            "/v1/identities/{identity}/overview",
+            "/v1/wallets/{identity}/overview",
+            "/v1/assets/{issuer}/{name}/overview",
+            "/v1/contracts",
+            "/v1/contracts/dividends",
+            "/v1/contracts/{contract_index}",
+            "/v1/contracts/{contract_index}/events",
+            "/v1/contracts/{contract_index}/dividends",
+            "/v1/export/{resource}",
+            "/v1/analytics/whales",
+            "/v1/analytics/active-identities",
+            "/v1/analytics/network",
             "/v1/webhooks",
             "/v1/webhooks/{id}",
             "/v1/webhooks/{id}/deliveries",
+            "/v1/webhooks/{id}/test",
+            "/v1/webhooks/{id}/replay",
         ] {
             assert!(paths.contains_key(path), "missing {path}");
         }

@@ -42,6 +42,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/transactions/validate", post(validate))
         .route("/v1/live/ticks/{tick}/transactions", get(tx_status))
         .route("/v1/ticks/{tick}/raw", get(raw_bundle))
+        .route("/v1/ticks/{tick}/votes", get(tick_votes))
         .route(
             "/v1/live/contracts/{contract_index}/query",
             post(contract_query),
@@ -170,6 +171,89 @@ async fn raw_bundle(
             ),
         ],
         payload,
+    ))
+}
+
+/// Archived quorum votes for one tick, with a signer bitmap.
+///
+/// Votes are optional in the raw archive. This route returns a clear 404 when
+/// the bundle was written with the default `ARCHIVE_VOTES=false` policy.
+async fn tick_votes(
+    State(state): State<AppState>,
+    Path(tick): Path<String>,
+) -> Result<impl IntoResponse, ApiError> {
+    let tick = parse_tick(&tick)?;
+    let Some(archive) = state.archive.clone() else {
+        return Err(ApiError::unavailable(
+            "raw archive is not configured; set S3_BUCKET or ARCHIVE_DIR",
+        ));
+    };
+    let row = state
+        .store
+        .tick(tick)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("tick {tick} is not indexed")))?;
+    let bundle = archive::get_bundle(archive.as_ref(), row.epoch, tick)
+        .await
+        .map_err(|error| ApiError::unavailable(format!("raw archive read failed: {error}")))?
+        .ok_or_else(|| {
+            ApiError::not_found(format!("raw bundle for tick {tick} is not archived"))
+        })?;
+    if bundle.votes.is_empty() {
+        return Err(ApiError::not_found(format!(
+            "votes for tick {tick} are not archived; set ARCHIVE_VOTES=true to store votes for new ticks"
+        )));
+    }
+    if bundle.votes.len() % qubic::messages::TICK_SIZE != 0 {
+        return Err(ApiError::internal(
+            "archived vote section is not a whole number of votes",
+        ));
+    }
+    let mut votes: Vec<(u16, String)> = bundle
+        .votes
+        .chunks_exact(qubic::messages::TICK_SIZE)
+        .map(|payload| {
+            let vote = qubic::messages::Tick::decode(payload)
+                .map_err(|error| ApiError::internal(format!("decode archived vote: {error}")))?;
+            Ok((vote.computor_index, hex::encode(vote.signature)))
+        })
+        .collect::<Result<_, ApiError>>()?;
+    votes.sort_by_key(|(index, _)| *index);
+    let mut bitmap = vec![0u8; qubic::messages::COMPUTOR_COUNT.div_ceil(8)];
+    for (index, _) in &votes {
+        let index = usize::from(*index);
+        if index < qubic::messages::COMPUTOR_COUNT {
+            bitmap[index / 8] |= 1 << (index % 8);
+        }
+    }
+    let data: Vec<Value> = votes
+        .iter()
+        .map(|(index, signature)| json!({ "computor_index": index, "signature": signature }))
+        .collect();
+    Ok((
+        [
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=31536000, immutable"),
+            ),
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+        ],
+        Json(json!({
+            "data": data,
+            "meta": {
+                "tick": tick,
+                "epoch": row.epoch,
+                "count": votes.len(),
+                "computors": qubic::messages::COMPUTOR_COUNT,
+                "bitmap": hex::encode(bitmap),
+                "source": "archive",
+                "signatures_verified": false,
+                "note": "Signatures are returned as archived. Verify them against the epoch computor set before relying on signer authority.",
+            }
+        })),
     ))
 }
 

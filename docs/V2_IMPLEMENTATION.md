@@ -134,14 +134,15 @@ Environment:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `MEMPOOL_ENABLED` | `true` | Enable mempool persistence and background tracking. |
-| `MEMPOOL_POLL_MS` | `1000` | Status poll interval. |
-| `MEMPOOL_RETRY_MS` | `5000` | Minimum delay between rebroadcasts. |
-| `MEMPOOL_MAX_ATTEMPTS` | `5` | Maximum broadcast attempts. |
+| `MEMPOOL_POLL_MS` | `500` | Status poll interval. |
+| `MEMPOOL_RETRY_MS` | `1000` | Minimum delay between rebroadcasts. |
+| `MEMPOOL_MAX_ATTEMPTS` | `10` | Maximum broadcast attempts. |
 | `MEMPOOL_EXPIRY_TICKS` | `10` | Expiry window after the target tick. |
 | `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open mempool entries. |
 | `WEBHOOK_TIMEOUT_MS` | `5000` | Delivery timeout. |
-| `WEBHOOK_MAX_ATTEMPTS` | `6` | Delivery attempts before dead-lettering. |
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost/private webhook targets. |
+| `GLYPH_LABELS_FILE` | unset | Operator label registry for identities, assets, and contracts. |
+| `GLYPH_WHALE_MIN_AMOUNT` | `1000000000` | Whale threshold in qu. |
 
 Statuses:
 

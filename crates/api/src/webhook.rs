@@ -56,6 +56,9 @@ const ENCRYPTED_URL_PREFIX: &str = "enc:v1:";
 /// stale after this long. The grace period covers registration before submit.
 const MISSING_ENTRY_GRACE: chrono::TimeDelta = chrono::TimeDelta::minutes(60);
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+const ONCHAIN_INTERVAL: Duration = Duration::from_secs(2);
+const ONCHAIN_CURSOR_ID: &str = "onchain-events-v1";
+const MAX_ONCHAIN_TICKS: u32 = 100;
 
 /// Encrypts webhook targets at rest with a deployment-provided key.
 #[derive(Clone)]
@@ -171,12 +174,17 @@ pub struct RegisterRequest {
     pub transaction_hashes: Vec<String>,
     #[serde(default)]
     pub identity: Option<String>,
+    #[serde(default)]
+    pub asset: Option<String>,
+    #[serde(default)]
+    pub contract_index: Option<u32>,
 }
 
 /// Shared webhook service held in [`AppState`].
 #[derive(Clone)]
 pub struct Webhooks {
     gateway: Arc<store::gateway::GatewayStore>,
+    store: Arc<dyn store::Store>,
     config: Arc<WebhookConfig>,
     client: reqwest::Client,
     cancel: CancellationToken,
@@ -185,6 +193,7 @@ pub struct Webhooks {
 impl Webhooks {
     pub fn new(
         gateway: Arc<store::gateway::GatewayStore>,
+        store: Arc<dyn store::Store>,
         config: WebhookConfig,
         cancel: CancellationToken,
     ) -> Self {
@@ -197,6 +206,7 @@ impl Webhooks {
             .unwrap_or_default();
         Self {
             gateway,
+            store,
             config: Arc::new(config),
             client,
             cancel,
@@ -216,7 +226,7 @@ impl Webhooks {
             if event.is_empty() {
                 continue;
             }
-            if !EVENTS.contains(&event) {
+            if !valid_event(event) {
                 return Err(ApiError::bad_request(format!(
                     "unknown webhook event {event:?}; supported events are {}",
                     EVENTS.join(", ")
@@ -250,6 +260,11 @@ impl Webhooks {
                 identity
             }
         };
+        let asset = match request.asset.as_deref().map(str::trim) {
+            None | Some("") => String::new(),
+            Some(asset) => normalize_asset_filter(asset).map_err(ApiError::bad_request)?,
+        };
+        let contract_index = request.contract_index.unwrap_or(0);
 
         let stored_url = match &self.config.cipher {
             Some(cipher) => cipher
@@ -265,6 +280,8 @@ impl Webhooks {
             events,
             transaction_hashes: hashes,
             identity,
+            asset,
+            contract_index,
             active: true,
             created_at: now,
             updated_at: now,
@@ -287,6 +304,8 @@ impl Webhooks {
             events: Vec::new(),
             transaction_hashes: vec![hash],
             identity: None,
+            asset: None,
+            contract_index: None,
         })
         .await
     }
@@ -331,6 +350,8 @@ impl Webhooks {
             "events": webhook.events,
             "transaction_hashes": webhook.transaction_hashes,
             "identity": webhook.identity,
+            "asset": webhook.asset,
+            "contract_index": webhook.contract_index,
             "active": webhook.active,
             "created_at": webhook.created_at,
             "updated_at": webhook.updated_at,
@@ -371,6 +392,212 @@ impl Webhooks {
         Ok(())
     }
 
+    /// Queues an on-chain event delivery.
+    async fn queue_onchain(
+        &self,
+        webhook: &Webhook,
+        event: &str,
+        transaction_hash: &str,
+        payload: Value,
+    ) -> Result<(), ApiError> {
+        let now = Utc::now();
+        self.gateway
+            .insert_delivery(&WebhookDelivery {
+                id: uuid::Uuid::new_v4().to_string(),
+                webhook_id: webhook.id.clone(),
+                event: event.to_owned(),
+                transaction_hash: transaction_hash.to_owned(),
+                status: "pending".to_owned(),
+                attempt: 0,
+                next_attempt_at: Some(now),
+                response_status: None,
+                error: None,
+                payload: payload.to_string(),
+                created_at: now,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Advances the on-chain source over indexed ticks. The cursor is persisted
+    /// after every tick so a restart resumes instead of replaying history.
+    async fn dispatch_onchain(&self) -> Result<(), ApiError> {
+        let Some(head) = self.store.head().await? else {
+            return Ok(());
+        };
+        let Some(cursor) = self.gateway.webhook_cursor(ONCHAIN_CURSOR_ID).await? else {
+            self.gateway
+                .set_webhook_cursor(ONCHAIN_CURSOR_ID, head.tick)
+                .await?;
+            return Ok(());
+        };
+        if head.tick <= cursor {
+            return Ok(());
+        }
+        let from = cursor.saturating_add(1);
+        let to = head.tick.min(from.saturating_add(MAX_ONCHAIN_TICKS - 1));
+        let webhooks = self.gateway.active_webhooks().await?;
+        for tick in from..=to {
+            if webhooks.is_empty() {
+                self.gateway
+                    .set_webhook_cursor(ONCHAIN_CURSOR_ID, tick)
+                    .await?;
+                continue;
+            }
+            let mut offset = 0;
+            loop {
+                let rows = self.store.events_for_tick(tick, 4096, offset).await?;
+                let count = rows.len();
+                for row in rows {
+                    let body: Value = serde_json::from_str(&row.body).unwrap_or(Value::Null);
+                    for webhook in &webhooks {
+                        if !webhook_matches_onchain(webhook, &row.type_name, &row.tx_hash, &body) {
+                            continue;
+                        }
+                        let event = format!("onchain.{}", row.type_name);
+                        let payload = json!({
+                            "event": event,
+                            "onchain": {
+                                "type": row.type_name,
+                                "epoch": row.epoch,
+                                "tick": row.tick,
+                                "log_id": row.log_id,
+                                "tx_hash": row.tx_hash,
+                                "tx_index": row.tx_index,
+                                "body": body,
+                                "timestamp": row.timestamp,
+                            }
+                        });
+                        self.queue_onchain(webhook, &event, &row.tx_hash, payload)
+                            .await?;
+                    }
+                }
+                if count < 4096 {
+                    break;
+                }
+                offset += count as u64;
+            }
+            let whale_min = crate::overview::whale_min_amount();
+            let mut offset = 0;
+            loop {
+                let rows = self.store.transactions_for_tick(tick, 4096, offset).await?;
+                let count = rows.len();
+                for transaction in rows {
+                    if transaction.amount < whale_min {
+                        continue;
+                    }
+                    for webhook in &webhooks {
+                        if !webhook_matches_onchain(
+                            webhook,
+                            "whale",
+                            &transaction.hash,
+                            &Value::Null,
+                        ) || !webhook_matches_transaction_ends(
+                            webhook,
+                            &transaction.source,
+                            &transaction.destination,
+                        ) {
+                            continue;
+                        }
+                        let event = "onchain.whale";
+                        let payload = json!({
+                            "event": event,
+                            "onchain": {
+                                "type": "whale",
+                                "tick": tick,
+                                "transaction": transaction,
+                                "min_amount": whale_min,
+                            }
+                        });
+                        self.queue_onchain(webhook, event, &transaction.hash, payload)
+                            .await?;
+                    }
+                }
+                if count < 4096 {
+                    break;
+                }
+                offset += count as u64;
+            }
+            self.gateway
+                .set_webhook_cursor(ONCHAIN_CURSOR_ID, tick)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Queues a synthetic delivery so an operator can verify signature handling
+    /// and connectivity without waiting for chain activity.
+    pub async fn enqueue_test(&self, id: &str) -> Result<WebhookDelivery, ApiError> {
+        let webhook = self
+            .gateway
+            .webhook(id)
+            .await?
+            .ok_or_else(|| ApiError::not_found(format!("webhook {id} does not exist")))?;
+        if !webhook.active {
+            return Err(ApiError::bad_request(format!("webhook {id} is inactive")));
+        }
+        let now = Utc::now();
+        let delivery = WebhookDelivery {
+            id: uuid::Uuid::new_v4().to_string(),
+            webhook_id: webhook.id,
+            event: "webhook.test".to_owned(),
+            transaction_hash: String::new(),
+            status: "pending".to_owned(),
+            attempt: 0,
+            next_attempt_at: Some(now),
+            response_status: None,
+            error: None,
+            payload: json!({
+                "event": "webhook.test",
+                "webhook_id": id,
+                "created_at": now,
+                "note": "Synthetic delivery requested through POST /v1/webhooks/{id}/test.",
+            })
+            .to_string(),
+            created_at: now,
+        };
+        self.gateway.insert_delivery(&delivery).await?;
+        Ok(delivery)
+    }
+
+    /// Re-queues stored deliveries for one webhook, preserving their payloads.
+    pub async fn replay(
+        &self,
+        id: &str,
+        event: Option<&str>,
+        limit: u32,
+    ) -> Result<usize, ApiError> {
+        self.gateway
+            .webhook(id)
+            .await?
+            .ok_or_else(|| ApiError::not_found(format!("webhook {id} does not exist")))?;
+        let rows = self.gateway.deliveries(id, limit.clamp(1, 500)).await?;
+        let mut count = 0;
+        for row in rows {
+            if event.is_some_and(|event| row.event != event) {
+                continue;
+            }
+            let now = Utc::now();
+            self.gateway
+                .insert_delivery(&WebhookDelivery {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    webhook_id: row.webhook_id,
+                    event: row.event,
+                    transaction_hash: row.transaction_hash,
+                    status: "pending".to_owned(),
+                    attempt: 0,
+                    next_attempt_at: Some(now),
+                    response_status: None,
+                    error: None,
+                    payload: row.payload,
+                    created_at: now,
+                })
+                .await?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Transaction-scoped registrations stop matching once the transaction is
     /// terminal. Queued deliveries still run; the row is deleted after they
     /// finish.
@@ -395,6 +622,8 @@ impl Webhooks {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut reconcile = tokio::time::interval(RECONCILE_INTERVAL);
         reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut onchain = tokio::time::interval(ONCHAIN_INTERVAL);
+        onchain.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => break,
@@ -406,6 +635,11 @@ impl Webhooks {
                 _ = reconcile.tick() => {
                     if let Err(error) = self.reconcile().await {
                         tracing::warn!(?error, "webhook reconciliation failed");
+                    }
+                }
+                _ = onchain.tick() => {
+                    if let Err(error) = self.dispatch_onchain().await {
+                        tracing::warn!(?error, "on-chain webhook dispatch failed");
                     }
                 }
             }
@@ -571,6 +805,41 @@ impl Webhooks {
     }
 }
 
+/// Transaction lifecycle events plus on-chain event selectors.
+fn valid_event(event: &str) -> bool {
+    EVENTS.contains(&event)
+        || matches!(event, "onchain" | "onchain.*" | "*")
+        || event.strip_prefix("onchain.").is_some_and(valid_event_name)
+        || event.strip_prefix("event.").is_some_and(valid_event_name)
+}
+
+fn valid_event_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn normalize_asset_filter(raw: &str) -> Result<String, String> {
+    let (issuer, name) = raw
+        .split_once('/')
+        .ok_or_else(|| "asset filter must be {issuer}/{name}".to_owned())?;
+    let issuer = issuer.trim().to_ascii_uppercase();
+    qubic::PublicKey::from_identity(&issuer)
+        .map_err(|error| format!("invalid asset issuer: {error}"))?;
+    let name = name.trim().to_ascii_uppercase();
+    if name.is_empty()
+        || name.len() > 7
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+    {
+        return Err("asset name must contain 1 to 7 uppercase ASCII letters or digits".to_owned());
+    }
+    Ok(format!("{issuer}/{name}"))
+}
+
 /// JSON body sent to a webhook endpoint. It is stored on the delivery row so
 /// the exact payload remains auditable.
 pub fn delivery_payload(event: &str, entry: &MempoolEntry, expiry_ticks: u32) -> String {
@@ -598,6 +867,95 @@ pub fn webhook_matches(webhook: &Webhook, event: &str, hash: &str, identity: &st
         return false;
     }
     true
+}
+
+fn webhook_matches_onchain(
+    webhook: &Webhook,
+    type_name: &str,
+    transaction_hash: &str,
+    body: &Value,
+) -> bool {
+    if !webhook.active {
+        return false;
+    }
+    let full_event = format!("onchain.{type_name}");
+    if !webhook.events.is_empty()
+        && !webhook.events.iter().any(|event| {
+            matches!(event.as_str(), "onchain" | "onchain.*" | "*")
+                || event == &full_event
+                || event
+                    .strip_prefix("onchain.")
+                    .is_some_and(|value| value == type_name)
+                || event
+                    .strip_prefix("event.")
+                    .is_some_and(|value| value == type_name)
+        })
+    {
+        return false;
+    }
+    if !webhook.transaction_hashes.is_empty()
+        && !webhook
+            .transaction_hashes
+            .iter()
+            .any(|hash| hash == transaction_hash)
+    {
+        return false;
+    }
+    if body.is_null() {
+        return true;
+    }
+    if !webhook.identity.is_empty() && !json_contains_identity(body, &webhook.identity) {
+        return false;
+    }
+    if !webhook.asset.is_empty() {
+        let Some((issuer, name)) = webhook.asset.split_once('/') else {
+            return false;
+        };
+        if body.get("issuer").and_then(Value::as_str) != Some(issuer)
+            || body.get("name").and_then(Value::as_str) != Some(name)
+        {
+            return false;
+        }
+    }
+    if webhook.contract_index != 0 {
+        let index = body
+            .get("contract_index")
+            .or_else(|| body.get("contractIndex"))
+            .and_then(|value| {
+                value
+                    .as_u64()
+                    .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+            })
+            .and_then(|value| u32::try_from(value).ok());
+        if index != Some(webhook.contract_index) {
+            return false;
+        }
+    }
+    true
+}
+
+fn webhook_matches_transaction_ends(webhook: &Webhook, source: &str, destination: &str) -> bool {
+    if !webhook.active {
+        return false;
+    }
+    if !webhook.identity.is_empty() && webhook.identity != source && webhook.identity != destination
+    {
+        return false;
+    }
+    webhook.asset.is_empty() && webhook.contract_index == 0
+}
+
+fn json_contains_identity(value: &Value, identity: &str) -> bool {
+    match value {
+        Value::String(text) => text == identity,
+        Value::Array(items) => items
+            .iter()
+            .any(|item| json_contains_identity(item, identity)),
+        Value::Object(map) => map
+            .values()
+            .any(|item| json_contains_identity(item, identity)),
+        _ => false,
+    }
 }
 
 pub fn is_terminal_event(event: &str) -> bool {
@@ -729,6 +1087,8 @@ pub fn router() -> Router<AppState> {
         .route("/v1/webhooks", post(register).get(list))
         .route("/v1/webhooks/{id}", delete(deactivate))
         .route("/v1/webhooks/{id}/deliveries", get(deliveries))
+        .route("/v1/webhooks/{id}/test", post(test_delivery))
+        .route("/v1/webhooks/{id}/replay", post(replay_deliveries))
 }
 
 fn service(state: &AppState) -> Result<Arc<Webhooks>, ApiError> {
@@ -802,6 +1162,50 @@ struct DeliveryQuery {
     limit: Option<u32>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ReplayQuery {
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+async fn test_delivery(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    let service = service(&state)?;
+    let delivery = service.enqueue_test(&id).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "data": {
+                "id": delivery.id,
+                "webhook_id": delivery.webhook_id,
+                "event": delivery.event,
+                "status": delivery.status,
+            }
+        })),
+    ))
+}
+
+async fn replay_deliveries(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<ReplayQuery>,
+) -> Result<impl axum::response::IntoResponse, ApiError> {
+    let service = service(&state)?;
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let count = service.replay(&id, params.event.as_deref(), limit).await?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "data": { "queued": count, "limit": limit, "event": params.event },
+            "meta": { "source": "webhook_deliveries" }
+        })),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +1219,8 @@ mod tests {
             events: events.iter().map(|value| (*value).to_owned()).collect(),
             transaction_hashes: hashes.iter().map(|value| (*value).to_owned()).collect(),
             identity: identity.to_owned(),
+            asset: String::new(),
+            contract_index: 0,
             active: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -1047,5 +1453,62 @@ mod tests {
         assert!(value.get("url").is_none());
         assert!(value.get("secret").is_none());
         assert_eq!(value["id"], "id");
+    }
+
+    #[test]
+    fn onchain_event_selectors_are_validated() {
+        assert!(valid_event("transaction.confirmed"));
+        assert!(valid_event("onchain"));
+        assert!(valid_event("onchain.*"));
+        assert!(valid_event("onchain.qu_transfer"));
+        assert!(valid_event("event.contract_error"));
+        assert!(!valid_event("onchain."));
+        assert!(!valid_event("other.event"));
+    }
+
+    #[test]
+    fn onchain_matching_applies_event_identity_asset_and_contract_filters() {
+        let mut hook = webhook(&["onchain.qu_transfer"], &[], "");
+        hook.identity = "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK".into();
+        hook.asset = format!("{}/QX", hook.identity);
+        hook.contract_index = 13;
+        let body = json!({
+            "from": hook.identity,
+            "to": "OTHER",
+            "issuer": hook.identity,
+            "name": "QX",
+            "contract_index": 13,
+        });
+        assert!(webhook_matches_onchain(&hook, "qu_transfer", "hash", &body));
+        assert!(!webhook_matches_onchain(
+            &hook,
+            "asset_issuance",
+            "hash",
+            &body
+        ));
+        let mut wrong_contract = body.clone();
+        wrong_contract["contract_index"] = json!(14);
+        assert!(!webhook_matches_onchain(
+            &hook,
+            "qu_transfer",
+            "hash",
+            &wrong_contract
+        ));
+    }
+
+    #[test]
+    fn whale_matching_uses_transfer_ends() {
+        let mut hook = webhook(&["onchain.whale"], &[], "");
+        hook.identity = "SOURCE".into();
+        assert!(webhook_matches_onchain(
+            &hook,
+            "whale",
+            "hash",
+            &Value::Null
+        ));
+        assert!(webhook_matches_transaction_ends(&hook, "SOURCE", "OTHER"));
+        assert!(!webhook_matches_transaction_ends(&hook, "OTHER", "THIRD"));
+        hook.asset = "ISSUER/QX".into();
+        assert!(!webhook_matches_transaction_ends(&hook, "SOURCE", "OTHER"));
     }
 }

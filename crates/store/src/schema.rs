@@ -331,6 +331,7 @@ pub const EPOCH_PARTITIONED_TABLES: &[&str] = &[
     "events",
     "event_participants",
     "quorum_evidence",
+    "contract_dividends",
 ];
 
 /// Epoch-keyed metadata tables that are not partitioned. Retention deletes
@@ -362,6 +363,34 @@ CREATE TABLE IF NOT EXISTS {database}.quorum_evidence
 ENGINE = ReplacingMergeTree(version)
 PARTITION BY epoch
 ORDER BY (epoch, tick)
+"#;
+
+/// Aggregate dividend distributions per contract and tick.
+///
+/// Core emits a start marker, one transfer per share possession, then an end
+/// marker. Glyph stores the aggregate and a K12 fingerprint of the transfer
+/// list so the API can show QUs per share without keeping a second copy of the
+/// individual logs.
+pub const CREATE_CONTRACT_DIVIDENDS: &str = r#"
+CREATE TABLE IF NOT EXISTS {database}.contract_dividends
+(
+    epoch UInt16,
+    tick UInt32,
+    start_log_id UInt64,
+    contract_index UInt32,
+    contract String,
+    total_amount Int64,
+    transfer_count UInt32,
+    recipient_count UInt32,
+    share_count UInt32,
+    amount_per_share Int64,
+    fingerprint FixedString(32),
+    timestamp DateTime64(3, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY epoch
+ORDER BY (epoch, contract_index, tick, start_log_id)
 "#;
 
 /// Hourly QUBIC/USDT oracle price points. Each `hour` is a logical row, so the
@@ -414,6 +443,7 @@ pub const ALL: &[&str] = &[
     CREATE_COMPUTORS,
     CREATE_EPOCHS,
     CREATE_QUORUM_EVIDENCE,
+    CREATE_CONTRACT_DIVIDENDS,
     CREATE_PRICE_POINTS,
 ];
 

@@ -772,6 +772,25 @@ Empty buckets are zero-filled so a chart can render the series directly.
 `meta.totals` sums the requested window. `counterparty_count` is the number of
 distinct counterparties inside one bucket.
 
+### `GET /v1/identities/{identity}/balance-history`
+
+Chronological cumulative net QU flow over the same buckets as `/flow`.
+`cumulative_net_amount` starts at zero at the oldest requested bucket, so it is a
+delta over the window, not the live spectrum balance. `meta.indexed_balance`
+carries the index-wide net flow and `meta.balance_source` is
+`indexed_transfer_flow`.
+
+### `GET /v1/identities/{identity}/graph`
+
+Bounded relationship graph built from aggregated counterparties. Query
+parameters are `depth` (1 or 2, default 1), `direction`
+(`all`, `incoming`, `outgoing`), and `limit` (1 to 50 neighbours, default 20).
+The response contains `nodes` with identity labels and `edges` with incoming,
+outgoing, net amounts, transaction count, and tick range. A depth-2 walk stops
+at 100 nodes. `GET /v1/graph?identity=` is the query-parameter alias.
+
+Edges are observed transfers, not proof of common ownership.
+
 ### `GET /v1/identities`
 
 Indexed identity summaries ordered by most recent activity, then canonical
@@ -1027,11 +1046,15 @@ identity resource so account pages do not need a second resource family.
 Resolves a value against the index. `q` is required and trimmed. Results are
 accumulated rather than stopping at the first match:
 
-1. All ASCII digits: try both a tick and an epoch.
-2. Lowercase value that decodes as a transaction hash: return the transaction.
-3. Uppercase value that decodes as an identity: return the identity.
+1. All ASCII digits: try a tick, an epoch, and a contract index.
+2. Lowercase hex: exact transaction hash, or a hash prefix of at least 6 hex
+   characters.
+3. Uppercase value: exact identity, or an identity prefix of at least 4
+   characters.
 4. `{issuer}/{name}`: return the asset when the issuer and name are valid.
-5. Otherwise return an empty list.
+5. Uppercase asset name of 2 to 7 digits or letters: asset-name prefix search.
+6. Operator labels matching the query by name, category, identity, asset, or
+   description.
 
 ```json
 {
@@ -1041,8 +1064,11 @@ accumulated rather than stopping at the first match:
 }
 ```
 
-`type` is `tick`, `epoch`, `transaction`, `identity`, or `asset`. A missing or
-empty `q` returns `400 bad_request`.
+`type` is `tick`, `epoch`, `contract`, `transaction`, `identity`, `asset`, or
+`label`. Prefix matches return up to `limit` rows per section (`limit` defaults
+to 10 and is clamped to `1..50`). A missing or empty `q` returns
+`400 bad_request`. Search is label-aware: identity, asset, contract, and
+transaction rows include operator labels when configured.
 
 ### `POST /v1/transactions/batch`
 
@@ -1071,6 +1097,73 @@ are collapsed. Unknown hashes do not fail the request; they are listed in
 
 More than 100 unique hashes, or a malformed hash, returns `400 bad_request`.
 
+### `POST /v1/batch`
+
+Executes up to 100 independent reads in one request. `requests` must be a
+non-empty array; each item has a `type` and its type-specific fields. Every
+result carries its own `status`, so a missing item does not fail the batch.
+
+```json
+{
+  "requests": [
+    { "id": "tx", "type": "transaction", "hash": "<hash>" },
+    { "id": "who", "type": "identity", "identity": "BZBQ..." },
+    { "id": "asset", "type": "asset", "issuer": "BZBQ...", "name": "QX" },
+    { "id": "logs", "type": "contract_events", "contract_index": 1, "limit": 5 }
+  ]
+}
+```
+
+Supported types: `transaction` (index first, then durable tracking),
+`tick`, `epoch`, `identity`, `asset`, `contract`, `contract_events`,
+`contract_dividends`, and `transactions` (for one identity).
+
+### Labels
+
+`GET /v1/labels?q=&limit=` returns the operator label registry. Labels are
+presentation metadata and never chain state. Set `GLYPH_LABELS_FILE` to load a
+JSON file with a top-level `labels` array; without it the API serves the small
+embedded registry. Identity, asset, contract, and transaction responses attach
+the matching label as a `label`, `source_label`, or `destination_label` field.
+
+### Explorer, identity, and asset overviews
+
+Composite routes join the index with labels, market data, and best-effort peer
+reads for a dashboard first paint.
+
+| Route | Meaning |
+| --- | --- |
+| `GET /v1/explorer/overview?limit=10` | Head and counts, recent ticks, transactions, events, activity, active identities, top identities, contracts, whales, on-chain price, and market snapshot. Unavailable sections are `null`. |
+| `GET /v1/wallets/{identity}/overview` | Identity row, optional wallet/asset view, flow buckets, counterparties, recent transactions, activity, and events. |
+| `GET /v1/identities/{identity}/overview` | Index-only identity overview; no peer wallet section. |
+| `GET /v1/assets/{issuer}/{name}/overview` | Issuance, transfer stats, recent transfers, and ranked holders when peers are configured. |
+
+### Contracts and dividends
+
+Contract indices are discovered from decoded event bodies and dividend rows.
+The API does not ship a contract registry; names are optional operator labels.
+
+| Route | Meaning |
+| --- | --- |
+| `GET /v1/contracts?limit=50&offset=0` | Observed contract indices by event count. |
+| `GET /v1/contracts/{contract_index}` | Summary, recent events, and epoch-grouped dividends. |
+| `GET /v1/contracts/{contract_index}/events` | Events for one contract, newest first. |
+| `GET /v1/contracts/{contract_index}/dividends` | Dividend rows grouped by epoch; `include=distributions` expands tick-level rows. |
+| `GET /v1/contracts/dividends` | All contracts, optionally filtered by `epoch`. |
+
+Dividend rows aggregate each START/END span: total amount, transfer count,
+unique recipients, share count, amount per share, and a K12 fingerprint over
+ordered `(recipient, amount)` pairs. `fingerprint` is hex encoded.
+
+### Exports
+
+`GET /v1/export/{resource}?format=csv|ndjson&limit=1000` exports a bounded
+snapshot with `Content-Disposition: attachment`. Resources are `transactions`,
+`events`, `identities`, `assets`, `contracts`, and `dividends`. Filters mirror
+the collection routes: `epoch`, `tick`, `min_tick`, `identity`, `type`,
+`issuer`, and `contract_index`. The hard cap is 10,000 rows. The
+`x-export-rows` header reports the emitted row count.
+
 ### Analytics
 
 Analytics routes read pre-aggregated projections in ClickHouse. They are
@@ -1081,6 +1174,9 @@ eventually consistent with the index head and are cached for 30 seconds.
 | `GET /v1/analytics/activity?interval=3600&limit=24` | Transaction, event, and tick counts per `interval`-second bucket, newest first. `interval` is clamped to `1..86400`; `limit` is clamped to `1..500`. |
 | `GET /v1/analytics/top-identities?limit=25` | Identities ranked by observed transfer count, then amount. `limit` is clamped to `1..200`. |
 | `GET /v1/analytics/event-types?limit=50` | Decoded event type counts, highest first. |
+| `GET /v1/analytics/whales?min_amount=&since_tick=&limit=25` | Transactions at or above `min_amount`, newest tick first. `min_amount` defaults to `GLYPH_WHALE_MIN_AMOUNT` (default `1000000000` qu). |
+| `GET /v1/analytics/active-identities?interval=3600&limit=24` | Unique identities active per bucket, from transfers and event participants. |
+| `GET /v1/analytics/network` | Index-wide head, epoch, tick, transaction, event, and identity counts. |
 
 Each returns `data` plus a `meta` object describing the effective `interval` and
 `limit`. Analytics routes do not use cursors.
@@ -1102,13 +1198,34 @@ verified and persisted.
 | `GET /v1/ws` | WebSocket carrying the same JSON events. |
 
 `GET /v1/stream` accepts `?types=tick,event` to select a subset. Event names are
-`tick`, `transaction`, `event`, `price`, and `market`; each SSE frame has an `id`
+`tick`, `transaction`, `whale`, `event`, `price`, and `market`; each SSE frame has an `id`
 and a JSON `data` payload. The type-specific routes always filter to their own
 event regardless of `types`. Add `identity=<identity>` to receive only
 transactions and events that mention one identity, and
 `asset=<issuer>/<name>` to receive only events for one asset. A filtered stream
 suppresses tick and price events. Both filters are applied per subscriber, so
 one broadcast still serves every client.
+
+`whale` events repeat a transaction that meets `GLYPH_WHALE_MIN_AMOUNT`
+(default `1000000000` qu) and include `amount`, `min_amount`, and the full
+`transaction` object.
+
+Resumable SSE: send `Last-Event-ID` (the `id` of the last processed frame) or
+`?since_tick=<tick>` to replay indexed ticks before switching to live events.
+Replay is capped at 500 ticks. The first frame is a `replay` event describing
+`since_tick`, `from_tick`, `to_tick`, and `truncated`; a failed replay emits
+`replay_error` and the live stream continues.
+
+WebSocket clients can change filters without reconnecting. Send a text frame:
+
+```json
+{"action":"subscribe","types":["transaction","whale"],"identity":"BZBQ..."}
+```
+
+`types` accepts a string or an array. `subscribe` replaces the current filters;
+`unsubscribe` with no `types` resets every filter, while
+`{"action":"unsubscribe","types":["whale"]}` removes selected types. Commands
+receive a `subscribed` acknowledgement or an `error` frame.
 
 The server sends a keep-alive comment every 15 seconds. If a client falls behind
 the internal 4096-event buffer, it receives a `lag` event with the number of
@@ -1636,9 +1753,10 @@ submissions return `429 tracking_full` before any peer socket is opened.
 It prevents a single wallet or script from consuming the whole pool and returns
 `429 source_tracking_full`.
 
-Terminal operational rows are removed by ClickHouse TTL one hour after their
-last update. Physical deletion is eventual because ClickHouse applies TTL during
-merges, but a terminal row never holds a capacity slot. The durable projection
+Operational mempool rows are removed by ClickHouse TTL seven days after their
+last update, regardless of status. Physical deletion is eventual because
+ClickHouse applies TTL during merges, but a terminal row never holds a capacity
+slot. The durable projection
 keeps confirmed, expired, and cancelled transaction pages readable for thirty
 days after their last update. Failed transactions have no TTL and remain
 queryable by hash indefinitely, with `status: "failed"` and `state: "failed"`.
@@ -1658,16 +1776,24 @@ client.
   "secret": "at-least-16-characters",
   "events": ["transaction.confirmed", "transaction.expired"],
   "transaction_hashes": ["abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefgh"],
-  "identity": "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK"
+  "identity": "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK",
+  "asset": "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK/QX",
+  "contract_index": 1
 }
 ```
 
 `secret` is required and must be at least 16 characters. Events are
 `transaction.queued`, `transaction.broadcast`, `transaction.confirmed`,
 `transaction.expired`, and `transaction.failed`. An
-empty or omitted `events` list subscribes to every transaction event. Empty
+empty or omitted `events` list subscribes to every event. On-chain selectors are
+`onchain`, `onchain.*`, `*`, `onchain.<type>` (for example
+`onchain.qu_transfer`), and `event.<type>`. `onchain.whale` delivers indexed
+transfers above `GLYPH_WHALE_MIN_AMOUNT`. Empty
 `transaction_hashes` means all hashes. Empty `identity` means all source
-identities; a non-empty value matches only the transaction source.
+identities; a non-empty value matches the transaction source or any on-chain
+event participant. `asset` filters on-chain asset events by `{issuer}/{name}`;
+`contract_index` filters on-chain events by contract. Both are ignored for
+plain transaction lifecycle events.
 
 `transaction.failed` is terminal and is emitted only after the tracker's
 `MEMPOOL_MAX_ATTEMPTS` is exhausted.
@@ -1700,6 +1826,25 @@ or `transaction.failed` is queued. A registration watching several hashes stays
 active until every hash is terminal. A hash that has no tracker entry is reaped
 once the registration is an hour old, so a restart cannot leave orphaned
 subscriptions.
+
+The on-chain source polls the index every two seconds and persists its cursor in
+`webhook_cursor`. On first start it begins at the current head, so enabling
+webhooks never floods a receiver with history. Restarts resume from the last
+processed tick. Delivery payloads use `event: "onchain.<type>"` and an
+`onchain` object with `type`, `epoch`, `tick`, `log_id`, `tx_hash`, `body`, and
+`timestamp`; whale deliveries carry `onchain.transaction` and `min_amount`.
+
+#### `POST /v1/webhooks/{id}/test`
+
+Queues a synthetic `webhook.test` delivery through the normal dispatcher so an
+operator can verify connectivity and signature handling. Returns `202` with the
+delivery id and status.
+
+#### `POST /v1/webhooks/{id}/replay?event=&limit=100`
+
+Re-queues stored deliveries for the registration, preserving their exact
+payloads. Optional `event` filters the source rows; `limit` is clamped to
+`1..500`. Returns `202` with the number queued.
 
 #### `GET /v1/webhooks/{id}/deliveries`
 
@@ -1810,6 +1955,15 @@ Responses are `application/octet-stream` with an immutable cache policy and a
 filename such as `tick-91916480-transactions.bin`. An unindexed tick or a
 missing bundle returns `404 not_found`. A missing archive configuration returns
 `503 unavailable`.
+
+### `GET /v1/ticks/{tick}/votes`
+
+Returns archived quorum votes for one indexed tick as JSON: each vote's
+`computor_index` and signature plus a signer bitmap in `meta.bitmap`. Votes are
+optional in the archive, so this route returns `404 not_found` for bundles
+written without `ARCHIVE_VOTES=true`. Signatures are returned as archived and
+`meta.signatures_verified` is `false`; verify them against the epoch computor
+set before relying on signer authority.
 
 #### Archive policy
 
@@ -1950,6 +2104,8 @@ current surface.
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private webhook targets. |
 | `WEBHOOK_ENCRYPTION_KEY` | unset | 32-byte hex or base64 key for webhook URL encryption at rest. |
 | `STREAM_POLL_MS` | `1000` | Index-head poll interval for the stream hub. |
+| `GLYPH_LABELS_FILE` | unset | JSON operator label registry; falls back to the embedded starter file. |
+| `GLYPH_WHALE_MIN_AMOUNT` | `1000000000` | Whale threshold in qu for analytics, stream, and webhook events. |
 | `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PREFIX` | unset | Raw archive object storage. Presence of `S3_BUCKET` enables it; the `_ID`/`_SECRET_ACCESS_KEY` aliases are also accepted. |
 | `ARCHIVE_DIR` | unset | Filesystem raw archive used when S3 is not configured. |
 | `ARCHIVE_VOTES` | `false` | Include full vote headers in raw tick bundles. |

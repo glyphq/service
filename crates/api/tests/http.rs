@@ -10,8 +10,9 @@ use chrono::{TimeZone, Utc};
 use futures_util::StreamExt;
 use serde_json::Value;
 use store::{
-    ActivityBucket, AssetRow, AssetTransferRow, ComputorRow, CounterpartyRow, EpochRow,
-    EventFilter, EventRow, EventTypeCount, FlowBucket, IdentityRow, IngestCursor, NetworkStats,
+    ActiveIdentityBucket, ActivityBucket, AssetRow, AssetTransferRow, AssetTransferStats,
+    ComputorRow, ContractDividendRow, ContractRow, CounterpartyRow, EpochRow, EventFilter,
+    EventRow, EventTypeCount, FlowBucket, IdentityRow, IngestCursor, NetworkStats, PricePointRow,
     QuorumEvidenceRow, Result as StoreResult, Store, TickBatch, TickRow, TransactionFilter,
     TransactionRow, WriteOutcome,
 };
@@ -615,6 +616,111 @@ impl Store for MockStore {
             latest_timestamp: Some(timestamp()),
             ingest: IngestCursor::default(),
         })
+    }
+
+    async fn contracts(&self, limit: u32, offset: u64) -> StoreResult<Vec<ContractRow>> {
+        Ok(page(
+            &[ContractRow {
+                contract_index: 13,
+                event_count: self.events.len() as u64,
+                first_tick: 5,
+                last_tick: 7,
+            }],
+            limit,
+            offset,
+        ))
+    }
+
+    async fn contract(&self, contract_index: u32) -> StoreResult<Option<ContractRow>> {
+        Ok(self
+            .contracts(10, 0)
+            .await?
+            .into_iter()
+            .find(|row| row.contract_index == contract_index))
+    }
+
+    async fn contract_events(
+        &self,
+        _contract_index: u32,
+        limit: u32,
+        offset: u64,
+    ) -> StoreResult<Vec<EventRow>> {
+        Ok(page(&self.events, limit, offset))
+    }
+
+    async fn contract_dividends(
+        &self,
+        _contract_index: Option<u32>,
+        _epoch: Option<u16>,
+        limit: u32,
+        offset: u64,
+    ) -> StoreResult<Vec<ContractDividendRow>> {
+        Ok(page(
+            &[ContractDividendRow {
+                epoch: 1,
+                tick: 7,
+                start_log_id: 3,
+                contract_index: 13,
+                contract: OTHER.into(),
+                total_amount: 1352,
+                transfer_count: 2,
+                recipient_count: 2,
+                share_count: 676,
+                amount_per_share: 2,
+                fingerprint: [7u8; 32],
+                timestamp: timestamp(),
+                version: 7,
+            }],
+            limit,
+            offset,
+        ))
+    }
+
+    async fn asset_transfer_stats(
+        &self,
+        _issuer: &str,
+        _name: &str,
+    ) -> StoreResult<AssetTransferStats> {
+        Ok(AssetTransferStats {
+            transfers: 4,
+            unique_senders: 2,
+            unique_receivers: 2,
+            shares: 40,
+            largest_shares: 20,
+        })
+    }
+
+    async fn whale_transactions(
+        &self,
+        min_amount: i64,
+        _since_tick: Option<u32>,
+        limit: u32,
+    ) -> StoreResult<Vec<TransactionRow>> {
+        let rows: Vec<_> = self
+            .transactions
+            .iter()
+            .filter(|row| row.amount >= min_amount)
+            .cloned()
+            .collect();
+        Ok(page(&rows, limit, 0))
+    }
+
+    async fn active_identity_buckets(
+        &self,
+        _interval_seconds: u32,
+        limit: u32,
+    ) -> StoreResult<Vec<ActiveIdentityBucket>> {
+        Ok(vec![ActiveIdentityBucket {
+            bucket: timestamp(),
+            active_identities: 2,
+        }]
+        .into_iter()
+        .take(limit as usize)
+        .collect())
+    }
+
+    async fn latest_price(&self) -> StoreResult<Option<PricePointRow>> {
+        Ok(None)
     }
 
     async fn write_tick(&self, batch: &TickBatch) -> StoreResult<WriteOutcome> {
@@ -1667,4 +1773,134 @@ async fn tick_capacity_reports_fill_and_top_senders() {
     assert_eq!(body["data"]["remaining_slots"], 4094);
     assert_eq!(body["data"]["top_senders"].as_array().unwrap().len(), 2);
     assert_eq!(body["data"]["money_flew"]["available"], false);
+}
+
+#[tokio::test]
+async fn contracts_and_dividends_are_discovered_and_grouped() {
+    let (status, body) = get("/v1/contracts?limit=5").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"][0]["contract_index"], 13);
+
+    let (status, body) = get("/v1/contracts/13").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["contract"]["contract_index"], 13);
+    assert_eq!(body["data"]["dividends"][0]["total_amount"], 1352);
+    assert_eq!(body["data"]["dividends"][0]["amount_per_share"], 2);
+
+    let (status, body) = get("/v1/contracts/dividends?include=distributions").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"][0]["distributions"][0]["start_log_id"], 3);
+    assert_eq!(
+        body["data"][0]["distributions"][0]["fingerprint"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+
+    let (status, _) = get("/v1/contracts/99").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn overviews_join_index_sections() {
+    let (status, body) = get("/v1/explorer/overview?limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["network"]["head"]["tick"], 7);
+    assert_eq!(body["data"]["contracts"][0]["contract_index"], 13);
+    assert_eq!(body["data"]["active_identities"][0]["active_identities"], 2);
+    assert!(body["data"]["price"].is_null());
+
+    let (status, body) = get(&format!("/v1/identities/{IDENTITY}/overview?limit=2")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["indexed"]["identity"], IDENTITY);
+    assert!(body["data"]["wallet"].is_null());
+
+    let (status, body) = get(&format!("/v1/assets/{IDENTITY}/QX/overview")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["issuance"]["name"], "QX");
+    assert_eq!(body["data"]["stats"]["transfers"], 4);
+    assert!(body["meta"]["holder_warning"].is_string());
+}
+
+#[tokio::test]
+async fn analytics_whales_and_active_identities_are_typed() {
+    let (status, body) = get("/v1/analytics/whales?min_amount=1&limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["meta"]["min_amount"], 1);
+    assert!(!body["data"].as_array().unwrap().is_empty());
+
+    let (status, body) = get("/v1/analytics/active-identities?interval=3600&limit=2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"][0]["active_identities"], 2);
+
+    let (status, body) = get("/v1/analytics/network").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["ticks"], 3);
+}
+
+#[tokio::test]
+async fn labels_batch_and_exports_are_available() {
+    let (status, body) = get("/v1/labels?limit=5").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["meta"]["source"], "operator-registry");
+
+    let hash = hash_for(7, 0);
+    let (status, body) = post(
+        "/v1/batch",
+        serde_json::json!({
+            "requests": [
+                { "id": "tx", "type": "transaction", "hash": hash },
+                { "id": "who", "type": "identity", "identity": IDENTITY },
+                { "id": "missing", "type": "tick", "tick": 999 }
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"][0]["status"], 200);
+    assert_eq!(body["data"][1]["data"]["identity"], IDENTITY);
+    assert_eq!(body["data"][2]["status"], 404);
+
+    let (status, _, headers) = request("/v1/export/transactions?format=ndjson&limit=2", &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["x-export-rows"], "2");
+    assert!(
+        headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("application/x-ndjson")
+    );
+}
+
+#[tokio::test]
+async fn balance_history_and_graph_are_derived_from_flows() {
+    let (status, body) = get(&format!(
+        "/v1/identities/{IDENTITY}/balance-history?interval=3600&limit=3"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"].as_array().unwrap().len(), 3);
+    assert!(body["data"][2]["cumulative_net_amount"].is_i64());
+    assert_eq!(body["meta"]["balance_source"], "indexed_transfer_flow");
+
+    let (status, body) = get(&format!("/v1/identities/{IDENTITY}/graph?depth=2&limit=5")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"]["center"], IDENTITY);
+    assert!(body["data"]["nodes"].as_array().unwrap().len() >= 2);
+    assert!(!body["data"]["edges"].as_array().unwrap().is_empty());
+
+    let (status, body) = get(&format!(
+        "/v1/graph?identity={IDENTITY}&direction=outgoing&limit=2"
+    ))
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["meta"]["direction"], "outgoing");
+}
+
+#[tokio::test]
+async fn archived_votes_require_configured_archive() {
+    let (status, body) = get("/v1/ticks/7/votes").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["code"], "unavailable");
 }

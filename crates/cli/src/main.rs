@@ -1,11 +1,13 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
 use archive::{FileArchive, S3Archive, SharedArchive};
 use clap::{Parser, Subcommand};
 use indexer::IndexerConfig;
-use node::{NodePool, PeerConfig};
+use node::{Head, NodePool, PeerConfig, TickBundle};
+use qubic::messages::{Computors, LogRanges, Tick, TickData};
 use store::{ClickHouseStore, Store};
 use tokio_util::sync::CancellationToken;
 
@@ -130,6 +132,33 @@ enum Command {
         #[arg(long)]
         version: Option<u64>,
         /// Print the aggregate without replacing the identities table.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Write a manifest of archived tick objects, optionally verifying every bundle.
+    ArchiveManifest {
+        #[arg(long)]
+        epoch: u16,
+        #[arg(long)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        /// Read and decode every bundle instead of trusting object metadata.
+        #[arg(long)]
+        verify: bool,
+        /// Write the manifest JSON here instead of stdout.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
+    /// Replay archived ticks into ClickHouse through the normal indexer path.
+    ArchiveReplay {
+        #[arg(long)]
+        epoch: u16,
+        #[arg(long)]
+        from: u32,
+        #[arg(long)]
+        to: u32,
+        /// Verify bundles without writing derived rows.
         #[arg(long)]
         dry_run: bool,
     },
@@ -595,6 +624,146 @@ async fn main() -> anyhow::Result<()> {
                 }))?
             );
         }
+        Command::ArchiveManifest {
+            epoch,
+            from,
+            to,
+            verify,
+            output,
+        } => {
+            if to < from {
+                bail!("--to must be greater than or equal to --from");
+            }
+            let archive = archive_from_env()?
+                .context("no raw archive configured; set S3_BUCKET or ARCHIVE_DIR")?;
+            let mut objects = Vec::new();
+            let mut missing = Vec::new();
+            let mut total_bytes = 0u64;
+            for tick in from..=to {
+                let key = archive::object_key(epoch, tick);
+                let Some(head) = archive.head(&key).await? else {
+                    missing.push(tick);
+                    continue;
+                };
+                total_bytes = total_bytes.saturating_add(head.size);
+                let mut object = serde_json::json!({
+                    "tick": tick,
+                    "key": key,
+                    "size": head.size,
+                    "last_modified": head.last_modified,
+                });
+                if verify {
+                    let bytes = archive.get(&key).await?;
+                    let bundle = archive::RawBundle::decode(&bytes)
+                        .with_context(|| format!("decode archive bundle {key}"))?;
+                    if bundle.epoch != epoch || bundle.tick != tick {
+                        bail!(
+                            "archive bundle {key} identifies epoch {} tick {}",
+                            bundle.epoch,
+                            bundle.tick
+                        );
+                    }
+                    object["digest"] =
+                        serde_json::json!(archive::digest::hex64(archive::xxh64(&bytes, 0)));
+                    object["sections"] = serde_json::json!({
+                        "tick_header": bundle.tick_header.len(),
+                        "tick_data": bundle.tick_data.len(),
+                        "votes": bundle.votes.len(),
+                        "transactions": bundle.transactions.len(),
+                        "log_ranges": bundle.log_ranges.len(),
+                        "logs": bundle.logs.len(),
+                        "computors": bundle.computors.len(),
+                    });
+                }
+                objects.push(object);
+            }
+            let manifest = serde_json::json!({
+                "epoch": epoch,
+                "from": from,
+                "to": to,
+                "verified": verify,
+                "summary": {
+                    "objects": objects.len(),
+                    "missing": missing.len(),
+                    "bytes": total_bytes,
+                },
+                "objects": objects,
+                "missing": missing,
+                "generated_at": chrono::Utc::now(),
+            });
+            let rendered = serde_json::to_string_pretty(&manifest)?;
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, rendered)
+                        .with_context(|| format!("write manifest {}", path.display()))?;
+                    println!("manifest written to {}", path.display());
+                }
+                None => println!("{rendered}"),
+            }
+        }
+        Command::ArchiveReplay {
+            epoch,
+            from,
+            to,
+            dry_run,
+        } => {
+            if to < from {
+                bail!("--to must be greater than or equal to --from");
+            }
+            let archive = archive_from_env()?
+                .context("no raw archive configured; set S3_BUCKET or ARCHIVE_DIR")?;
+            let url =
+                std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
+            let db = std::env::var("CLICKHOUSE_DB").unwrap_or_else(|_| "glyph".into());
+            let store = Arc::new(ClickHouseStore::new(&url, &db)?);
+            if !dry_run {
+                store.init().await.context("initialize ClickHouse")?;
+            }
+            let config = IndexerConfig {
+                peers: vec![PeerConfig::new("127.0.0.1:1".parse()?)],
+                start_tick: Some(from),
+                poll_interval: std::time::Duration::from_millis(250),
+                verify_signatures: false,
+                progress_every: 1,
+                max_tick_attempts: 1,
+                archive: Some(archive.clone()),
+                archive_fail_closed: false,
+            };
+            let mut indexer =
+                indexer::Indexer::new(store.clone(), config).context("configure archive replay")?;
+            let mut replayed = 0;
+            let mut transactions = 0;
+            let mut events = 0;
+            for tick in from..=to {
+                let Some(bundle) = archive::get_bundle(archive.as_ref(), epoch, tick).await? else {
+                    bail!("archive bundle for epoch {epoch} tick {tick} is missing");
+                };
+                let verified = verify_archived_bundle(archive.as_ref(), &bundle, epoch, tick)
+                    .await
+                    .with_context(|| format!("verify archived tick {tick}"))?;
+                if dry_run {
+                    println!(
+                        "tick {tick}: {} transaction(s), {} event(s), {} vote(s)",
+                        verified.transactions.len(),
+                        verified.logs.len(),
+                        verified.votes.len()
+                    );
+                } else {
+                    let batch = indexer.write_verified(&verified).await?;
+                    transactions += batch.transactions.len();
+                    events += batch.events.len();
+                }
+                replayed += 1;
+            }
+            println!(
+                "{}: {replayed} tick(s), {transactions} transaction(s), {events} event(s), db {db}",
+                if dry_run {
+                    "archive dry run"
+                } else {
+                    "archive replay"
+                }
+            );
+        }
         Command::Serve { bind } => {
             let url =
                 std::env::var("CLICKHOUSE_URL").unwrap_or_else(|_| "http://127.0.0.1:8123".into());
@@ -647,6 +816,93 @@ fn archive_from_env() -> anyhow::Result<Option<SharedArchive>> {
         }
     }
     Ok(None)
+}
+
+async fn verify_archived_bundle(
+    archive: &dyn archive::RawArchive,
+    bundle: &archive::RawBundle,
+    epoch: u16,
+    tick: u32,
+) -> anyhow::Result<indexer::VerifiedTick> {
+    if bundle.epoch != epoch || bundle.tick != tick {
+        bail!(
+            "bundle identifies epoch {} tick {}, expected epoch {epoch} tick {tick}",
+            bundle.epoch,
+            bundle.tick
+        );
+    }
+    if bundle.votes.is_empty() {
+        bail!("archive bundle has no votes; re-archive with ARCHIVE_VOTES=true before replaying");
+    }
+    if bundle.votes.len() % qubic::messages::TICK_SIZE != 0 {
+        bail!("archived vote section is not a whole number of votes");
+    }
+    let tick_header = Tick::decode(&bundle.tick_header).context("decode tick header")?;
+    let tick_data = TickData::decode(&bundle.tick_data).context("decode tick data")?;
+    let computors = if bundle.computors.is_empty() {
+        let sidecar = archive::get_computors(archive, epoch)
+            .await
+            .context("read computor sidecar")?
+            .context("computor sidecar is missing")?;
+        Computors::decode(&sidecar).context("decode computor sidecar")?
+    } else {
+        Computors::decode(&bundle.computors).context("decode archived computors")?
+    };
+    if computors.epoch != epoch {
+        bail!(
+            "computor set is for epoch {}, expected {epoch}",
+            computors.epoch
+        );
+    }
+    let votes = bundle
+        .votes
+        .chunks_exact(qubic::messages::TICK_SIZE)
+        .map(Tick::decode)
+        .collect::<Result<Vec<_>, _>>()
+        .context("decode archived votes")?;
+    let log_ranges = LogRanges::decode(&bundle.log_ranges).context("decode log ranges")?;
+    let logs = qubic::LogEvent::decode_many(&bundle.logs).context("decode logs")?;
+    let transactions = decode_archived_transactions(&bundle.transactions)?;
+    let reconstructed = TickBundle {
+        head: Head {
+            epoch,
+            tick,
+            initial_tick: tick,
+            tick_duration: 0,
+        },
+        computors,
+        tick: tick_header,
+        tick_data,
+        votes,
+        transactions,
+        log_ranges,
+        logs,
+        logs_complete: true,
+        warnings: Vec::new(),
+    };
+    indexer::verify_bundle(reconstructed, false).map_err(Into::into)
+}
+
+fn decode_archived_transactions(
+    mut payload: &[u8],
+) -> anyhow::Result<Vec<qubic::messages::Transaction>> {
+    let mut transactions = Vec::new();
+    while !payload.is_empty() {
+        if payload.len() < qubic::messages::Transaction::BASE_SIZE + 64 {
+            bail!("truncated archived transaction");
+        }
+        let input_size = u16::from_le_bytes([payload[78], payload[79]]) as usize;
+        let size = qubic::messages::Transaction::BASE_SIZE + input_size + 64;
+        if payload.len() < size {
+            bail!("truncated archived transaction body");
+        }
+        transactions.push(
+            qubic::messages::Transaction::decode(&payload[..size])
+                .context("decode archived transaction")?,
+        );
+        payload = &payload[size..];
+    }
+    Ok(transactions)
 }
 
 #[cfg(test)]
@@ -772,5 +1028,39 @@ mod tests {
             Command::Serve { bind } => assert_eq!(bind, None),
             _ => panic!("expected serve command"),
         }
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+
+    #[test]
+    fn archived_transactions_decode_sequentially() {
+        let first = qubic::messages::Transaction {
+            source: [1u8; 32],
+            destination: [2u8; 32],
+            amount: 10,
+            tick: 7,
+            input_type: 0,
+            input: vec![0xAA, 0xBB],
+            signature: [3u8; 64],
+        };
+        let second = qubic::messages::Transaction {
+            source: [4u8; 32],
+            destination: [5u8; 32],
+            amount: 20,
+            tick: 7,
+            input_type: 1,
+            input: Vec::new(),
+            signature: [6u8; 64],
+        };
+        let mut payload = first.encode();
+        payload.extend_from_slice(&second.encode());
+        let decoded = decode_archived_transactions(&payload).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].amount, 10);
+        assert_eq!(decoded[1].amount, 20);
+        assert!(decode_archived_transactions(&[0u8; 10]).is_err());
     }
 }

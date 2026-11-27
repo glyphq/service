@@ -1,0 +1,10 @@
+{
+  "labels": [
+    {
+      "name": "Zero identity",
+      "category": "burn",
+      "identity": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "description": "All-zero Qubic identity used as a burn or placeholder destination."
+    }
+  ]
+}

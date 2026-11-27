@@ -11,6 +11,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::get;
@@ -25,6 +26,8 @@ use crate::dto::event_value;
 
 const CHANNEL_CAPACITY: usize = 4096;
 const MAX_TICKS_PER_POLL: u32 = 100;
+/// Maximum tick span replayed through `Last-Event-ID`/`since_tick`.
+const MAX_REPLAY_TICKS: u32 = 500;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamEvent {
@@ -35,7 +38,7 @@ pub struct StreamEvent {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct StreamQuery {
-    /// Comma-separated event names: tick, transaction, event, price, market.
+    /// Comma-separated event names: tick, transaction, whale, event, price, market.
     #[serde(default)]
     pub types: Option<String>,
     /// Only emit transactions and events that mention this identity.
@@ -44,6 +47,9 @@ pub struct StreamQuery {
     /// Only emit asset events for `{issuer}/{name}`.
     #[serde(default)]
     pub asset: Option<String>,
+    /// Replay indexed ticks after this tick before switching to live events.
+    #[serde(default)]
+    pub since_tick: Option<u32>,
 }
 
 impl StreamQuery {
@@ -113,6 +119,11 @@ fn event_matches_identity(event: &StreamEvent, identity: &str) -> bool {
             event.data.get("source").and_then(Value::as_str) == Some(identity)
                 || event.data.get("destination").and_then(Value::as_str) == Some(identity)
         }
+        "whale" => {
+            let transaction = event.data.get("transaction").unwrap_or(&event.data);
+            transaction.get("source").and_then(Value::as_str) == Some(identity)
+                || transaction.get("destination").and_then(Value::as_str) == Some(identity)
+        }
         "event" => json_contains_identity(event.data.get("body"), identity),
         _ => false,
     }
@@ -150,12 +161,16 @@ fn event_matches_asset(event: &StreamEvent, asset: &str) -> bool {
 
 pub struct StreamHub {
     sender: broadcast::Sender<StreamEvent>,
+    whale_min_amount: i64,
 }
 
 impl StreamHub {
     pub fn new() -> Self {
         let (sender, _) = broadcast::channel(CHANNEL_CAPACITY);
-        Self { sender }
+        Self {
+            sender,
+            whale_min_amount: crate::overview::whale_min_amount(),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<StreamEvent> {
@@ -236,10 +251,18 @@ impl StreamHub {
     }
 
     async fn publish_tick(&self, store: &dyn Store, tick: u32) -> store::Result<()> {
+        for event in self.collect_tick(store, tick).await? {
+            self.publish(event);
+        }
+        Ok(())
+    }
+
+    async fn collect_tick(&self, store: &dyn Store, tick: u32) -> store::Result<Vec<StreamEvent>> {
+        let mut events = Vec::new();
         let Some(row) = store.tick(tick).await? else {
-            return Ok(());
+            return Ok(events);
         };
-        self.publish(StreamEvent {
+        events.push(StreamEvent {
             event: "tick",
             id: format!("tick:{tick}"),
             data: serde_json::to_value(&row).unwrap_or(Value::Null),
@@ -249,11 +272,25 @@ impl StreamHub {
             let rows = store.transactions_for_tick(tick, 4096, offset).await?;
             let count = rows.len();
             for transaction in rows {
-                self.publish(StreamEvent {
+                let amount = transaction.amount;
+                let hash = transaction.hash.clone();
+                let data = serde_json::to_value(&transaction).unwrap_or(Value::Null);
+                events.push(StreamEvent {
                     event: "transaction",
-                    id: format!("tx:{}", transaction.hash),
-                    data: serde_json::to_value(&transaction).unwrap_or(Value::Null),
+                    id: format!("tx:{hash}"),
+                    data: data.clone(),
                 });
+                if amount >= self.whale_min_amount {
+                    events.push(StreamEvent {
+                        event: "whale",
+                        id: format!("whale:{hash}"),
+                        data: json!({
+                            "amount": amount,
+                            "min_amount": self.whale_min_amount,
+                            "transaction": data,
+                        }),
+                    });
+                }
             }
             if count < 4096 {
                 break;
@@ -266,7 +303,7 @@ impl StreamHub {
             let count = rows.len();
             for event in rows {
                 let log_id = event.log_id;
-                self.publish(StreamEvent {
+                events.push(StreamEvent {
                     event: "event",
                     id: format!("event:{tick}:{log_id}"),
                     data: event_value(event),
@@ -277,7 +314,7 @@ impl StreamHub {
             }
             offset += count as u64;
         }
-        Ok(())
+        Ok(events)
     }
 }
 
@@ -300,66 +337,106 @@ pub fn router() -> Router<AppState> {
 
 async fn sse_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<StreamQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, crate::ApiError> {
-    sse_stream(state, query).await
+    sse_stream(state, query, headers).await
 }
 
 async fn sse_ticks(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<StreamQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, crate::ApiError> {
-    sse_stream(state, query.only("tick")).await
+    sse_stream(state, query.only("tick"), headers).await
 }
 
 async fn sse_transactions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<StreamQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, crate::ApiError> {
-    sse_stream(state, query.only("transaction")).await
+    sse_stream(state, query.only("transaction"), headers).await
 }
 
 async fn sse_events(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<StreamQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, crate::ApiError> {
-    sse_stream(state, query.only("event")).await
+    sse_stream(state, query.only("event"), headers).await
 }
 
 async fn sse_prices(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<StreamQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, crate::ApiError> {
-    sse_stream(state, query.only("price")).await
+    sse_stream(state, query.only("price"), headers).await
 }
 
 async fn sse_market(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<StreamQuery>,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, crate::ApiError> {
-    sse_stream(state, query.only("market")).await
+    sse_stream(state, query.only("market"), headers).await
 }
 
 async fn sse_stream(
     state: AppState,
     query: StreamQuery,
+    headers: HeaderMap,
 ) -> Result<Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>, crate::ApiError> {
+    let since_tick = query.since_tick.or_else(|| {
+        headers
+            .get("last-event-id")
+            .and_then(|value| value.to_str().ok().and_then(parse_event_tick))
+    });
     let query = query.normalize()?;
     let hub = state
         .hub
         .clone()
         .ok_or_else(|| crate::ApiError::unavailable("streaming is not enabled"))?;
     let mut receiver = hub.subscribe();
+    let store = state.store.clone();
     let stream = async_stream::stream! {
+        let mut replayed_to = since_tick.unwrap_or(0);
+        if let Some(since) = since_tick {
+            let head = store.head().await.ok().flatten().map(|row| row.tick);
+            let to = head.unwrap_or(since);
+            let from = to.saturating_sub(MAX_REPLAY_TICKS).max(since);
+            yield Ok(Event::default().event("replay").json_data(json!({
+                "since_tick": since,
+                "from_tick": from.saturating_add(1),
+                "to_tick": to,
+                "truncated": to.saturating_sub(since) > MAX_REPLAY_TICKS,
+                "max_replay_ticks": MAX_REPLAY_TICKS,
+            })).unwrap_or_else(|_| Event::default().event("error").data("serialize")));
+            for tick in from.saturating_add(1)..=to {
+                match hub.collect_tick(store.as_ref(), tick).await {
+                    Ok(events) => {
+                        for event in events {
+                            if query.allows(&event) {
+                                yield Ok(sse_event(event));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        yield Ok(Event::default().event("replay_error").data(error.to_string()));
+                        break;
+                    }
+                }
+            }
+            replayed_to = to;
+        }
         loop {
             match receiver.recv().await {
                 Ok(event) if query.allows(&event) => {
-                    let event = Event::default()
-                        .event(event.event)
-                        .id(event.id)
-                        .json_data(event.data)
-                        .unwrap_or_else(|_| Event::default().event("error").data("serialize"));
-                    yield Ok(event);
+                    if event_tick(&event).is_some_and(|tick| tick <= replayed_to) {
+                        continue;
+                    }
+                    yield Ok(sse_event(event));
                 }
                 Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(count)) => {
@@ -374,6 +451,40 @@ async fn sse_stream(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     ))
+}
+
+fn sse_event(event: StreamEvent) -> Event {
+    Event::default()
+        .event(event.event)
+        .id(event.id)
+        .json_data(event.data)
+        .unwrap_or_else(|_| Event::default().event("error").data("serialize"))
+}
+
+fn parse_event_tick(id: &str) -> Option<u32> {
+    let mut parts = id.trim().split(':');
+    let kind = parts.next()?;
+    match kind {
+        "tick" | "event" => parts.next()?.parse().ok(),
+        _ => None,
+    }
+}
+
+fn event_tick(event: &StreamEvent) -> Option<u32> {
+    event
+        .data
+        .get("tick")
+        .and_then(Value::as_u64)
+        .and_then(|tick| u32::try_from(tick).ok())
+        .or_else(|| {
+            event
+                .data
+                .get("transaction")
+                .and_then(|transaction| transaction.get("tick"))
+                .and_then(Value::as_u64)
+                .and_then(|tick| u32::try_from(tick).ok())
+        })
+        .or_else(|| parse_event_tick(&event.id))
 }
 
 async fn ws_handler(
@@ -392,6 +503,7 @@ async fn ws_handler(
 }
 
 async fn websocket(mut socket: WebSocket, hub: Arc<StreamHub>, query: StreamQuery) {
+    let mut query = query;
     let mut receiver = hub.subscribe();
     // A price- or market-only client can be idle for a long time between
     // changes. Ping it so proxies do not silently close the connection.
@@ -430,12 +542,96 @@ async fn websocket(mut socket: WebSocket, hub: Arc<StreamHub>, query: StreamQuer
                             break;
                         }
                     }
+                    Some(Ok(Message::Text(text))) => {
+                        let response = match ws_command(&text, &mut query) {
+                            Ok(value) => json!({ "event": "subscribed", "data": value }),
+                            Err(error) => json!({
+                                "event": "error",
+                                "data": { "code": error.code, "detail": error.detail },
+                            }),
+                        };
+                        if socket.send(Message::Text(response.to_string().into())).await.is_err() {
+                            break;
+                        }
+                    }
                     Some(Err(_)) => break,
                     _ => {}
                 }
             }
         }
     }
+}
+
+fn ws_command(text: &str, query: &mut StreamQuery) -> Result<Value, crate::ApiError> {
+    let value: Value = serde_json::from_str(text)
+        .map_err(|error| crate::ApiError::bad_request(format!("invalid JSON command: {error}")))?;
+    let action = value
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| crate::ApiError::bad_request("command requires action"))?;
+    match action {
+        "subscribe" | "filters" => {
+            let types = match value.get("types") {
+                Some(Value::Array(items)) => Some(
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                Some(Value::String(text)) => Some(text.clone()),
+                Some(Value::Null) | None => None,
+                Some(_) => {
+                    return Err(crate::ApiError::bad_request(
+                        "types must be a string or an array of strings",
+                    ));
+                }
+            }
+            .filter(|text| !text.trim().is_empty());
+            let identity = value
+                .get("identity")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let asset = value
+                .get("asset")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            *query = StreamQuery {
+                types,
+                identity,
+                asset,
+                since_tick: None,
+            }
+            .normalize()?;
+        }
+        "unsubscribe" => {
+            let remove: HashSet<&str> = value
+                .get("types")
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            if remove.is_empty() {
+                *query = StreamQuery::default();
+            } else if let Some(types) = query.types.as_deref() {
+                let kept: Vec<&str> = types
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty() && !remove.contains(value))
+                    .collect();
+                query.types = (!kept.is_empty()).then(|| kept.join(","));
+            }
+        }
+        other => {
+            return Err(crate::ApiError::bad_request(format!(
+                "unknown command {other:?}; expected subscribe or unsubscribe"
+            )));
+        }
+    }
+    Ok(json!({
+        "types": query.types,
+        "identity": query.identity,
+        "asset": query.asset,
+    }))
 }
 
 /// Parses a comma-separated type list for tests and documentation examples.
@@ -567,5 +763,37 @@ mod tests {
             }
             other => panic!("expected a lag error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn event_ids_parse_to_replay_ticks() {
+        assert_eq!(parse_event_tick("tick:123"), Some(123));
+        assert_eq!(parse_event_tick("event:456:9"), Some(456));
+        assert_eq!(parse_event_tick("tx:abcd"), None);
+        assert_eq!(parse_event_tick("whale:abcd"), None);
+    }
+
+    #[test]
+    fn websocket_commands_replace_and_remove_filters() {
+        let mut query = StreamQuery::default();
+        let identity = "BZBQFLLBNCXEMGLOBHUVFTLUPLVCPQUASSILFABOFFBCADQSSUPNWLZBQEXK";
+        let ack = ws_command(
+            &format!(
+                r#"{{"action":"subscribe","types":["tick","whale"],"identity":"{identity}"}}"#
+            ),
+            &mut query,
+        )
+        .expect("subscribe");
+        assert_eq!(query.types.as_deref(), Some("tick,whale"));
+        assert_eq!(query.identity.as_deref(), Some(identity));
+        assert_eq!(ack["types"], "tick,whale");
+
+        ws_command(r#"{"action":"unsubscribe","types":["whale"]}"#, &mut query)
+            .expect("unsubscribe one");
+        assert_eq!(query.types.as_deref(), Some("tick"));
+
+        ws_command(r#"{"action":"unsubscribe"}"#, &mut query).expect("reset");
+        assert!(query.types.is_none());
+        assert!(query.identity.is_none());
     }
 }

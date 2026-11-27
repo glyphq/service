@@ -18,15 +18,19 @@ the original phase boundaries:
   multi-peer fetch pipeline with batched ClickHouse writes, the normalized event
   participant index and identity activity feed, wallet and asset-holder reads, a status
   dashboard, the Scalar API reference, per-tick quorum evidence, persisted computor sets,
-  and the QUBIC/USDT oracle price series.
-- Partial: streaming has no `Last-Event-ID` replay, only a lag event and current-head
-  continuation. The batch route looks up transaction hashes, not arbitrary GET requests.
-  The archive writes and reads bundles but has no spool, manifest, or replay command yet.
-  Operations have health probes, request IDs, tracing, and graceful shutdown, but no
-  Prometheus metrics or fuzz targets. Peer health is improving, but the indexer still
-  assumes a single logical writer.
-- Not started: state digest-chain verification, a generic batch endpoint, Prometheus
-  metrics, multi-peer quorum cross-checking, archive replay, and a seven-day soak.
+  the QUBIC/USDT oracle price series, resumable SSE and dynamic WebSocket filters,
+  operator labels, explorer/identity/asset overviews, contract and dividend discovery,
+  on-chain event webhooks, bounded CSV/NDJSON exports, prefix search, generic read
+  batching, archive manifests, and an archive replay command.
+- Partial: the archive replay path reconstructs and verifies bundles but requires
+  `ARCHIVE_VOTES=true` because default bundles omit votes. Archive spool and checkpoint
+  recovery from a lost writer checkpoint are still missing. Operations have health
+  probes, request IDs, tracing, and graceful shutdown, but no Prometheus metrics or fuzz
+  targets. Peer health is improving, but the indexer still assumes a single logical
+  writer.
+- Not started: state digest-chain verification, Prometheus metrics, multi-peer quorum
+  cross-checking, and an executed seven-day soak. `scripts/soak.py` implements the
+  seven-day read-path run but has not been run for seven days in this environment.
 
 ## Phase 0: Foundations
 
@@ -190,6 +194,8 @@ the original phase boundaries:
 - SSE `/v1/stream` with `Last-Event-ID` replay.
 - WebSocket `/v1/ws` with subscribe, unsubscribe, ping.
 - Batch transaction lookup `/v1/transactions/batch` for up to 100 hashes.
+- Generic `/v1/batch` for typed reads across transactions, ticks, epochs, identities,
+  assets, contracts, events, dividends, and identity transactions.
 - Search `/v1/search` with typed classification.
 - OpenAPI 3.1 generation and `/docs`.
 - Rate limiting.
@@ -215,10 +221,11 @@ the original phase boundaries:
 **Scope**
 
 - Raw bundle writer for local filesystem and S3. (Implemented.)
-- Manifest with content hashes.
+- Manifest with content hashes. (Implemented as `glyph archive-manifest`.)
 - Local spool and retry on archive failure. (Not implemented; failures are logged or fail
   the tick under `ARCHIVE_FAIL_CLOSED`.)
-- Partition rebuild from the archive.
+- Partition rebuild from the archive. (Implemented as `glyph archive-replay`; requires
+  archived votes and a computor sidecar.)
 - Checkpoint recovery.
 - Retention policy and partition drops.
 

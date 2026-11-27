@@ -139,9 +139,10 @@ and the stack is reachable only from the same machine.
 | `MEMPOOL_MAX_ENTRIES` | `10000` | Maximum open tracked transactions. New submissions are rejected when full. |
 | `MEMPOOL_MAX_PER_SOURCE` | `100` | Maximum open tracked transactions per source identity. |
 | `WEBHOOK_TIMEOUT_MS` | `5000` | Webhook delivery timeout. |
-| `WEBHOOK_MAX_ATTEMPTS` | `6` | Delivery attempts before an attempt is dead-lettered. |
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private-range webhook targets. Keep `false` unless the receiver is internal and trusted. |
 | `WEBHOOK_ENCRYPTION_KEY` | unset | 32-byte hex or base64 key for webhook URL encryption at rest. `deploy/docker/run-stack.sh` generates and persists one automatically. |
+| `GLYPH_LABELS_FILE` | unset | Operator JSON label registry for identities, assets, and contract indices. |
+| `GLYPH_WHALE_MIN_AMOUNT` | `1000000000` | Whale threshold in qu used by analytics, streams, and webhook events. |
 | `PRUNE_KEEP_EPOCHS` | unset | Optional retention after an epoch rollover. Drops ClickHouse partitions older than the newest N epochs. |
 | `GLYPH_IMAGE` | `glyph:local` | Image tag built and used by all glyph services. |
 | `GLYPH_API_LOG` | `info,tower_http=info` | `RUST_LOG` for the API. |
@@ -293,6 +294,17 @@ Recovery options, in order of preference:
 1. Restore the ClickHouse volume from a cold backup.
 2. Restore an epoch partition if you have a per-partition backup.
 3. Rebuild from the raw archive when it is enabled.
+   Manifest the range first, then dry-run and replay:
+
+   ```bash
+   glyph archive-manifest --epoch "$EPOCH" --from "$FROM" --to "$TO" --verify
+   glyph archive-replay --epoch "$EPOCH" --from "$FROM" --to "$TO" --dry-run
+   glyph archive-replay --epoch "$EPOCH" --from "$FROM" --to "$TO"
+   ```
+
+   Replay requires bundles archived with `ARCHIVE_VOTES=true` and the epoch
+   computor sidecar. The command reconstructs each `TickBundle`, verifies quorum
+   and data digests, and writes through the normal indexer path.
 4. Re-index from peers. The indexer resumes from the checkpoint or, if the
    checkpoint is gone, from the maximum indexed tick. History before the
    current epoch is not recoverable without the archive.

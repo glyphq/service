@@ -9,10 +9,10 @@ use clickhouse::Row;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActivityBucket, AssetRow, AssetTransferRow, ComputorRow, CounterpartyRow, EntitySnapshot,
-    EpochMetadata, EpochRow, EventParticipantRow, EventRow, EventTypeCount, FlowBucket,
-    IdentityActivityRow, IdentityRow, IdentityTotals, PricePointRow, QuorumEvidenceRow, Result,
-    TickRow, TransactionRow,
+    ActiveIdentityBucket, ActivityBucket, AssetRow, AssetTransferRow, AssetTransferStats,
+    ComputorRow, ContractDividendRow, ContractRow, CounterpartyRow, EntitySnapshot, EpochMetadata,
+    EpochRow, EventParticipantRow, EventRow, EventTypeCount, FlowBucket, IdentityActivityRow,
+    IdentityRow, IdentityTotals, PricePointRow, QuorumEvidenceRow, Result, TickRow, TransactionRow,
 };
 
 /// RowBinary encodes `FixedString(N)` as N raw bytes. Serde's array impl only
@@ -325,6 +325,84 @@ pub(crate) struct QuorumEvidenceInsert {
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
     pub timestamp: DateTime<Utc>,
     pub version: u64,
+}
+
+#[derive(Debug, Row, Serialize)]
+pub(crate) struct ContractDividendInsert {
+    pub epoch: u16,
+    pub tick: u32,
+    pub start_log_id: u64,
+    pub contract_index: u32,
+    pub contract: String,
+    pub total_amount: i64,
+    pub transfer_count: u32,
+    pub recipient_count: u32,
+    pub share_count: u32,
+    pub amount_per_share: i64,
+    #[serde(with = "fixed_bytes")]
+    pub fingerprint: [u8; 32],
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+    pub version: u64,
+}
+
+impl From<&ContractDividendRow> for ContractDividendInsert {
+    fn from(row: &ContractDividendRow) -> Self {
+        Self {
+            epoch: row.epoch,
+            tick: row.tick,
+            start_log_id: row.start_log_id,
+            contract_index: row.contract_index,
+            contract: row.contract.clone(),
+            total_amount: row.total_amount,
+            transfer_count: row.transfer_count,
+            recipient_count: row.recipient_count,
+            share_count: row.share_count,
+            amount_per_share: row.amount_per_share,
+            fingerprint: row.fingerprint,
+            timestamp: row.timestamp,
+            version: row.version,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct ContractDividendSelect {
+    pub epoch: u16,
+    pub tick: u32,
+    pub start_log_id: u64,
+    pub contract_index: u32,
+    pub contract: String,
+    pub total_amount: i64,
+    pub transfer_count: u32,
+    pub recipient_count: u32,
+    pub share_count: u32,
+    pub amount_per_share: i64,
+    #[serde(with = "fixed_bytes")]
+    pub fingerprint: [u8; 32],
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub timestamp: DateTime<Utc>,
+    pub version: u64,
+}
+
+impl From<ContractDividendSelect> for ContractDividendRow {
+    fn from(row: ContractDividendSelect) -> Self {
+        Self {
+            epoch: row.epoch,
+            tick: row.tick,
+            start_log_id: row.start_log_id,
+            contract_index: row.contract_index,
+            contract: row.contract,
+            total_amount: row.total_amount,
+            transfer_count: row.transfer_count,
+            recipient_count: row.recipient_count,
+            share_count: row.share_count,
+            amount_per_share: row.amount_per_share,
+            fingerprint: row.fingerprint,
+            timestamp: row.timestamp,
+            version: row.version,
+        }
+    }
 }
 
 impl From<&QuorumEvidenceRow> for QuorumEvidenceInsert {
@@ -689,6 +767,62 @@ impl From<ActivityBucketSelect> for ActivityBucket {
             transactions: row.transactions,
             events: row.events,
             volume: row.volume,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct ActiveIdentityBucketSelect {
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    pub bucket: DateTime<Utc>,
+    pub active_identities: u64,
+}
+
+impl From<ActiveIdentityBucketSelect> for ActiveIdentityBucket {
+    fn from(row: ActiveIdentityBucketSelect) -> Self {
+        Self {
+            bucket: row.bucket,
+            active_identities: row.active_identities,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct ContractSelect {
+    pub contract_index: u32,
+    pub event_count: u64,
+    pub first_tick: u32,
+    pub last_tick: u32,
+}
+
+impl From<ContractSelect> for ContractRow {
+    fn from(row: ContractSelect) -> Self {
+        Self {
+            contract_index: row.contract_index,
+            event_count: row.event_count,
+            first_tick: row.first_tick,
+            last_tick: row.last_tick,
+        }
+    }
+}
+
+#[derive(Debug, Row, Deserialize)]
+pub(crate) struct AssetTransferStatsSelect {
+    pub transfers: u64,
+    pub unique_senders: u64,
+    pub unique_receivers: u64,
+    pub shares: i64,
+    pub largest_shares: i64,
+}
+
+impl From<AssetTransferStatsSelect> for AssetTransferStats {
+    fn from(row: AssetTransferStatsSelect) -> Self {
+        Self {
+            transfers: row.transfers,
+            unique_senders: row.unique_senders,
+            unique_receivers: row.unique_receivers,
+            shares: row.shares,
+            largest_shares: row.largest_shares,
         }
     }
 }

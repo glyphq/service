@@ -528,6 +528,7 @@ dependencies = [
  "archive",
  "async-trait",
  "bus",
+ "chrono",
  "clap",
  "hex",
  "indexer",

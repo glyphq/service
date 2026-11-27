@@ -202,6 +202,8 @@ The most common variables are below. The full list is in
 | `MEMPOOL_MAX_PER_SOURCE` | `100` | Maximum open tracked transactions per source |
 | `WEBHOOK_TIMEOUT_MS` | `5000` | Webhook delivery timeout. Each event is attempted once. |
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private webhook targets |
+| `GLYPH_LABELS_FILE` | unset | Operator JSON label registry for identities, assets, and contracts |
+| `GLYPH_WHALE_MIN_AMOUNT` | `1000000000` | Whale threshold in qu for analytics, streams, and webhooks |
 | `PRUNE_KEEP_EPOCHS` | unset | Drop partitions older than the newest N epochs |
 
 Peer selection starts from the configured seeds. `NodePool::connect_best` picks the
@@ -243,18 +245,36 @@ curl -sS 'localhost:8080/v1/identities/<identity>/activity?limit=25'
 curl -sS 'localhost:8080/v1/identities/<identity>/events?limit=25'
 curl -sS 'localhost:8080/v1/identities/<identity>/counterparties?limit=10'
 curl -sS 'localhost:8080/v1/identities/<identity>/flow?interval=3600&limit=24'
+curl -sS 'localhost:8080/v1/identities/<identity>/balance-history?interval=3600&limit=24'
+curl -sS 'localhost:8080/v1/identities/<identity>/graph?depth=2&limit=10'
 
 # Wallets and assets
 curl -sS localhost:8080/v1/wallets/<identity>
+curl -sS localhost:8080/v1/wallets/<identity>/overview
+curl -sS localhost:8080/v1/assets/<issuer>/<name>/overview
 curl -sS 'localhost:8080/v1/assets/<issuer>/<name>/transfers?limit=25'
 curl -sS 'localhost:8080/v1/assets/<issuer>/<name>/holders?limit=25'
+
+# Explorer, contracts, search, and labels
+curl -sS 'localhost:8080/v1/explorer/overview?limit=10'
+curl -sS 'localhost:8080/v1/contracts?limit=25'
+curl -sS 'localhost:8080/v1/contracts/dividends?include=distributions'
+curl -sS 'localhost:8080/v1/search?q=QX'
+curl -sS 'localhost:8080/v1/labels?limit=25'
 
 # Prices, market, analytics, and streams
 curl -sS 'localhost:8080/v1/prices/history?hours=24'
 curl -sS localhost:8080/v1/market
 curl -sS 'localhost:8080/v1/analytics/activity?interval=3600&limit=24'
+curl -sS 'localhost:8080/v1/analytics/whales?limit=10'
 curl -sS -N 'localhost:8080/v1/stream?types=tick,event'
 curl -sS -N 'localhost:8080/v1/stream?identity=<identity>'
+
+# Exports and read batching
+curl -sS 'localhost:8080/v1/export/transactions?format=csv&limit=1000' -o transactions.csv
+curl -sS -X POST localhost:8080/v1/batch \
+  -H 'content-type: application/json' \
+  -d '{"requests":[{"type":"tick","tick":91915000},{"type":"identity","identity":"<identity>"}]}'
 
 # Validation, broadcast, webhooks, archive, docs
 curl -sS -X POST localhost:8080/v1/transactions/validate \
@@ -267,7 +287,12 @@ curl -sS -X POST localhost:8080/v1/transactions \
 curl -sS -X POST localhost:8080/v1/transactions \
   -H 'content-type: application/json' -d '{"raw":"0x...","direct":true}'
 curl -sS 'localhost:8080/v1/ticks/91915000/raw?section=transactions' -o tick.bin
+curl -sS 'localhost:8080/v1/ticks/91915000/votes'
 curl -sS localhost:8080/docs
+
+# Archive manifest and replay
+glyph archive-manifest --epoch 240 --from 91915000 --to 91915010 --verify
+glyph archive-replay --epoch 240 --from 91915000 --to 91915010 --dry-run
 ```
 
 Response conventions:

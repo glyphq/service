@@ -12,7 +12,10 @@ use chrono::{DateTime, Utc};
 use node::{Head, NodePool, Peer, PeerConfig, TickBundle};
 use qubic::crypto::k12::k12_32;
 use qubic::crypto::schnorrq;
-use qubic::logs::{CONTRACT_ERROR_MESSAGE, EventBody};
+use qubic::logs::{
+    CONTRACT_ERROR_MESSAGE, CUSTOM_OP_END_DISTRIBUTE_DIVIDENDS,
+    CUSTOM_OP_START_DISTRIBUTE_DIVIDENDS, EventBody,
+};
 use qubic::messages::{
     COMPUTOR_COUNT, Computors, LOG_TX_PER_TICK, QUORUM, TICK_DATA_SIZE, TX_PER_TICK, Tick,
     TickData, Transaction, ZERO_DIGEST,
@@ -20,7 +23,8 @@ use qubic::messages::{
 use qubic::{LogEvent, PublicKey};
 use serde::Serialize;
 use store::{
-    EventParticipantRow, EventRow, IdentityRow, QuorumEvidenceRow, Store, TickBatch, TransactionRow,
+    ContractDividendRow, EventParticipantRow, EventRow, IdentityRow, QuorumEvidenceRow, Store,
+    TickBatch, TransactionRow,
 };
 use tokio::sync::{Mutex as AsyncMutex, RwLock as AsyncRwLock, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -570,6 +574,17 @@ impl<S: Store + 'static> Indexer<S> {
     pub fn with_sink(mut self, sink: Arc<dyn BatchSink>) -> Self {
         self.sink = Some(sink);
         self
+    }
+
+    /// Builds and writes one already-verified tick.
+    ///
+    /// Archive replay uses this path so derived rows, identity deltas, event
+    /// participants, dividends, and quorum evidence are identical to live
+    /// ingestion. The indexer's peer pool is not touched.
+    pub async fn write_verified(&mut self, verified: &VerifiedTick) -> Result<TickBatch> {
+        let batch = self.build_batch(verified).await?;
+        self.store.write_ticks(std::slice::from_ref(&batch)).await?;
+        Ok(batch)
     }
 
     /// Runs until `cancel` is triggered.
@@ -1577,6 +1592,7 @@ impl<S: Store + 'static> Indexer<S> {
 
         let touched = self.apply_identity_changes(verified).await?;
         batch.identities = touched;
+        batch.dividends = contract_dividend_rows(verified, timestamp);
         batch.evidence = Some(quorum_evidence(verified, &self.config, timestamp));
 
         Ok(batch)
@@ -1660,6 +1676,106 @@ impl<S: Store + 'static> Indexer<S> {
         }
         Ok(rows)
     }
+}
+
+/// Aggregate each START/END dividend span into one row.
+///
+/// Core logs a start marker, one `qu_transfer` per share possession, and an
+/// end marker. The individual transfers are already in the event table; this
+/// row keeps the epoch-level answer (total QUs, QUs per share, recipients, and
+/// a deterministic fingerprint) without duplicating every log.
+fn contract_dividend_rows(
+    verified: &VerifiedTick,
+    timestamp: DateTime<Utc>,
+) -> Vec<ContractDividendRow> {
+    dividend_rows(
+        verified.tick.epoch,
+        verified.tick.tick,
+        &verified.logs,
+        timestamp,
+    )
+}
+
+fn dividend_rows(
+    epoch: u16,
+    tick: u32,
+    logs: &[LogEvent],
+    timestamp: DateTime<Utc>,
+) -> Vec<ContractDividendRow> {
+    type DividendTransfer = ([u8; 32], [u8; 32], i64);
+    let mut rows = Vec::new();
+    let mut active: Option<(u64, Vec<DividendTransfer>)> = None;
+    let mut ordered: Vec<&LogEvent> = logs.iter().collect();
+    ordered.sort_by_key(|event| event.log_id);
+    for event in ordered {
+        match event.body() {
+            EventBody::Custom { op_code, .. }
+                if op_code == CUSTOM_OP_START_DISTRIBUTE_DIVIDENDS =>
+            {
+                active = Some((event.log_id, Vec::new()));
+            }
+            EventBody::Custom { op_code, .. } if op_code == CUSTOM_OP_END_DISTRIBUTE_DIVIDENDS => {
+                if let Some((start_log_id, transfers)) = active.take() {
+                    if let Some(row) =
+                        dividend_row(epoch, tick, start_log_id, &transfers, timestamp)
+                    {
+                        rows.push(row);
+                    }
+                }
+            }
+            EventBody::QuTransfer { from, to, amount } => {
+                if let Some((_, transfers)) = active.as_mut() {
+                    transfers.push((from, to, amount));
+                }
+            }
+            _ => {}
+        }
+    }
+    rows
+}
+
+fn dividend_row(
+    epoch: u16,
+    tick: u32,
+    start_log_id: u64,
+    transfers: &[([u8; 32], [u8; 32], i64)],
+    timestamp: DateTime<Utc>,
+) -> Option<ContractDividendRow> {
+    let (contract, _, _) = *transfers.first()?;
+    // Contract identities are id(index, 0, 0, 0): the index is the first
+    // little-endian u32 and every following byte is zero.
+    if contract[4..].iter().any(|byte| *byte != 0) {
+        return None;
+    }
+    let contract_index = u32::from_le_bytes(contract[..4].try_into().ok()?);
+    if contract_index == 0 || transfers.iter().any(|(from, _, _)| *from != contract) {
+        return None;
+    }
+    let mut total_amount = 0i64;
+    let mut recipients = HashSet::new();
+    let mut fingerprint_input = Vec::with_capacity(transfers.len() * 40);
+    for (_, to, amount) in transfers {
+        total_amount = total_amount.saturating_add(*amount);
+        recipients.insert(*to);
+        fingerprint_input.extend_from_slice(to);
+        fingerprint_input.extend_from_slice(&amount.to_le_bytes());
+    }
+    let share_count = COMPUTOR_COUNT as u32;
+    Some(ContractDividendRow {
+        epoch,
+        tick,
+        start_log_id,
+        contract_index,
+        contract: PublicKey(contract).to_identity(),
+        total_amount,
+        transfer_count: transfers.len() as u32,
+        recipient_count: recipients.len() as u32,
+        share_count,
+        amount_per_share: total_amount / i64::from(share_count),
+        fingerprint: k12_32(&fingerprint_input),
+        timestamp,
+        version: 0,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3216,6 +3332,84 @@ mod tests {
     fn verification_order_is_monotonic() {
         assert!(Verification::Quorum < Verification::Data);
         assert!(Verification::Data < Verification::State);
+    }
+
+    #[test]
+    fn dividend_rows_derive_amount_per_share_and_fingerprint() {
+        let mut contract = [0u8; 32];
+        contract[..4].copy_from_slice(&13u32.to_le_bytes());
+        let mut first = [0u8; 32];
+        first[0] = 1;
+        let mut second = [0u8; 32];
+        second[0] = 2;
+        let transfers = vec![(contract, first, 676i64), (contract, second, 676i64)];
+        let now = Utc::now();
+        let row = dividend_row(240, 100, 9, &transfers, now).expect("dividend row");
+        assert_eq!(row.contract_index, 13);
+        assert_eq!(row.total_amount, 1352);
+        assert_eq!(row.transfer_count, 2);
+        assert_eq!(row.recipient_count, 2);
+        assert_eq!(row.share_count, 676);
+        assert_eq!(row.amount_per_share, 2);
+        assert_eq!(
+            row.fingerprint,
+            k12_32(&{
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&first);
+                bytes.extend_from_slice(&676i64.to_le_bytes());
+                bytes.extend_from_slice(&second);
+                bytes.extend_from_slice(&676i64.to_le_bytes());
+                bytes
+            })
+        );
+        assert!(dividend_row(240, 100, 9, &[], now).is_none());
+        let mut wrong = transfers.clone();
+        wrong[1].0[0] = 99;
+        assert!(dividend_row(240, 100, 9, &wrong, now).is_none());
+    }
+
+    #[test]
+    fn dividend_span_detection_collects_only_transfers_between_markers() {
+        use qubic::logs::{CUSTOM_MESSAGE, QU_TRANSFER};
+
+        let mut contract = [0u8; 32];
+        contract[..4].copy_from_slice(&13u32.to_le_bytes());
+        let mut holder = [0u8; 32];
+        holder[0] = 9;
+        let start = LogEvent {
+            epoch: 240,
+            tick: 100,
+            log_type: CUSTOM_MESSAGE,
+            log_id: 5,
+            log_digest: 0,
+            body: CUSTOM_OP_START_DISTRIBUTE_DIVIDENDS.to_le_bytes().to_vec(),
+        };
+        let mut transfer_body = Vec::new();
+        transfer_body.extend_from_slice(&contract);
+        transfer_body.extend_from_slice(&holder);
+        transfer_body.extend_from_slice(&676i64.to_le_bytes());
+        let transfer = LogEvent {
+            epoch: 240,
+            tick: 100,
+            log_type: QU_TRANSFER,
+            log_id: 6,
+            log_digest: 0,
+            body: transfer_body,
+        };
+        let end = LogEvent {
+            epoch: 240,
+            tick: 100,
+            log_type: CUSTOM_MESSAGE,
+            log_id: 7,
+            log_digest: 0,
+            body: CUSTOM_OP_END_DISTRIBUTE_DIVIDENDS.to_le_bytes().to_vec(),
+        };
+        let rows = dividend_rows(240, 100, &[start, transfer, end], Utc::now());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].start_log_id, 5);
+        assert_eq!(rows[0].total_amount, 676);
+        assert_eq!(rows[0].amount_per_share, 1);
+        assert_eq!(rows[0].recipient_count, 1);
     }
 
     #[test]

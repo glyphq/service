@@ -224,6 +224,35 @@ indexer populates it from the typed decoder in the same batch as the event. Its 
 is `(identity, tick, log_id)`, so a wallet history query reads only that identity's rows
 and joins back to `events` for the decoded body.
 
+## `glyph.contract_dividends`
+
+One row per START/END dividend span in a tick. Core emits
+`CUSTOM_OP_START_DISTRIBUTE_DIVIDENDS`, one `qu_transfer` per share possession from the
+contract identity to each holder, then `CUSTOM_OP_END_DISTRIBUTE_DIVIDENDS`. The raw
+transfers remain in `events`; this table keeps the epoch answer without rescanning them.
+
+| Column | Type | Meaning |
+| --- | --- | --- |
+| `epoch`, `tick`, `start_log_id` | `UInt16`, `UInt32`, `UInt64` | Span identity |
+| `contract_index` | `UInt32` | Contract index decoded from the identity prefix |
+| `contract` | `String` | Contract identity that paid |
+| `total_amount` | `Int64` | Sum of the span's transfer amounts |
+| `transfer_count`, `recipient_count` | `UInt32` | Transfers and unique recipients |
+| `share_count` | `UInt32` | Shares used for `amount_per_share` (`NUMBER_OF_COMPUTORS`, 676) |
+| `amount_per_share` | `Int64` | `total_amount / share_count` |
+| `fingerprint` | `FixedString(32)` | K12 over ordered `(recipient public key, amount)` pairs |
+| `timestamp`, `version` | `DateTime64`, `UInt64` | Ingestion metadata |
+
+```sql
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY epoch
+ORDER BY (epoch, contract_index, tick, start_log_id)
+```
+
+The API groups tick rows into one response row per `(epoch, contract)` and derives a
+fingerprint over the ordered per-distribution fingerprints. Contract indices are
+discovered from event bodies and these rows, never from a hardcoded registry.
+
 ## `glyph.identities`
 
 Derived aggregates per identity. This is a convenience table, not consensus state.
@@ -455,8 +484,7 @@ CREATE TABLE IF NOT EXISTS glyph.mempool
 )
 ENGINE = ReplacingMergeTree(version)
 ORDER BY hash
-TTL updated_at + INTERVAL 1 DAY DELETE
-    WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')
+TTL updated_at + INTERVAL 7 DAY DELETE
 ```
 
 `raw` is retained so a retry can rebroadcast without asking the client again. `tick` is the
@@ -477,6 +505,8 @@ CREATE TABLE IF NOT EXISTS glyph.webhooks
     events String,
     transaction_hashes String,
     identity String,
+    asset String,
+    contract_index UInt32,
     active UInt8,
     created_at DateTime64(3, 'UTC'),
     updated_at DateTime64(3, 'UTC'),
@@ -488,8 +518,10 @@ TTL updated_at + INTERVAL 7 DAY DELETE WHERE active = 0
 ```
 
 `events` and `transaction_hashes` are JSON-encoded arrays in a `String` column. An empty
-`events` array matches every transaction event, an empty `transaction_hashes` array matches
-every hash, and an empty `identity` matches every source identity. `secret` must be at
+`events` array matches every event, an empty `transaction_hashes` array matches every hash,
+and an empty `identity` matches every source identity or on-chain participant. `asset`
+optionally filters on-chain asset events and `contract_index` optionally filters on-chain
+events by contract. `secret` must be at
 least 16 characters and is used to sign deliveries. It is never serialized into API
 responses. When `WEBHOOK_ENCRYPTION_KEY` is set, `url` is stored as
 `enc:v1:<base64 nonce and ChaCha20-Poly1305 ciphertext>` and only the dispatcher decrypts
@@ -517,17 +549,35 @@ TTL created_at + INTERVAL 1 DAY DELETE
     WHERE status IN ('delivered', 'failed')
 ```
 
-A delivery row is updated in place (with a new version) across retries. `status` is
+A delivery row is updated in place (with a new version) across attempts. `status` is
 `pending`, `delivered`, or `failed`; `next_attempt_at` is `0` once no retry is scheduled;
-`payload` retains the exact JSON body so retries are byte-identical. Retries use a
-1 s, 2 s, 4 s, ... backoff capped at 60 s and stop after `WEBHOOK_MAX_ATTEMPTS`.
+`payload` retains the exact JSON body so a replay is byte-identical. Each delivery is
+attempted once; a failure is terminal.
+
+```sql
+CREATE TABLE IF NOT EXISTS glyph.webhook_cursor
+(
+    id String,
+    tick UInt32,
+    updated_at DateTime64(3, 'UTC'),
+    version UInt64
+)
+ENGINE = ReplacingMergeTree(version)
+ORDER BY id
+```
+
+The on-chain webhook source stores its last fully processed tick under
+`onchain-events-v1`. Advancing the cursor after every tick makes a restart resume instead
+of replays or gaps; the first start begins at the current head so enabling webhooks does
+not flood a receiver with history.
 
 These tables are created by `Store::init`/`glyph db-init` alongside the canonical schema,
 not by a separate gateway migration. Startup also applies `ALTER TABLE ... MODIFY TTL` so
 existing deployments pick up retention without a manual migration.
 
-Retention is intentionally short because Qubic broadcast has no fee: terminal mempool
-entries and delivered or dead-lettered deliveries are removed after 1 day, and inactive
+Retention is intentionally short because Qubic broadcast has no fee: mempool entries are
+removed after 7 days regardless of status, delivered or dead-lettered deliveries after
+1 day, and inactive
 webhooks after 7 days.
 Open mempool entries and pending deliveries are never removed by TTL. ClickHouse evaluates
 TTL during background merges, so deletion is eventual rather than immediate.
@@ -596,6 +646,7 @@ in-flight duplicates omit `FINAL` and deduplicate with `argMax` or a subquery. N
 | `ticks` | `epoch` | `(epoch, tick)` | `by_tick` | Tick by number, head, epoch ranges |
 | `transactions` | `epoch` | `(tick, tx_index)` | `by_hash`, `by_source`, `by_destination` | Hash lookup, tick list, identity history |
 | `events` | `epoch` | `(epoch, log_id)` | `by_tick`, `by_recent`, `by_type` | Event by ID, tick list, type scans, activity buckets |
+| `contract_dividends` | `epoch` | `(epoch, contract_index, tick, start_log_id)` | none | Contract dividend epochs and fingerprints |
 | `event_participants` | `epoch` | `(identity, tick, log_id)` | none | Identity activity and contract effects |
 | `identities` | none | `identity` | `by_activity` | Identity lookup, top identities |
 | `ingest_state` | none | `key` | none | Internal |
@@ -606,6 +657,7 @@ in-flight duplicates omit `FINAL` and deduplicate with `argMax` or a subquery. N
 | `mempool` | none | `hash` | none | API broadcast tracking (gateway) |
 | `webhooks` | none | `id` | none | Webhook registrations (gateway) |
 | `webhook_deliveries` | none | `(webhook_id, id)` | none | Persisted delivery attempts (gateway) |
+| `webhook_cursor` | none | `id` | none | On-chain webhook source progress (gateway) |
 
 `quorum_evidence` is partitioned by epoch, while `price_points` is not partitioned. Both
 are small relative to the tick tables and are read by a single key or by hour. The

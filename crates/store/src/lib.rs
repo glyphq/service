@@ -393,6 +393,57 @@ pub struct ActivityBucket {
     pub volume: i64,
 }
 
+/// Unique identities active in one time bucket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveIdentityBucket {
+    pub bucket: DateTime<Utc>,
+    pub active_identities: u64,
+}
+
+/// One contract index observed in decoded event bodies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractRow {
+    pub contract_index: u32,
+    pub event_count: u64,
+    pub first_tick: u32,
+    pub last_tick: u32,
+}
+
+/// One dividend distribution by a contract during a tick.
+///
+/// Core emits a `custom_message` start marker, one `qu_transfer` per share
+/// possession, then an end marker. Glyph stores the aggregate and a digest of
+/// the transfer list instead of duplicating every log row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContractDividendRow {
+    pub epoch: u16,
+    pub tick: u32,
+    pub start_log_id: u64,
+    pub contract_index: u32,
+    /// Contract identity that paid the dividend.
+    pub contract: String,
+    pub total_amount: i64,
+    pub transfer_count: u32,
+    pub recipient_count: u32,
+    /// Number of contract shares used to derive `amount_per_share`.
+    pub share_count: u32,
+    pub amount_per_share: i64,
+    /// K12 digest of `(recipient public key, amount)` pairs in log order.
+    pub fingerprint: [u8; 32],
+    pub timestamp: DateTime<Utc>,
+    pub version: u64,
+}
+
+/// Aggregate transfers for one `(issuer, name)` asset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetTransferStats {
+    pub transfers: u64,
+    pub unique_senders: u64,
+    pub unique_receivers: u64,
+    pub shares: i64,
+    pub largest_shares: i64,
+}
+
 /// Number of events of one `type_name` produced by
 /// [`Store::event_type_counts`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,6 +541,8 @@ pub struct TickBatch {
     /// publish participant identities.
     pub event_participants: Vec<EventParticipantRow>,
     pub identities: Vec<IdentityRow>,
+    /// Aggregate dividend distributions observed in this tick.
+    pub dividends: Vec<ContractDividendRow>,
     /// Optional quorum evidence for this tick. Written in the same batch,
     /// before the tick row, so a visible tick always has its audit row.
     pub evidence: Option<QuorumEvidenceRow>,
@@ -516,6 +569,7 @@ impl TickBatch {
             events: Vec::new(),
             event_participants: Vec::new(),
             identities: Vec::new(),
+            dividends: Vec::new(),
             evidence: None,
         }
     }
@@ -790,6 +844,100 @@ pub trait Store: Send + Sync {
         limit: u32,
         offset: u64,
     ) -> Result<Vec<EventRow>>;
+    /// Largest transactions at or above `min_amount`, newest first.
+    async fn whale_transactions(
+        &self,
+        min_amount: i64,
+        since_tick: Option<u32>,
+        limit: u32,
+    ) -> Result<Vec<TransactionRow>> {
+        let _ = (min_amount, since_tick, limit);
+        Err(Error::Config(
+            "whale_transactions is not supported by this store".into(),
+        ))
+    }
+    /// Unique active identities for `interval_seconds` buckets, newest first.
+    async fn active_identity_buckets(
+        &self,
+        interval_seconds: u32,
+        limit: u32,
+    ) -> Result<Vec<ActiveIdentityBucket>> {
+        let _ = (interval_seconds, limit);
+        Err(Error::Config(
+            "active_identity_buckets is not supported by this store".into(),
+        ))
+    }
+    /// Contract indices observed in decoded contract event bodies.
+    async fn contracts(&self, limit: u32, offset: u64) -> Result<Vec<ContractRow>> {
+        let _ = (limit, offset);
+        Err(Error::Config(
+            "contracts is not supported by this store".into(),
+        ))
+    }
+    /// Summary for one contract index.
+    async fn contract(&self, contract_index: u32) -> Result<Option<ContractRow>> {
+        let _ = contract_index;
+        Err(Error::Config(
+            "contract is not supported by this store".into(),
+        ))
+    }
+    /// Events emitted by one contract index, newest first.
+    async fn contract_events(
+        &self,
+        contract_index: u32,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<EventRow>> {
+        let _ = (contract_index, limit, offset);
+        Err(Error::Config(
+            "contract_events is not supported by this store".into(),
+        ))
+    }
+    /// Dividend distributions, newest first, optionally for one contract or epoch.
+    async fn contract_dividends(
+        &self,
+        contract_index: Option<u32>,
+        epoch: Option<u16>,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<ContractDividendRow>> {
+        let _ = (contract_index, epoch, limit, offset);
+        Err(Error::Config(
+            "contract_dividends is not supported by this store".into(),
+        ))
+    }
+    /// Aggregate ownership and possession transfer counts for one asset.
+    async fn asset_transfer_stats(&self, issuer: &str, name: &str) -> Result<AssetTransferStats> {
+        let _ = (issuer, name);
+        Err(Error::Config(
+            "asset_transfer_stats is not supported by this store".into(),
+        ))
+    }
+    /// Transactions whose hash starts with `prefix`, newest first.
+    async fn transactions_by_hash_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<TransactionRow>> {
+        let _ = (prefix, limit);
+        Err(Error::Config(
+            "transactions_by_hash_prefix is not supported by this store".into(),
+        ))
+    }
+    /// Identities whose canonical form starts with `prefix`, newest activity first.
+    async fn identities_by_prefix(&self, prefix: &str, limit: u32) -> Result<Vec<IdentityRow>> {
+        let _ = (prefix, limit);
+        Err(Error::Config(
+            "identities_by_prefix is not supported by this store".into(),
+        ))
+    }
+    /// Assets whose name starts with `prefix`.
+    async fn assets_by_name(&self, prefix: &str, limit: u32) -> Result<Vec<AssetRow>> {
+        let _ = (prefix, limit);
+        Err(Error::Config(
+            "assets_by_name is not supported by this store".into(),
+        ))
+    }
     /// Event counts grouped by `type_name`, most frequent first.
     async fn event_type_counts(&self, limit: u32) -> Result<Vec<EventTypeCount>> {
         let _ = limit;
@@ -2428,6 +2576,296 @@ LIMIT ? OFFSET ?
             .bind(limit)
             .bind(offset)
             .fetch_all::<rows::EventSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn whale_transactions(
+        &self,
+        min_amount: i64,
+        since_tick: Option<u32>,
+        limit: u32,
+    ) -> Result<Vec<TransactionRow>> {
+        let mut sql = String::from("SELECT ?fields FROM transactions FINAL WHERE amount >= ?");
+        if since_tick.is_some() {
+            sql.push_str(" AND tick >= ?");
+        }
+        sql.push_str(" ORDER BY tick DESC, amount DESC LIMIT ?");
+        let mut query = self.client.query(&sql).bind(min_amount);
+        if let Some(tick) = since_tick {
+            query = query.bind(tick);
+        }
+        let rows = query
+            .bind(limit.clamp(1, 500))
+            .fetch_all::<rows::TransactionSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn active_identity_buckets(
+        &self,
+        interval_seconds: u32,
+        limit: u32,
+    ) -> Result<Vec<ActiveIdentityBucket>> {
+        let interval = i64::from(interval_seconds.max(1));
+        let limit = limit.clamp(1, 500);
+        let span = interval.saturating_mul(i64::from(limit));
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT bucket, uniqExact(identity) AS active_identities
+FROM (
+    SELECT toDateTime64(toStartOfInterval(timestamp, toIntervalSecond(?)), 3, 'UTC') AS bucket,
+           source AS identity
+    FROM transactions FINAL
+    WHERE timestamp >= now64(3) - toIntervalSecond(?)
+    UNION ALL
+    SELECT toDateTime64(toStartOfInterval(timestamp, toIntervalSecond(?)), 3, 'UTC') AS bucket,
+           destination AS identity
+    FROM transactions FINAL
+    WHERE timestamp >= now64(3) - toIntervalSecond(?)
+    UNION ALL
+    SELECT toDateTime64(toStartOfInterval(timestamp, toIntervalSecond(?)), 3, 'UTC') AS bucket,
+           identity
+    FROM event_participants FINAL
+    WHERE timestamp >= now64(3) - toIntervalSecond(?)
+)
+WHERE identity != ''
+GROUP BY bucket
+ORDER BY bucket DESC
+LIMIT ?
+"#,
+            )
+            .bind(interval)
+            .bind(span)
+            .bind(interval)
+            .bind(span)
+            .bind(interval)
+            .bind(span)
+            .bind(limit)
+            .fetch_all::<rows::ActiveIdentityBucketSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn contracts(&self, limit: u32, offset: u64) -> Result<Vec<ContractRow>> {
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT contract_index, count() AS event_count, min(tick) AS first_tick,
+       max(tick) AS last_tick
+FROM (
+    SELECT toUInt32(
+               JSONExtractUInt(body, 'contract_index')
+               + JSONExtractUInt(body, 'contractIndex')
+           ) AS contract_index,
+           tick
+    FROM events FINAL
+    WHERE type_name IN (
+        'contract_error', 'contract_warning', 'contract_information',
+        'contract_debug', 'burning', 'custom_message', 'contract_reserve_deduction'
+    )
+    UNION ALL
+    SELECT contract_index, tick FROM contract_dividends FINAL
+)
+WHERE contract_index > 0
+GROUP BY contract_index
+ORDER BY event_count DESC, contract_index ASC
+LIMIT ? OFFSET ?
+"#,
+            )
+            .bind(limit.clamp(1, 200))
+            .bind(offset)
+            .fetch_all::<rows::ContractSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn contract(&self, contract_index: u32) -> Result<Option<ContractRow>> {
+        let row = self
+            .client
+            .query(
+                r#"
+SELECT contract_index, count() AS event_count, min(tick) AS first_tick,
+       max(tick) AS last_tick
+FROM (
+    SELECT toUInt32(
+               JSONExtractUInt(body, 'contract_index')
+               + JSONExtractUInt(body, 'contractIndex')
+           ) AS contract_index,
+           tick
+    FROM events FINAL
+    WHERE type_name IN (
+        'contract_error', 'contract_warning', 'contract_information',
+        'contract_debug', 'burning', 'custom_message', 'contract_reserve_deduction'
+    )
+    UNION ALL
+    SELECT contract_index, tick FROM contract_dividends FINAL
+)
+WHERE contract_index = ?
+GROUP BY contract_index
+LIMIT 1
+"#,
+            )
+            .bind(contract_index)
+            .fetch_optional::<rows::ContractSelect>()
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    async fn contract_events(
+        &self,
+        contract_index: u32,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<EventRow>> {
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT ?fields FROM events FINAL
+WHERE (JSONExtractUInt(body, 'contract_index')
+       + JSONExtractUInt(body, 'contractIndex')) = ?
+ORDER BY tick DESC, log_id DESC
+LIMIT ? OFFSET ?
+"#,
+            )
+            .bind(contract_index)
+            .bind(limit.clamp(1, 200))
+            .bind(offset)
+            .fetch_all::<rows::EventSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn contract_dividends(
+        &self,
+        contract_index: Option<u32>,
+        epoch: Option<u16>,
+        limit: u32,
+        offset: u64,
+    ) -> Result<Vec<ContractDividendRow>> {
+        let mut sql = String::from("SELECT ?fields FROM contract_dividends FINAL WHERE 1 = 1");
+        if contract_index.is_some() {
+            sql.push_str(" AND contract_index = ?");
+        }
+        if epoch.is_some() {
+            sql.push_str(" AND epoch = ?");
+        }
+        sql.push_str(" ORDER BY epoch DESC, tick DESC LIMIT ? OFFSET ?");
+        let mut query = self.client.query(&sql);
+        if let Some(index) = contract_index {
+            query = query.bind(index);
+        }
+        if let Some(epoch) = epoch {
+            query = query.bind(epoch);
+        }
+        let rows = query
+            .bind(limit.clamp(1, 500))
+            .bind(offset)
+            .fetch_all::<rows::ContractDividendSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn asset_transfer_stats(&self, issuer: &str, name: &str) -> Result<AssetTransferStats> {
+        let row = self
+            .client
+            .query(
+                r#"
+SELECT count() AS transfers,
+       uniqExact(from_identity) AS unique_senders,
+       uniqExact(to_identity) AS unique_receivers,
+       sum(shares) AS shares,
+       max(shares) AS largest_shares
+FROM (
+    SELECT JSONExtractString(body, 'from') AS from_identity,
+           JSONExtractString(body, 'to') AS to_identity,
+           toInt64OrZero(JSONExtractString(body, 'shares')) AS shares
+    FROM events FINAL
+    WHERE type_name IN ('asset_ownership_change', 'asset_possession_change')
+      AND JSONExtractString(body, 'issuer') = ?
+      AND JSONExtractString(body, 'name') = ?
+)
+"#,
+            )
+            .bind(issuer)
+            .bind(name)
+            .fetch_one::<rows::AssetTransferStatsSelect>()
+            .await?;
+        Ok(row.into())
+    }
+
+    async fn transactions_by_hash_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<TransactionRow>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM transactions FINAL \
+                 WHERE startsWith(hash, ?) \
+                 ORDER BY tick DESC, tx_index ASC LIMIT ?",
+            )
+            .bind(prefix)
+            .bind(limit.clamp(1, 25))
+            .fetch_all::<rows::TransactionSelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn identities_by_prefix(&self, prefix: &str, limit: u32) -> Result<Vec<IdentityRow>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT ?fields FROM identities FINAL \
+                 WHERE startsWith(identity, ?) \
+                 ORDER BY last_seen_tick DESC, identity ASC LIMIT ?",
+            )
+            .bind(prefix)
+            .bind(limit.clamp(1, 25))
+            .fetch_all::<rows::IdentitySelect>()
+            .await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn assets_by_name(&self, prefix: &str, limit: u32) -> Result<Vec<AssetRow>> {
+        let rows = self
+            .client
+            .query(
+                r#"
+SELECT issuer, name, decimals, unit, managing_contract, shares,
+       issued_tick, log_id, timestamp
+FROM (
+    SELECT JSONExtractString(body, 'issuer') AS issuer,
+           JSONExtractString(body, 'name') AS name,
+           toUInt8(JSONExtractUInt(body, 'decimals')) AS decimals,
+           JSONExtractString(body, 'unit') AS unit,
+           toInt64OrZero(coalesce(
+               nullIf(JSONExtractString(body, 'managing_contract'), ''),
+               JSONExtractString(body, 'managingContract')
+           )) AS managing_contract,
+           toInt64OrZero(JSONExtractString(body, 'shares')) AS shares,
+           tick AS issued_tick,
+           log_id AS log_id,
+           timestamp AS timestamp
+    FROM (
+        SELECT * FROM events WHERE type_name = 'asset_issuance'
+        ORDER BY version DESC LIMIT 1 BY epoch, log_id
+    )
+)
+WHERE issuer != '' AND startsWith(name, ?)
+ORDER BY issued_tick DESC, log_id DESC
+LIMIT 1 BY issuer, name
+LIMIT ?
+"#,
+            )
+            .bind(prefix)
+            .bind(limit.clamp(1, 25))
+            .fetch_all::<rows::AssetSelect>()
             .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }

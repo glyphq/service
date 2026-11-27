@@ -137,6 +137,10 @@ pub struct Webhook {
     pub transaction_hashes: Vec<String>,
     /// Empty means every source identity.
     pub identity: String,
+    /// Optional `{issuer}/{name}` asset filter for on-chain events.
+    pub asset: String,
+    /// Optional contract index filter for on-chain events. Zero means any.
+    pub contract_index: u32,
     pub active: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -312,6 +316,8 @@ struct WebhookRow {
     events: String,
     transaction_hashes: String,
     identity: String,
+    asset: String,
+    contract_index: u32,
     active: u8,
     #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
     created_at: DateTime<Utc>,
@@ -330,6 +336,8 @@ impl From<&Webhook> for WebhookRow {
             transaction_hashes: serde_json::to_string(&webhook.transaction_hashes)
                 .unwrap_or_else(|_| "[]".into()),
             identity: webhook.identity.clone(),
+            asset: webhook.asset.clone(),
+            contract_index: webhook.contract_index,
             active: u8::from(webhook.active),
             created_at: webhook.created_at,
             updated_at: webhook.updated_at,
@@ -347,11 +355,22 @@ impl From<WebhookRow> for Webhook {
             events: serde_json::from_str(&row.events).unwrap_or_default(),
             transaction_hashes: serde_json::from_str(&row.transaction_hashes).unwrap_or_default(),
             identity: row.identity,
+            asset: row.asset,
+            contract_index: row.contract_index,
             active: row.active != 0,
             created_at: row.created_at,
             updated_at: row.updated_at,
         }
     }
+}
+
+#[derive(Debug, Row, Serialize, Deserialize)]
+struct WebhookCursorRow {
+    id: String,
+    tick: u32,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    updated_at: DateTime<Utc>,
+    version: u64,
 }
 
 #[derive(Debug, Row, Serialize, Deserialize)]
@@ -702,6 +721,33 @@ impl GatewayStore {
         Ok(row.n > 0)
     }
 
+    /// Last tick fully processed by the on-chain webhook source.
+    pub async fn webhook_cursor(&self, id: &str) -> Result<Option<u32>> {
+        let row = self
+            .client
+            .query(
+                "SELECT ?fields FROM webhook_cursor WHERE id = ? \
+                 ORDER BY version DESC LIMIT 1",
+            )
+            .bind(id)
+            .fetch_optional::<WebhookCursorRow>()
+            .await?;
+        Ok(row.map(|row| row.tick))
+    }
+
+    pub async fn set_webhook_cursor(&self, id: &str, tick: u32) -> Result<()> {
+        let row = WebhookCursorRow {
+            id: id.to_owned(),
+            tick,
+            updated_at: Utc::now(),
+            version: self.next_version(),
+        };
+        let mut insert = self.client.insert::<WebhookCursorRow>("webhook_cursor")?;
+        insert.write(&row).await?;
+        insert.end().await?;
+        Ok(())
+    }
+
     pub async fn delete_webhook(&self, id: &str) -> Result<()> {
         self.client
             .query("ALTER TABLE webhooks DELETE WHERE id = ? SETTINGS mutations_sync = 2")
@@ -820,8 +866,7 @@ fn create_statements(database: &str) -> Vec<String> {
              )\n\
              ENGINE = ReplacingMergeTree(version)\n\
              ORDER BY hash\n\
-             TTL updated_at + INTERVAL 1 HOUR DELETE \
-                 WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')"
+             TTL updated_at + INTERVAL 7 DAY DELETE"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {database}.tracked_transactions\n(\n\
@@ -856,6 +901,8 @@ fn create_statements(database: &str) -> Vec<String> {
                  events String,\n\
                  transaction_hashes String,\n\
                  identity String,\n\
+                 asset String,\n\
+                 contract_index UInt32,\n\
                  active UInt8,\n\
                  created_at DateTime64(3, 'UTC'),\n\
                  updated_at DateTime64(3, 'UTC'),\n\
@@ -885,16 +932,23 @@ fn create_statements(database: &str) -> Vec<String> {
              TTL created_at + INTERVAL 1 DAY DELETE \
                  WHERE status IN ('delivered', 'failed')"
         ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {database}.webhook_cursor\n(\n\
+                 id String,\n\
+                 tick UInt32,\n\
+                 updated_at DateTime64(3, 'UTC'),\n\
+                 version UInt64\n\
+             )\n\
+             ENGINE = ReplacingMergeTree(version)\n\
+             ORDER BY id"
+        ),
     ]
 }
 
 /// Applies retention to tables created before the TTL clauses were added.
 fn retention_statements(database: &str) -> Vec<String> {
     vec![
-        format!(
-            "ALTER TABLE {database}.mempool MODIFY TTL updated_at + INTERVAL 1 HOUR DELETE \
-             WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')"
-        ),
+        format!("ALTER TABLE {database}.mempool MODIFY TTL updated_at + INTERVAL 7 DAY DELETE"),
         format!(
             "ALTER TABLE {database}.tracked_transactions MODIFY TTL \
              updated_at + INTERVAL 30 DAY DELETE WHERE status != 'failed'"
@@ -906,6 +960,14 @@ fn retention_statements(database: &str) -> Vec<String> {
         format!(
             "ALTER TABLE {database}.webhook_deliveries MODIFY TTL created_at + INTERVAL 1 DAY \
              DELETE WHERE status IN ('delivered', 'failed')"
+        ),
+        format!(
+            "ALTER TABLE {database}.webhooks ADD COLUMN IF NOT EXISTS asset String \
+             AFTER identity"
+        ),
+        format!(
+            "ALTER TABLE {database}.webhooks ADD COLUMN IF NOT EXISTS contract_index UInt32 \
+             AFTER asset"
         ),
     ]
 }
@@ -931,23 +993,21 @@ mod tests {
             "tracked_transactions",
             "webhooks",
             "webhook_deliveries",
+            "webhook_cursor",
         ] {
             assert!(
                 statements.contains(&format!("glyph.{table}")),
                 "missing table {table}"
             );
         }
-        assert_eq!(statements.matches("ReplacingMergeTree(version)").count(), 4);
+        assert_eq!(statements.matches("ReplacingMergeTree(version)").count(), 5);
         assert!(statements.contains("created_at DateTime64(3, 'UTC')"));
         assert!(statements.contains("ORDER BY hash"));
         assert!(statements.contains("ORDER BY id"));
         assert_eq!(statements.matches("TTL ").count(), 4);
-        assert!(
-            statements.contains("WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')")
-        );
         assert!(statements.contains("WHERE active = 0"));
         assert!(statements.contains("WHERE status IN ('delivered', 'failed')"));
-        assert!(statements.contains("TTL updated_at + INTERVAL 1 HOUR DELETE"));
+        assert!(statements.contains("TTL updated_at + INTERVAL 7 DAY DELETE"));
         assert!(
             statements.contains("TTL updated_at + INTERVAL 30 DAY DELETE WHERE status != 'failed'")
         );
@@ -969,7 +1029,7 @@ mod tests {
                 "missing retention for {table}"
             );
         }
-        assert!(statements.contains("mempool MODIFY TTL updated_at + INTERVAL 1 HOUR DELETE"));
+        assert!(statements.contains("mempool MODIFY TTL updated_at + INTERVAL 7 DAY DELETE"));
         assert!(statements.contains(
             "tracked_transactions MODIFY TTL updated_at + INTERVAL 30 DAY DELETE \
                      WHERE status != 'failed'"
@@ -1071,6 +1131,8 @@ mod tests {
             events: vec!["transaction.confirmed".into()],
             transaction_hashes: Vec::new(),
             identity: String::new(),
+            asset: String::new(),
+            contract_index: 0,
             active: true,
             created_at: Utc::now(),
             updated_at: Utc::now(),

@@ -28,6 +28,10 @@ pub fn router() -> Router<AppState> {
             get(counterparties),
         )
         .route("/v1/identities/{identity}/flow", get(flow))
+        .route(
+            "/v1/identities/{identity}/balance-history",
+            get(balance_history),
+        )
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -169,6 +173,91 @@ async fn flow(
                     "net_amount": total_incoming.saturating_sub(total_outgoing),
                     "transaction_count": total_transactions,
                 },
+            }
+        })),
+    ))
+}
+
+/// Cumulative net QU flow over the selected window.
+///
+/// This is a change series derived from indexed transfers, not the spectrum
+/// balance. The response names that distinction so a wallet can show an
+/// indexed delta without presenting it as the live spendable balance.
+async fn balance_history(
+    State(state): State<AppState>,
+    Path(identity): Path<String>,
+    Query(params): Query<FlowQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let identity = parse_identity(&identity)?;
+    let interval = params
+        .interval
+        .unwrap_or(DEFAULT_INTERVAL_SECONDS)
+        .clamp(60, 86_400);
+    let limit = params.limit.unwrap_or(DEFAULT_BUCKETS).clamp(1, 1000);
+    let (head, indexed) = tokio::join!(state.store.head(), state.store.identity(&identity));
+    let head = head?.ok_or_else(|| ApiError::not_found("the index has no ticks yet"))?;
+    let indexed = indexed?;
+
+    let interval_seconds = i64::from(interval);
+    let head_seconds = head.timestamp.timestamp();
+    let latest_bucket = head_seconds - head_seconds.rem_euclid(interval_seconds);
+    let start_seconds = latest_bucket - interval_seconds * i64::from(limit - 1);
+    let from = DateTime::from_timestamp(start_seconds, 0)
+        .ok_or_else(|| ApiError::internal("balance window is outside the timestamp range"))?;
+    let rows = state
+        .store
+        .identity_flow(&identity, interval, from, limit)
+        .await?;
+    let by_bucket: HashMap<i64, store::FlowBucket> = rows
+        .into_iter()
+        .map(|row| (row.bucket.timestamp(), row))
+        .collect();
+
+    let mut data = Vec::with_capacity(limit as usize);
+    let mut cumulative_net = 0i64;
+    let mut total_incoming = 0i64;
+    let mut total_outgoing = 0i64;
+    for index in (0..limit).rev() {
+        let seconds = latest_bucket - interval_seconds * i64::from(index);
+        let bucket = Utc
+            .timestamp_opt(seconds, 0)
+            .single()
+            .ok_or_else(|| ApiError::internal("balance bucket is outside the timestamp range"))?;
+        let row = by_bucket.get(&seconds);
+        let incoming = row.map_or(0, |row| row.incoming_amount);
+        let outgoing = row.map_or(0, |row| row.outgoing_amount);
+        let net = incoming.saturating_sub(outgoing);
+        cumulative_net = cumulative_net.saturating_add(net);
+        total_incoming = total_incoming.saturating_add(incoming);
+        total_outgoing = total_outgoing.saturating_add(outgoing);
+        data.push(json!({
+            "bucket": bucket,
+            "incoming_amount": incoming,
+            "outgoing_amount": outgoing,
+            "net_amount": net,
+            "cumulative_net_amount": cumulative_net,
+            "transaction_count": row.map_or(0, |row| row.transaction_count),
+            "counterparty_count": row.map_or(0, |row| row.counterparty_count),
+        }));
+    }
+
+    Ok((
+        [(header::CACHE_CONTROL, HeaderValue::from_static(SHORT_CACHE))],
+        Json(json!({
+            "data": data,
+            "meta": {
+                "identity": identity,
+                "interval_seconds": interval,
+                "limit": limit,
+                "from": from,
+                "totals": {
+                    "incoming_amount": total_incoming,
+                    "outgoing_amount": total_outgoing,
+                    "net_amount": cumulative_net,
+                },
+                "indexed_balance": indexed.as_ref().map(|row| row.balance),
+                "balance_source": "indexed_transfer_flow",
+                "note": "cumulative_net_amount is the indexed transfer delta from the window start. It is not the live spectrum balance.",
             }
         })),
     ))

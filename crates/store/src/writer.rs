@@ -11,7 +11,8 @@ use std::collections::{BTreeMap, HashMap};
 use serde::Serialize;
 
 use crate::rows::{
-    self, EventInsert, IdentityInsert, QuorumEvidenceInsert, TickInsert, TransactionInsert,
+    self, ContractDividendInsert, EventInsert, IdentityInsert, QuorumEvidenceInsert, TickInsert,
+    TransactionInsert,
 };
 use crate::{
     CURSOR_HEAD, ClickHouseStore, Error, EventParticipantRow, HeadCursor, Result, Store, TickBatch,
@@ -24,6 +25,7 @@ struct PreparedTick {
     events: Vec<EventInsert>,
     participants: Vec<EventParticipantRow>,
     identities: Vec<IdentityInsert>,
+    dividends: Vec<ContractDividendInsert>,
     evidence: Option<QuorumEvidenceInsert>,
     outcome: WriteOutcome,
 }
@@ -50,6 +52,7 @@ pub async fn write_ticks(
     let mut events = Vec::new();
     let mut participants = Vec::new();
     let mut identities = Vec::new();
+    let mut dividends = Vec::new();
     let mut evidence = Vec::new();
     let mut ticks = Vec::with_capacity(batches.len());
     let mut outcomes = Vec::with_capacity(batches.len());
@@ -60,6 +63,7 @@ pub async fn write_ticks(
         events.extend(prepared.events);
         participants.extend(prepared.participants);
         identities.extend(prepared.identities);
+        dividends.extend(prepared.dividends);
         if let Some(row) = prepared.evidence {
             evidence.push(row);
         }
@@ -73,6 +77,7 @@ pub async fn write_ticks(
     // has a complete identity index.
     store.write_event_participants(&participants).await?;
     insert_all(&store.client, "identities", &identities).await?;
+    insert_all(&store.client, "contract_dividends", &dividends).await?;
     // Evidence is written before the tick row so a visible head always has its
     // audit row. It shares the batch version, so a replay replaces it.
     insert_all(&store.client, "quorum_evidence", &evidence).await?;
@@ -242,12 +247,26 @@ fn prepare_tick(batch: &TickBatch) -> Result<PreparedTick> {
         version,
     };
 
+    let dividends = batch
+        .dividends
+        .iter()
+        .map(|row| {
+            validate_row(batch, row.epoch, row.tick, "contract dividend")?;
+            let mut row = ContractDividendInsert::from(row);
+            if row.version == 0 {
+                row.version = batch.version;
+            }
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
     Ok(PreparedTick {
         tick,
         transactions: transaction_rows,
         events: event_rows,
         participants,
         identities: identity_rows,
+        dividends,
         evidence,
         outcome,
     })

@@ -157,6 +157,12 @@ pub fn router() -> Router<AppState> {
             get(analytics_top_identities),
         )
         .route("/v1/analytics/event-types", get(analytics_event_types))
+        .route("/v1/analytics/whales", get(analytics_whales))
+        .route(
+            "/v1/analytics/active-identities",
+            get(analytics_active_identities),
+        )
+        .route("/v1/analytics/network", get(analytics_network))
         .route("/v1/search", get(search))
 }
 
@@ -1087,18 +1093,49 @@ async fn search(
         .map(|value| value.trim())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| ApiError::bad_request("query parameter q is required"))?;
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(10)
+        .clamp(1, 50);
+    let prefix_limit = limit.min(25);
 
     let mut data = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |key: String, value: Value, data: &mut Vec<Value>| {
+        if seen.insert(key) {
+            data.push(value);
+        }
+    };
 
     if query.chars().all(|c| c.is_ascii_digit()) {
         if let Ok(tick) = query.parse::<u32>() {
             if let Some(row) = state.store.tick(tick).await? {
-                data.push(json!({ "type": "tick", "tick": tick, "value": row }));
+                push(
+                    format!("tick:{tick}"),
+                    json!({ "type": "tick", "tick": tick, "value": row }),
+                    &mut data,
+                );
             }
         }
         if let Ok(epoch) = query.parse::<u16>() {
             if let Some(row) = state.store.epoch(epoch).await? {
-                data.push(json!({ "type": "epoch", "epoch": epoch, "value": row }));
+                push(
+                    format!("epoch:{epoch}"),
+                    json!({ "type": "epoch", "epoch": epoch, "value": row }),
+                    &mut data,
+                );
+            }
+        }
+        if let Ok(index) = query.parse::<u32>() {
+            if let Ok(Some(row)) = state.store.contract(index).await {
+                let mut value = serde_json::to_value(row).unwrap_or(Value::Null);
+                state.labels.enrich_contract(&mut value, index);
+                push(
+                    format!("contract:{index}"),
+                    json!({ "type": "contract", "value": value }),
+                    &mut data,
+                );
             }
         }
     }
@@ -1106,14 +1143,55 @@ async fn search(
     let lower = query.to_ascii_lowercase();
     if qubic::decode_tx_hash(&lower).is_ok() {
         if let Some(row) = state.store.transaction(&lower).await? {
-            data.push(json!({ "type": "transaction", "value": row }));
+            push(
+                format!("transaction:{lower}"),
+                json!({ "type": "transaction", "value": row }),
+                &mut data,
+            );
+        }
+    } else if lower.len() >= 6
+        && lower.len() < 64
+        && lower.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        if let Ok(rows) = state
+            .store
+            .transactions_by_hash_prefix(&lower, prefix_limit)
+            .await
+        {
+            for row in rows {
+                push(
+                    format!("transaction:{}", row.hash),
+                    json!({ "type": "transaction", "value": row }),
+                    &mut data,
+                );
+            }
         }
     }
 
     let upper = query.to_ascii_uppercase();
     if qubic::PublicKey::from_identity(&upper).is_ok() {
         if let Some(row) = state.store.identity(&upper).await? {
-            data.push(json!({ "type": "identity", "value": row }));
+            let mut value = serde_json::to_value(row).unwrap_or(Value::Null);
+            state.labels.enrich_identity(&mut value, &upper);
+            push(
+                format!("identity:{upper}"),
+                json!({ "type": "identity", "value": value }),
+                &mut data,
+            );
+        }
+    } else if upper.len() >= 4 && upper.len() < 60 && upper.bytes().all(|b| b.is_ascii_uppercase())
+    {
+        if let Ok(rows) = state.store.identities_by_prefix(&upper, prefix_limit).await {
+            for row in rows {
+                let identity = row.identity.clone();
+                let mut value = serde_json::to_value(row).unwrap_or(Value::Null);
+                state.labels.enrich_identity(&mut value, &identity);
+                push(
+                    format!("identity:{identity}"),
+                    json!({ "type": "identity", "value": value }),
+                    &mut data,
+                );
+            }
         }
     }
 
@@ -1127,16 +1205,62 @@ async fn search(
                 .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase());
         if valid_name && qubic::PublicKey::from_identity(&issuer).is_ok() {
             if let Some(row) = state.store.asset(&issuer, &name).await? {
-                data.push(json!({ "type": "asset", "value": row }));
+                let mut value = serde_json::to_value(row).unwrap_or(Value::Null);
+                state.labels.enrich_asset(&mut value, &issuer, &name);
+                push(
+                    format!("asset:{issuer}/{name}"),
+                    json!({ "type": "asset", "value": value }),
+                    &mut data,
+                );
             }
         }
+    } else if query.len() >= 2
+        && query.len() <= 7
+        && upper
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_uppercase())
+    {
+        let name_prefix = upper.clone();
+        if let Ok(rows) = state.store.assets_by_name(&name_prefix, prefix_limit).await {
+            for row in rows {
+                let (issuer, name) = (row.issuer.clone(), row.name.clone());
+                let mut value = serde_json::to_value(row).unwrap_or(Value::Null);
+                state.labels.enrich_asset(&mut value, &issuer, &name);
+                push(
+                    format!("asset:{issuer}/{name}"),
+                    json!({ "type": "asset", "value": value }),
+                    &mut data,
+                );
+            }
+        }
+    }
+
+    for label in state.labels.search(query, limit) {
+        let key = format!(
+            "label:{}:{}:{}",
+            label.category,
+            label.identity.as_deref().unwrap_or(""),
+            label
+                .contract_index
+                .map_or_else(String::new, |index| index.to_string())
+        );
+        push(key, json!({ "type": "label", "value": label }), &mut data);
     }
 
     Ok((
         [(header::CACHE_CONTROL, RECENT)],
         Json(json!({
             "data": data,
-            "meta": { "query": query, "count": data.len() },
+            "meta": {
+                "query": query,
+                "count": data.len(),
+                "limit": limit,
+                "capabilities": [
+                    "exact_tick", "exact_epoch", "exact_contract", "exact_transaction",
+                    "transaction_hash_prefix", "exact_identity", "identity_prefix",
+                    "exact_asset", "asset_name_prefix", "label"
+                ],
+            },
         })),
     ))
 }
@@ -1153,6 +1277,88 @@ async fn analytics_activity(
         Json(json!({
             "data": rows,
             "meta": { "interval_seconds": interval, "limit": limit },
+        })),
+    ))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct WhalesQuery {
+    #[serde(default)]
+    min_amount: Option<i64>,
+    #[serde(default)]
+    since_tick: Option<u32>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+async fn analytics_whales(
+    State(state): State<AppState>,
+    Query(params): Query<WhalesQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let min_amount = params
+        .min_amount
+        .unwrap_or_else(crate::overview::whale_min_amount)
+        .max(1);
+    let limit = params.limit.unwrap_or(25).clamp(1, 200);
+    let rows = state
+        .store
+        .whale_transactions(min_amount, params.since_tick, limit)
+        .await?;
+    let data: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let mut value = transaction_value(row);
+            state.labels.enrich_transaction(&mut value);
+            value
+        })
+        .collect();
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({
+            "data": data,
+            "meta": {
+                "min_amount": min_amount,
+                "since_tick": params.since_tick,
+                "limit": limit,
+                "count": data.len(),
+                "ordering": "tick_desc_then_amount_desc",
+            },
+        })),
+    ))
+}
+
+async fn analytics_active_identities(
+    State(state): State<AppState>,
+    Query(params): Query<AnalyticsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let interval = params.interval.unwrap_or(3600).clamp(60, 86_400);
+    let limit = params.limit.unwrap_or(24).clamp(1, 500);
+    let rows = state.store.active_identity_buckets(interval, limit).await?;
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({
+            "data": rows,
+            "meta": { "interval_seconds": interval, "limit": limit },
+        })),
+    ))
+}
+
+async fn analytics_network(State(state): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    let stats = state.network_stats().await?;
+    Ok((
+        [(header::CACHE_CONTROL, AGGREGATE)],
+        Json(json!({
+            "data": {
+                "head": stats.head,
+                "epochs": stats.epochs,
+                "ticks": stats.ticks,
+                "transactions": stats.transactions,
+                "events": stats.events,
+                "identities": stats.identities,
+                "latest_timestamp": stats.latest_timestamp,
+                "ingest": stats.ingest,
+            },
+            "meta": { "source": "index", "cache_seconds": 5 },
         })),
     ))
 }

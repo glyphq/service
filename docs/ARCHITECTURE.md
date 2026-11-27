@@ -341,12 +341,13 @@ dispatcher. They are operational state, not consensus.
 5. Each status transition that matches a registration is written to `webhook_deliveries`
    and posted with `X-Glyph-Event`, `X-Glyph-Delivery`, `X-Glyph-Timestamp`, and
    `X-Glyph-Signature: sha256=<hex HMAC-SHA256 of "{timestamp}.{body}">`.
-6. Failed deliveries retry with 1 s, 2 s, 4 s, ... backoff capped at 60 s up to
-   `WEBHOOK_MAX_ATTEMPTS`, then are recorded as `failed` (dead-lettered). Delivery is
-   at-least-once.
+6. Each delivery is attempted once. A non-2xx response, timeout, or transport error is
+   recorded as `failed` and the payload stays auditable in `webhook_deliveries`.
+   On-chain event and whale webhooks are sourced from indexed ticks with a persisted
+   cursor.
 
-ClickHouse TTL clauses keep the gateway tables bounded. Terminal mempool entries expire
-after 1 hour, delivered or dead-lettered deliveries after 1 day, inactive webhooks after
+ClickHouse TTL clauses keep the gateway tables bounded. Mempool entries expire
+after 7 days regardless of status, delivered or dead-lettered deliveries after 1 day, inactive webhooks after
 7 days, and durable tracked transactions after 30 days unless their status is `failed`.
 Failed tracked transactions are kept indefinitely so a failed broadcast page resolves
 by hash. Open mempool entries and pending deliveries are excluded, so TTL never drops
