@@ -48,6 +48,16 @@ if [[ -z "$webhook_key" ]]; then
     (umask 077 && printf '%s' "$webhook_key" > "$webhook_key_file")
   fi
 fi
+lifecycle_key="${LIFECYCLE_LINK_KEY:-}"
+lifecycle_key_file="${LIFECYCLE_LINK_KEY_FILE:-$repo_root/.lifecycle-link-key}"
+if [[ -z "$lifecycle_key" ]]; then
+  if [[ -f "$lifecycle_key_file" ]]; then
+    lifecycle_key="$(<"$lifecycle_key_file")"
+  else
+    lifecycle_key="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    (umask 077 && printf '%s' "$lifecycle_key" > "$lifecycle_key_file")
+  fi
+fi
 s3_user="${S3_ACCESS_KEY:-glyph}"
 s3_password="${S3_SECRET_KEY:-glyph-dev-secret}"
 s3_bucket="${S3_BUCKET:-glyph-archive}"
@@ -80,6 +90,9 @@ app_env=(
   -e "WEBHOOK_MAX_ATTEMPTS=${WEBHOOK_MAX_ATTEMPTS:-6}"
   -e "WEBHOOK_ALLOW_PRIVATE=${WEBHOOK_ALLOW_PRIVATE:-false}"
   -e "WEBHOOK_ENCRYPTION_KEY=$webhook_key"
+  -e "LIFECYCLE_LINK_KEY=$lifecycle_key"
+  -e "LIFECYCLE_LINK_TTL_SECONDS=${LIFECYCLE_LINK_TTL_SECONDS:-900}"
+  -e "API_PUBLIC_URL=${API_PUBLIC_URL:-}"
   -e "STREAM_POLL_MS=${STREAM_POLL_MS:-1000}"
   -e "PRICE_POLL_MS=${PRICE_POLL_MS:-60000}"
   -e "MARKET_ENABLED=${MARKET_ENABLED:-true}"

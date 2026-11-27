@@ -18,11 +18,14 @@ use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetReques
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
 
 pub mod advanced;
+pub mod crypto;
 pub mod dto;
 pub mod entity_cache;
 pub mod error;
 pub mod identity;
 pub mod lifecycle;
+pub mod lifecycle_link;
+pub mod lifecycle_stream;
 pub mod live_events;
 pub mod market;
 pub mod mempool;
@@ -65,6 +68,8 @@ pub struct AppState {
     pub mempool: Option<Arc<mempool::Mempool>>,
     /// Signed webhook registration and delivery. `None` disables webhook routes.
     pub webhooks: Option<Arc<webhook::Webhooks>>,
+    /// Encrypted, expiring links for the transaction lifecycle stream.
+    pub lifecycle_links: Option<Arc<lifecycle_link::LifecycleLinks>>,
     /// Short-lived cache for peer-backed reads.
     pub live_cache: Arc<peer::LiveCache>,
     /// Deduplicates background entity and wallet refreshes per identity.
@@ -96,6 +101,7 @@ impl AppState {
             gateway: None,
             mempool: None,
             webhooks: None,
+            lifecycle_links: None,
             invalidator: peer::EntityInvalidator::new(live_cache.clone()),
             live_cache,
             refreshes: Arc::new(peer::RefreshCoordinator::default()),
@@ -209,6 +215,7 @@ pub fn router(state: AppState) -> Router {
         .merge(advanced::router())
         .merge(network::router())
         .merge(lifecycle::router())
+        .merge(lifecycle_stream::router())
         .merge(market::router())
         .merge(prices::router())
         .merge(stream::router())
@@ -429,6 +436,10 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
     let pool = NodePool::new(peers.clone());
     let live_cache = Arc::new(peer::LiveCache::default());
     let invalidator = peer::EntityInvalidator::new(live_cache.clone());
+    let lifecycle_links = lifecycle_link::LifecycleLinks::from_env().map(Arc::new);
+    if lifecycle_links.is_none() {
+        tracing::warn!("LIFECYCLE_LINK_KEY is not configured; lifecycle links are disabled");
+    }
     let archive = archive_from_env();
     let price_interval = std::env::var("PRICE_POLL_MS")
         .ok()
@@ -524,6 +535,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         gateway,
         mempool,
         webhooks,
+        lifecycle_links,
         live_cache,
         invalidator,
         refreshes: Arc::new(peer::RefreshCoordinator::default()),

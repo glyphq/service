@@ -24,7 +24,7 @@ use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use base64::Engine;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use chrono::{TimeDelta, Utc};
@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use crate::advanced::json_body;
+use crate::crypto::decode_key;
 use crate::{ApiError, AppState};
 
 /// Every event a registration may subscribe to.
@@ -120,18 +121,6 @@ impl UrlCipher {
             .map_err(|_| "webhook url decryption failed".to_owned())?;
         String::from_utf8(plaintext).map_err(|_| "webhook url is not valid UTF-8".to_owned())
     }
-}
-
-fn decode_key(raw: &str) -> Option<[u8; 32]> {
-    let bytes = if raw.len() == 64 && raw.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        hex::decode(raw).ok()?
-    } else {
-        URL_SAFE_NO_PAD
-            .decode(raw)
-            .or_else(|_| STANDARD.decode(raw))
-            .ok()?
-    };
-    bytes.try_into().ok()
 }
 
 #[derive(Debug, Clone)]

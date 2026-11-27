@@ -56,17 +56,38 @@ async fn lifecycle(
     State(state): State<AppState>,
     Path(hash): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let body = snapshot_cached(&state, &hash, Duration::from_secs(2)).await?;
+    Ok(([(header::CACHE_CONTROL, RECENT)], Json(body)))
+}
+
+/// Returns the lifecycle body, reusing a recent snapshot for `ttl`.
+pub async fn snapshot_cached(
+    state: &AppState,
+    hash: &str,
+    ttl: Duration,
+) -> Result<Value, ApiError> {
     let hash = hash.trim().to_ascii_lowercase();
     let digest =
         qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
     let cache_key = format!("lifecycle:{hash}:{}", state.invalidator.generation());
-    if let Some(value) = state.live_cache.get(&cache_key, Duration::from_secs(2)) {
-        return Ok(([(header::CACHE_CONTROL, RECENT)], Json(value)));
+    if let Some(value) = state.live_cache.get(&cache_key, ttl) {
+        return Ok(value);
     }
 
-    let indexed = state.store.transaction(&hash).await?;
+    let body = build_snapshot(state, &hash, &digest).await?;
+    let cache_key = format!("lifecycle:{hash}:{}", state.invalidator.generation());
+    state.live_cache.put(cache_key, body.clone());
+    Ok(body)
+}
+
+async fn build_snapshot(
+    state: &AppState,
+    hash: &str,
+    digest: &[u8; 32],
+) -> Result<Value, ApiError> {
+    let indexed = state.store.transaction(hash).await?;
     let mempool = match &state.mempool {
-        Some(mempool) => mempool.status(&hash).await.unwrap_or(None),
+        Some(mempool) => mempool.status(hash).await.unwrap_or(None),
         None => None,
     };
     let mut network_error = None;
@@ -74,7 +95,7 @@ async fn lifecycle(
         match peer::request(
             "peer transaction lookup",
             PEER_TIMEOUT,
-            state.pool.transaction(digest),
+            state.pool.transaction(*digest),
         )
         .await
         {
@@ -110,7 +131,7 @@ async fn lifecycle(
         })
     });
     let network_seen = indexed.is_none() && network_tick.is_some();
-    let current = current_tick(&state).await;
+    let current = current_tick(state).await;
     if let Some(row) = &indexed {
         let recent = current.is_none_or(|current| {
             row.tick.saturating_add(CONFIRMATION_INVALIDATION_TICKS) >= current
@@ -124,14 +145,14 @@ async fn lifecycle(
         }
     }
     let money_flew = match indexed_tick.or(network_tick) {
-        Some(tick) => peer_money_flew(&state, tick, &digest).await,
+        Some(tick) => peer_money_flew(state, tick, digest).await,
         None => None,
     };
 
     let events = if indexed.is_some() {
         state
             .store
-            .events_for_transaction(&hash)
+            .events_for_transaction(hash)
             .await
             .unwrap_or_default()
             .into_iter()
@@ -213,9 +234,7 @@ async fn lifecycle(
             "note": "money_flew is only known when a peer running the tx-status add-on answers. It is null otherwise, not false."
         }
     });
-    let cache_key = format!("lifecycle:{hash}:{}", state.invalidator.generation());
-    state.live_cache.put(cache_key, body.clone());
-    Ok(([(header::CACHE_CONTROL, RECENT)], Json(body)))
+    Ok(body)
 }
 
 fn lifecycle_state(
@@ -251,6 +270,51 @@ fn lifecycle_state(
         return "pending";
     }
     "unknown"
+}
+
+/// States that will not change again for this transaction.
+pub fn is_terminal(state: &str) -> bool {
+    matches!(state, "confirmed" | "failed" | "expired" | "cancelled")
+}
+
+/// Compact SSE projection of a full lifecycle body.
+pub fn progress_payload(body: &Value) -> Value {
+    let data = body.get("data").unwrap_or(&Value::Null);
+    let tracking = data.get("tracking").filter(|value| value.is_object());
+    let events = data
+        .get("events")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let errors = data
+        .get("errors")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    json!({
+        "hash": data.get("hash").cloned().unwrap_or(Value::Null),
+        "state": data.get("state").cloned().unwrap_or(Value::Null),
+        "target_tick": data.get("target_tick").cloned().unwrap_or(Value::Null),
+        "included_tick": data.get("included_tick").cloned().unwrap_or(Value::Null),
+        "network_included_tick": data.get("network_included_tick").cloned().unwrap_or(Value::Null),
+        "current_tick": data.get("current_tick").cloned().unwrap_or(Value::Null),
+        "confirmations": data.get("confirmations").cloned().unwrap_or(Value::Null),
+        "money_flew": data.get("money_flew").cloned().unwrap_or(Value::Null),
+        "execution": data.get("execution").cloned().unwrap_or(Value::Null),
+        "indexed": data.get("indexed").cloned().unwrap_or(Value::Null),
+        "confirmation_source": data.get("confirmation_source").cloned().unwrap_or(Value::Null),
+        "transaction": data.get("transaction").cloned().unwrap_or(Value::Null),
+        "tracking": tracking.map_or(Value::Null, |tracking| json!({
+            "status": tracking.get("status").cloned().unwrap_or(Value::Null),
+            "attempts": tracking.get("attempts").cloned().unwrap_or(Value::Null),
+            "broadcast_peers": tracking.get("broadcast_peers").cloned().unwrap_or(Value::Null),
+            "target_tick": tracking.get("target_tick").cloned().unwrap_or(Value::Null),
+            "expiry_tick": tracking.get("expiry_tick").cloned().unwrap_or(Value::Null),
+            "confirmed_tick": tracking.get("confirmed_tick").cloned().unwrap_or(Value::Null),
+            "error": tracking.get("error").cloned().unwrap_or(Value::Null),
+        })),
+        "timeline": data.get("timeline").cloned().unwrap_or_else(|| json!([])),
+        "event_count": events,
+        "error_count": errors,
+    })
 }
 
 fn execution_json(events: &[Value], money_flew: Option<bool>) -> Value {

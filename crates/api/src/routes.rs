@@ -1388,6 +1388,7 @@ pub async fn docs() -> Html<&'static str> {
 <li><code>GET /v1/transactions?epoch=&amp;tick=&amp;identity=&amp;limit=&amp;cursor=</code></li>
 <li><code>GET /v1/transactions/{hash}</code></li>
 <li><code>GET /v1/transactions/{hash}/lifecycle</code></li>
+<li><code>POST /v1/transactions/{hash}/lifecycle/link?ttl_seconds=</code></li>
 <li><code>GET /v1/transactions/inclusion-risk?source=&amp;target_tick=&amp;amount=</code></li>
 <li><code>GET /v1/events?epoch=&amp;tick=&amp;type=&amp;limit=&amp;cursor=</code></li>
 <li><code>GET /v1/identities?limit=&amp;cursor=</code></li>
@@ -1411,6 +1412,7 @@ pub async fn docs() -> Html<&'static str> {
 <li><code>GET /v1/analytics/event-types?limit=</code></li>
 <li><code>GET /v1/stream?types=</code></li>
 <li><code>GET /v1/stream/{ticks|transactions|events|prices|market}</code></li>
+<li><code>GET /v1/lifecycle/stream?token=</code></li>
 <li><code>GET /v1/ws</code></li>
 <li><code>GET /v1/live/identities/{identity}</code></li>
 <li><code>GET /v1/live/transactions/{hash}</code></li>

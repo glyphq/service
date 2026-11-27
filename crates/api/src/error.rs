@@ -90,6 +90,14 @@ impl ApiError {
             detail: detail.into(),
         }
     }
+
+    pub fn unauthorized(detail: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            detail: detail.into(),
+        }
+    }
 }
 
 impl std::fmt::Display for ApiError {

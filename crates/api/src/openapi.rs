@@ -381,6 +381,23 @@ fn paths() -> Value {
                     "responses": { "200": { "description": "Transaction lifecycle", "content": { "application/json": { "schema": { "type": "object" } } } }, "400": { "description": "Invalid hash" }, "404": { "description": "Unknown transaction" } }
                 }
             },
+            "/v1/transactions/{hash}/lifecycle/link": {
+                "post": {
+                    "operationId": "createTransactionLifecycleLink",
+                    "tags": ["Transactions"],
+                    "summary": "Create a temporary encrypted lifecycle stream link",
+                    "description": "Creates a short-lived AEAD token for the transaction lifecycle SSE stream. The token is self-contained, scoped to one hash, and expires. No account or API key is required.",
+                    "parameters": [
+                        transaction_hash_param(),
+                        { "name": "ttl_seconds", "in": "query", "required": false, "description": "Link lifetime. Default 900, range 30-3600.", "schema": { "type": "integer", "minimum": 30, "maximum": 3600, "default": 900 } }
+                    ],
+                    "responses": {
+                        "200": { "description": "Encrypted stream URL", "content": { "application/json": { "schema": { "type": "object" } } } },
+                        "400": { "description": "Invalid hash or TTL" },
+                        "503": { "description": "Lifecycle links are not configured" }
+                    }
+                }
+            },
             "/v1/ticks/{tick}/capacity": {
                 "get": {
                     "operationId": "getTickCapacity",
@@ -886,6 +903,22 @@ fn paths() -> Value {
                     "responses": {
                         "200": { "description": "text/event-stream", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
                         "503": { "description": "Streaming is not enabled" }
+                    }
+                }
+            },
+            "/v1/lifecycle/stream": {
+                "get": {
+                    "operationId": "streamTransactionLifecycle",
+                    "tags": ["Stream"],
+                    "summary": "Stream live transaction lifecycle progress",
+                    "description": "SSE progress for one transaction. The token comes from `POST /v1/transactions/{hash}/lifecycle/link`. Events are `progress`, `waiting`, `warning`, `done`, and `link_expired`; `done` is terminal and the connection closes.",
+                    "parameters": [
+                        { "name": "token", "in": "query", "required": true, "description": "Encrypted lifecycle link token.", "schema": { "type": "string" } }
+                    ],
+                    "responses": {
+                        "200": { "description": "SSE lifecycle progress", "content": { "text/event-stream": { "schema": { "type": "string" } } } },
+                        "401": { "description": "Invalid or expired link" },
+                        "503": { "description": "Lifecycle links are not configured" }
                     }
                 }
             },
@@ -2134,6 +2167,7 @@ mod tests {
             "/v1/transactions/{hash}/effects",
             "/v1/transactions/inclusion-risk",
             "/v1/transactions/{hash}/lifecycle",
+            "/v1/transactions/{hash}/lifecycle/link",
             "/v1/events",
             "/v1/identities",
             "/v1/identities/{identity}",
@@ -2160,6 +2194,7 @@ mod tests {
             "/v1/stream/events",
             "/v1/stream/prices",
             "/v1/stream/market",
+            "/v1/lifecycle/stream",
             "/v1/ws",
             "/v1/live/identities/{identity}",
             "/v1/live/transactions/{hash}",

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use api::{AppState, router};
 use async_trait::async_trait;
@@ -6,6 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use axum::response::IntoResponse;
 use chrono::{TimeZone, Utc};
+use futures_util::StreamExt;
 use serde_json::Value;
 use store::{
     ActivityBucket, AssetRow, AssetTransferRow, ComputorRow, CounterpartyRow, EpochRow,
@@ -1486,6 +1488,126 @@ async fn transaction_lifecycle_reports_inclusion_and_execution() {
     let (status, body) = get("/v1/transactions/unknown/lifecycle").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["code"], "invalid_transaction_hash");
+}
+
+#[tokio::test]
+async fn lifecycle_link_creates_a_scoped_sse_stream() {
+    let hash = hash_for(7, 0);
+    let mut state = AppState::new(Arc::new(MockStore::new()));
+    state.lifecycle_links = Some(Arc::new(api::lifecycle_link::LifecycleLinks::new(
+        [7u8; 32],
+        600,
+        Some("https://api.example".into()),
+    )));
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/transactions/{hash}/lifecycle/link?ttl_seconds=60"
+                ))
+                .header(header::HOST, "api.example")
+                .header("x-forwarded-proto", "https")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: Value = serde_json::from_slice(&bytes).expect("link json");
+    assert_eq!(body["data"]["expires_in_seconds"], 60);
+    assert_eq!(body["data"]["hash"], hash);
+    let url = body["data"]["url"].as_str().expect("url");
+    assert!(url.starts_with("https://api.example/v1/lifecycle/stream?token=gll1."));
+    let token = url.split_once("token=").expect("token").1;
+
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/lifecycle/stream?token={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers()[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+    let mut stream = response.into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("first sse frame")
+        .expect("frame")
+        .expect("body");
+    let frame = String::from_utf8_lossy(&chunk);
+    assert!(frame.contains("event: progress"), "{frame}");
+    assert!(frame.contains(&format!("\"hash\":\"{hash}\"")), "{frame}");
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/v1/lifecycle/stream?token=gll1.invalid")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn lifecycle_link_requires_configuration_and_a_valid_hash() {
+    let hash = hash_for(7, 0);
+    let response = router(AppState::new(Arc::new(MockStore::new())))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/transactions/{hash}/lifecycle/link"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let mut state = AppState::new(Arc::new(MockStore::new()));
+    state.lifecycle_links = Some(Arc::new(api::lifecycle_link::LifecycleLinks::new(
+        [7u8; 32], 600, None,
+    )));
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/transactions/not-a-hash/lifecycle/link")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v1/transactions/{hash}/lifecycle/link?ttl_seconds=1"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
