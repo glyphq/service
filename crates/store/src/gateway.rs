@@ -846,7 +846,7 @@ fn create_statements(database: &str) -> Vec<String> {
              )\n\
              ENGINE = ReplacingMergeTree(version)\n\
              ORDER BY hash\n\
-             TTL updated_at + INTERVAL 30 DAY DELETE"
+             TTL updated_at + INTERVAL 30 DAY DELETE WHERE status != 'failed'"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {database}.webhooks\n(\n\
@@ -897,7 +897,7 @@ fn retention_statements(database: &str) -> Vec<String> {
         ),
         format!(
             "ALTER TABLE {database}.tracked_transactions MODIFY TTL \
-             updated_at + INTERVAL 30 DAY DELETE"
+             updated_at + INTERVAL 30 DAY DELETE WHERE status != 'failed'"
         ),
         format!(
             "ALTER TABLE {database}.webhooks MODIFY TTL updated_at + INTERVAL 7 DAY DELETE \
@@ -948,7 +948,9 @@ mod tests {
         assert!(statements.contains("WHERE active = 0"));
         assert!(statements.contains("WHERE status IN ('delivered', 'failed')"));
         assert!(statements.contains("TTL updated_at + INTERVAL 1 HOUR DELETE"));
-        assert!(statements.contains("TTL updated_at + INTERVAL 30 DAY DELETE"));
+        assert!(
+            statements.contains("TTL updated_at + INTERVAL 30 DAY DELETE WHERE status != 'failed'")
+        );
         assert!(statements.contains("TTL updated_at + INTERVAL 7 DAY DELETE WHERE active = 0"));
         assert!(statements.contains("TTL created_at + INTERVAL 1 DAY DELETE"));
     }
@@ -968,10 +970,10 @@ mod tests {
             );
         }
         assert!(statements.contains("mempool MODIFY TTL updated_at + INTERVAL 1 HOUR DELETE"));
-        assert!(
-            statements
-                .contains("tracked_transactions MODIFY TTL updated_at + INTERVAL 30 DAY DELETE")
-        );
+        assert!(statements.contains(
+            "tracked_transactions MODIFY TTL updated_at + INTERVAL 30 DAY DELETE \
+                     WHERE status != 'failed'"
+        ));
         assert!(statements.contains("webhooks MODIFY TTL updated_at + INTERVAL 7 DAY DELETE"));
         assert!(
             statements.contains("webhook_deliveries MODIFY TTL created_at + INTERVAL 1 DAY DELETE")

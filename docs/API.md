@@ -1639,8 +1639,9 @@ It prevents a single wallet or script from consuming the whole pool and returns
 Terminal operational rows are removed by ClickHouse TTL one hour after their
 last update. Physical deletion is eventual because ClickHouse applies TTL during
 merges, but a terminal row never holds a capacity slot. The durable projection
-keeps the public transaction page readable for thirty days after its last
-update, then ClickHouse TTL removes it.
+keeps confirmed, expired, and cancelled transaction pages readable for thirty
+days after their last update. Failed transactions have no TTL and remain
+queryable by hash indefinitely, with `status: "failed"` and `state: "failed"`.
 
 ### Webhooks
 

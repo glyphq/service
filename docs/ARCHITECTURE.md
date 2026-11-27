@@ -347,8 +347,10 @@ dispatcher. They are operational state, not consensus.
 
 ClickHouse TTL clauses keep the gateway tables bounded. Terminal mempool entries expire
 after 1 hour, delivered or dead-lettered deliveries after 1 day, inactive webhooks after
-7 days, and durable tracked transactions after 30 days. Open mempool entries and pending
-deliveries are excluded, so TTL never drops work the tracker or dispatcher still needs.
+7 days, and durable tracked transactions after 30 days unless their status is `failed`.
+Failed tracked transactions are kept indefinitely so a failed broadcast page resolves
+by hash. Open mempool entries and pending deliveries are excluded, so TTL never drops
+work the tracker or dispatcher still needs.
 
 Transaction-scoped webhooks close when a terminal event is queued. The dispatcher
 deletes a closed registration as soon as it has no pending delivery, so failed or

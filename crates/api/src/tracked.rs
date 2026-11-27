@@ -171,4 +171,14 @@ mod tests {
         assert!(view.data["tick"].is_null());
         assert_eq!(view.meta["source"], "tracking");
     }
+
+    #[test]
+    fn tracked_view_reports_failed_rows_as_failed() {
+        let view = view(&ResolvedTransaction::Tracked(entry(MempoolStatus::Failed)));
+        assert!(!view.indexed);
+        assert_eq!(view.state, "failed");
+        assert_eq!(view.data["status"], "failed");
+        assert_eq!(view.data["tracking_status"], "failed");
+        assert_eq!(view.meta["state"], "failed");
+    }
 }
