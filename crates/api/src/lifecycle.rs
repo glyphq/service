@@ -281,6 +281,7 @@ pub fn is_terminal(state: &str) -> bool {
 pub fn progress_payload(body: &Value) -> Value {
     let data = body.get("data").unwrap_or(&Value::Null);
     let tracking = data.get("tracking").filter(|value| value.is_object());
+    let transaction = data.get("transaction").filter(|value| value.is_object());
     let events = data
         .get("events")
         .and_then(Value::as_array)
@@ -301,7 +302,15 @@ pub fn progress_payload(body: &Value) -> Value {
         "execution": data.get("execution").cloned().unwrap_or(Value::Null),
         "indexed": data.get("indexed").cloned().unwrap_or(Value::Null),
         "confirmation_source": data.get("confirmation_source").cloned().unwrap_or(Value::Null),
-        "transaction": data.get("transaction").cloned().unwrap_or(Value::Null),
+        "transaction": transaction.map_or(Value::Null, |transaction| json!({
+            "hash": transaction.get("hash").cloned().unwrap_or(Value::Null),
+            "tick": transaction.get("tick").cloned().unwrap_or(Value::Null),
+            "source": transaction.get("source").cloned().unwrap_or(Value::Null),
+            "destination": transaction.get("destination").cloned().unwrap_or(Value::Null),
+            "amount": transaction.get("amount").cloned().unwrap_or(Value::Null),
+            "input_type": transaction.get("input_type").cloned().unwrap_or(Value::Null),
+            "status": transaction.get("status").cloned().unwrap_or(Value::Null),
+        })),
         "tracking": tracking.map_or(Value::Null, |tracking| json!({
             "status": tracking.get("status").cloned().unwrap_or(Value::Null),
             "attempts": tracking.get("attempts").cloned().unwrap_or(Value::Null),

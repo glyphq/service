@@ -1552,6 +1552,31 @@ async fn lifecycle_link_creates_a_scoped_sse_stream() {
     assert!(frame.contains("event: progress"), "{frame}");
     assert!(frame.contains(&format!("\"hash\":\"{hash}\"")), "{frame}");
 
+    let unknown = hash_for(999_999, 0);
+    let token = state
+        .lifecycle_links
+        .as_ref()
+        .expect("links")
+        .issue(&unknown, 60)
+        .expect("token");
+    let response = router(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/v1/lifecycle/stream?token={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    let chunk = tokio::time::timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("first waiting frame")
+        .expect("frame")
+        .expect("body");
+    let frame = String::from_utf8_lossy(&chunk);
+    assert!(frame.contains("event: waiting"), "{frame}");
+
     let response = router(state)
         .oneshot(
             Request::builder()
