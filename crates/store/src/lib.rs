@@ -2643,6 +2643,9 @@ LIMIT ? OFFSET ?
         interval_seconds: u32,
         limit: u32,
     ) -> Result<Vec<ActiveIdentityBucket>> {
+        // `uniqExact` is unaffected by replayed rows with the same identity, so
+        // skip the global FINAL merge. This is the difference between a
+        // multi-second aggregation over every version and a bounded scan.
         let interval = i64::from(interval_seconds.max(1));
         let limit = limit.clamp(1, 500);
         let span = interval.saturating_mul(i64::from(limit));
@@ -2654,17 +2657,17 @@ SELECT bucket, uniqExact(identity) AS active_identities
 FROM (
     SELECT toDateTime64(toStartOfInterval(timestamp, toIntervalSecond(?)), 3, 'UTC') AS bucket,
            source AS identity
-    FROM transactions FINAL
+    FROM transactions
     WHERE timestamp >= now64(3) - toIntervalSecond(?)
     UNION ALL
     SELECT toDateTime64(toStartOfInterval(timestamp, toIntervalSecond(?)), 3, 'UTC') AS bucket,
            destination AS identity
-    FROM transactions FINAL
+    FROM transactions
     WHERE timestamp >= now64(3) - toIntervalSecond(?)
     UNION ALL
     SELECT toDateTime64(toStartOfInterval(timestamp, toIntervalSecond(?)), 3, 'UTC') AS bucket,
            identity
-    FROM event_participants FINAL
+    FROM event_participants
     WHERE timestamp >= now64(3) - toIntervalSecond(?)
 )
 WHERE identity != ''

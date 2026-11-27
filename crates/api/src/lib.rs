@@ -431,7 +431,7 @@ pub async fn serve(store: Arc<dyn Store>, bind: &str) -> anyhow::Result<()> {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .map(Duration::from_millis)
-        .unwrap_or(Duration::from_millis(1000));
+        .unwrap_or(Duration::from_millis(250));
     let hub_task = tokio::spawn(hub.clone().run(store.clone(), poll, cancel.clone()));
     let peers: Vec<PeerConfig> = std::env::var("QUBIC_PEERS")
         .or_else(|_| std::env::var("QUBIC_PEER"))

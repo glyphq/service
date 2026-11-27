@@ -251,7 +251,18 @@ impl StreamHub {
     }
 
     async fn publish_tick(&self, store: &dyn Store, tick: u32) -> store::Result<()> {
-        for event in self.collect_tick(store, tick).await? {
+        // Emit the tick header before querying its transactions and logs.
+        // A `/v1/stream/ticks` subscriber must not wait for detail collection,
+        // and a busy tick must not hold back the next tick header.
+        let Some(row) = store.tick(tick).await? else {
+            return Ok(());
+        };
+        self.publish(StreamEvent {
+            event: "tick",
+            id: format!("tick:{tick}"),
+            data: serde_json::to_value(&row).unwrap_or(Value::Null),
+        });
+        for event in self.collect_tick_details(store, tick).await? {
             self.publish(event);
         }
         Ok(())
@@ -267,6 +278,16 @@ impl StreamHub {
             id: format!("tick:{tick}"),
             data: serde_json::to_value(&row).unwrap_or(Value::Null),
         });
+        events.extend(self.collect_tick_details(store, tick).await?);
+        Ok(events)
+    }
+
+    async fn collect_tick_details(
+        &self,
+        store: &dyn Store,
+        tick: u32,
+    ) -> store::Result<Vec<StreamEvent>> {
+        let mut events = Vec::new();
         let mut offset = 0;
         loop {
             let rows = store.transactions_for_tick(tick, 4096, offset).await?;

@@ -185,7 +185,7 @@ The most common variables are below. The full list is in
 | `QUBIC_PEERS` | unset | Indexer peers, live API routes, and broadcast |
 | `ALLOW_BROADCAST` | `false` | Enables `POST /v1/transactions` |
 | `BROADCAST_PEERS` | `8` | Peers per broadcast fan-out, capped at `8` |
-| `STREAM_POLL_MS` | `1000` | Stream hub index-head poll interval |
+| `STREAM_POLL_MS` | `250` | Stream hub index-head poll interval |
 | `PRICE_POLL_MS` | `60000` | Live price feed refresh interval |
 | `MARKET_ENABLED` | `true` | Set `false` to disable the external market poller |
 | `MARKET_POLL_MS` | `5000` | Market provider round-robin interval |
