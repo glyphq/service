@@ -331,6 +331,9 @@ dispatcher. They are operational state, not consensus.
    acknowledge broadcasts, so this is not proof of inclusion.
 3. Every `MEMPOOL_POLL_MS` the tracker checks the index for the hash. An indexed hash moves
    the entry to `confirmed` and records the indexed tick.
+   Each transition also writes a durable `tracked_transactions` projection with decoded
+   fields only. Public transaction detail, effects, and lifecycle reads use it after the
+   operational mempool entry is gone, so pending and failed pages do not 404.
 4. Unconfirmed entries are retried no more often than `MEMPOOL_RETRY_MS` until
    `MEMPOOL_MAX_ATTEMPTS`. Once the indexed head is greater than
    `tick + MEMPOOL_EXPIRY_TICKS`, the entry becomes `expired`. Explicit cancellation
@@ -342,10 +345,10 @@ dispatcher. They are operational state, not consensus.
    `WEBHOOK_MAX_ATTEMPTS`, then are recorded as `failed` (dead-lettered). Delivery is
    at-least-once.
 
-ClickHouse TTL clauses keep the gateway tables bounded. Terminal mempool entries and
-delivered or dead-lettered deliveries expire after 1 day, and inactive webhooks after
-7 days. Open mempool entries and pending deliveries are excluded, so TTL never drops
-work the tracker or dispatcher still needs.
+ClickHouse TTL clauses keep the gateway tables bounded. Terminal mempool entries expire
+after 1 hour, delivered or dead-lettered deliveries after 1 day, inactive webhooks after
+7 days, and durable tracked transactions after 30 days. Open mempool entries and pending
+deliveries are excluded, so TTL never drops work the tracker or dispatcher still needs.
 
 Transaction-scoped webhooks close when a terminal event is queued. The dispatcher
 deletes a closed registration as soon as it has no pending delivery, so failed or

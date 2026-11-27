@@ -37,6 +37,7 @@ pub mod prices;
 pub mod routes;
 pub mod status_page;
 pub mod stream;
+pub mod tracked;
 pub mod transactions_ext;
 pub mod wallet;
 pub mod webhook;

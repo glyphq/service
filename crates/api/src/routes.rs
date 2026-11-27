@@ -605,17 +605,14 @@ async fn transaction(
     State(state): State<AppState>,
     Path(hash): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let hash = hash.trim().to_ascii_lowercase();
-    let _ =
-        qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
-    let row = state
-        .store
-        .transaction(&hash)
+    let resolved = crate::tracked::resolve(&state, &hash)
         .await?
-        .ok_or_else(|| ApiError::not_found(format!("transaction {hash} is not indexed")))?;
+        .ok_or_else(|| ApiError::not_found(format!("transaction {hash} is not tracked")))?;
+    let view = crate::tracked::view(&resolved);
+    let cache = if view.indexed { IMMUTABLE } else { "no-store" };
     Ok((
-        [(header::CACHE_CONTROL, IMMUTABLE)],
-        Json(json!({ "data": transaction_value(&row) })),
+        [(header::CACHE_CONTROL, cache)],
+        Json(json!({ "data": view.data, "meta": view.meta })),
     ))
 }
 

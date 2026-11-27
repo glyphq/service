@@ -18,6 +18,7 @@ use qubic::messages::Transaction;
 use serde_json::{Value, json};
 
 use crate::dto::event_value;
+use crate::tracked::ResolvedTransaction;
 use crate::{ApiError, AppState};
 
 /// Cap on the primary peer transaction lookup. A peer answers an unknown hash
@@ -43,13 +44,34 @@ async fn transaction_effects(
     State(state): State<AppState>,
     Path(hash): Path<String>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let hash = hash.trim().to_ascii_lowercase();
-    qubic::decode_tx_hash(&hash).map_err(|error| ApiError::invalid_hash(error.to_string()))?;
-    let transaction = state
-        .store
-        .transaction(&hash)
+    let resolved = crate::tracked::resolve(&state, &hash)
         .await?
-        .ok_or_else(|| ApiError::not_found(format!("transaction {hash} is not indexed")))?;
+        .ok_or_else(|| ApiError::not_found(format!("transaction {hash} is not tracked")))?;
+    let view = crate::tracked::view(&resolved);
+    let ResolvedTransaction::Indexed(transaction) = resolved else {
+        let summary = effect_summary(&[]);
+        return Ok((
+            [(header::CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "data": {
+                    "transaction": view.data,
+                    "tick": Value::Null,
+                    "events": [],
+                    "effects": [],
+                    "summary": summary,
+                },
+                "meta": {
+                    "source": "tracking",
+                    "indexed": false,
+                    "state": view.state,
+                    "event_count": 0,
+                    "effect_count": 0,
+                    "note": "Transaction was submitted through Glyph but is not indexed yet; events and effects are unavailable."
+                }
+            })),
+        ));
+    };
+    let hash = transaction.hash.clone();
     let tick = state.store.tick(transaction.tick).await?;
     let events: Vec<Value> = state
         .store
@@ -62,10 +84,7 @@ async fn transaction_effects(
     let summary = effect_summary(&events);
 
     Ok((
-        [(
-            header::CACHE_CONTROL,
-            axum::http::HeaderValue::from_static("public, max-age=31536000, immutable"),
-        )],
+        [(header::CACHE_CONTROL, "public, max-age=31536000, immutable")],
         Json(json!({
             "data": {
                 "transaction": transaction,
@@ -76,6 +95,8 @@ async fn transaction_effects(
             },
             "meta": {
                 "source": "index",
+                "indexed": true,
+                "state": "confirmed",
                 "event_count": events.len(),
                 "effect_count": effects.len(),
             }
@@ -193,9 +214,14 @@ async fn transaction_status(
     }
 
     let indexed = state.store.transaction(&hash).await?;
+    let tracked = match (&state.gateway, indexed.is_none()) {
+        (Some(gateway), true) => gateway.tracked_transaction(&hash).await?,
+        _ => None,
+    };
+    let known = indexed.is_some() || tracked.is_some();
     let (mut peer, mut peer_error) = match connect(&state).await {
         Ok(peer) => (Some(peer), None),
-        Err(error) if indexed.is_some() => {
+        Err(error) if known => {
             tracing::warn!(%hash, %error.detail, "transaction status peer lookup degraded");
             (None, Some(error.detail))
         }
@@ -213,14 +239,14 @@ async fn transaction_status(
     };
     let network = match lookup {
         Some(Ok(Ok(transaction))) => transaction,
-        Some(Ok(Err(error))) if indexed.is_some() => {
+        Some(Ok(Err(error))) if known => {
             tracing::warn!(%hash, %error.detail, "transaction status peer lookup degraded");
             peer_error = Some(error.detail);
             peer = None;
             None
         }
         Some(Ok(Err(error))) => return Err(error),
-        Some(Err(_)) if indexed.is_some() => {
+        Some(Err(_)) if known => {
             tracing::warn!(
                 %hash,
                 timeout_seconds = PEER_LOOKUP_TIMEOUT.as_secs(),
@@ -242,7 +268,7 @@ async fn transaction_status(
         None => None,
     };
 
-    if indexed.is_none() && network.is_none() {
+    if indexed.is_none() && network.is_none() && tracked.is_none() {
         return Err(ApiError::not_found(format!(
             "transaction {hash} is not indexed and is unknown to the peer"
         )));
@@ -287,14 +313,32 @@ async fn transaction_status(
     if let Some(row) = &indexed {
         data["indexed"] = json!(row);
     }
+    if let Some(transaction) = &tracked {
+        let view = crate::tracked::view(&ResolvedTransaction::Tracked(transaction.clone()));
+        data["tracked"] = view.data;
+    }
     if let Some(tick) = tick {
         data["tick"] = json!(tick);
     }
 
-    let mut meta = json!({ "source": "index+peer" });
+    let mut meta = json!({
+        "source": if indexed.is_some() {
+            "index+peer"
+        } else if tracked.is_some() {
+            "tracking+peer"
+        } else {
+            "peer"
+        }
+    });
     if let Some(error) = peer_error {
         meta["peer_error"] = json!(error);
-        meta["source"] = json!("index");
+        meta["source"] = json!(if indexed.is_some() {
+            "index"
+        } else if tracked.is_some() {
+            "tracking"
+        } else {
+            "peer"
+        });
     }
     let body = json!({
         "data": data,

@@ -376,7 +376,7 @@ fn paths() -> Value {
                     "operationId": "getTransactionLifecycle",
                     "tags": ["Transactions"],
                     "summary": "Get transaction lifecycle",
-                    "description": "Indexed, tracked, and peer state with events, effects, and money-flow. `state` is `confirmed` only when the explorer index or mempool can serve the transaction; a peer-only hit is `network_seen` until the writer commits it.",
+                    "description": "Indexed, tracked, and peer state with events, effects, and money-flow. `state` is `confirmed` only when the explorer index can serve the transaction; a durable tracking record or active mempool entry reports `tracking`, and a peer-only hit is `network_seen` until the writer commits it.",
                     "parameters": [transaction_hash_param()],
                     "responses": { "200": { "description": "Transaction lifecycle", "content": { "application/json": { "schema": { "type": "object" } } } }, "400": { "description": "Invalid hash" }, "404": { "description": "Unknown transaction" } }
                 }
@@ -565,12 +565,12 @@ fn paths() -> Value {
                     "operationId": "getTransaction",
                     "tags": ["Transactions"],
                     "summary": "Get transaction",
-                    "description": "By hash.",
+                    "description": "By hash. Falls back to Glyph's durable tracking record for a transaction submitted through this API but not indexed yet. `meta.indexed=false` and `meta.source=tracking` mark the fallback; the response is not cached.",
                     "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Transaction", "content": { "application/json": { "schema": data_envelope("Transaction") } } },
                         "400": { "description": "Invalid hash" },
-                        "404": { "description": "Transaction not indexed" }
+                        "404": { "description": "Transaction is neither indexed nor tracked" }
                     }
                 }
             },
@@ -579,12 +579,12 @@ fn paths() -> Value {
                     "operationId": "getTransactionEffects",
                     "tags": ["Transactions"],
                     "summary": "Get transaction effects",
-                    "description": "Transaction, tick, events, typed effects, and summary.",
+                    "description": "Transaction, tick, events, typed effects, and summary. A transaction that is tracked but not indexed returns its decoded transaction with empty events and effects, `meta.source=tracking`, and `no-store`.",
                     "parameters": [transaction_hash_param()],
                     "responses": {
                         "200": { "description": "Transaction effects", "content": { "application/json": { "schema": { "type": "object", "properties": { "data": { "$ref": "#/components/schemas/TransactionEffects" } } } } } },
                         "400": { "description": "Invalid transaction hash" },
-                        "404": { "description": "Transaction not indexed" }
+                        "404": { "description": "Transaction is neither indexed nor tracked" }
                     }
                 }
             },
@@ -1043,14 +1043,14 @@ fn paths() -> Value {
                     "operationId": "getTransactionStatus",
                     "tags": ["Transactions"],
                     "summary": "Get transaction status",
-                    "description": "Legacy status view. Use transaction lifecycle for events, effects, tracking, and timeline.",
+                    "description": "Legacy status view. Use transaction lifecycle for events, effects, tracking, and timeline. Durable tracked rows keep pending, failed, and expired transactions readable without a peer.",
                     "deprecated": true,
                     "parameters": [transaction_hash_param()],
                     "responses": {
-                        "200": { "description": "Indexed and/or peer transaction status" },
+                        "200": { "description": "Indexed, tracked, and/or peer transaction status" },
                         "400": { "description": "Invalid hash" },
-                        "404": { "description": "Unknown to both index and peer" },
-                        "503": { "description": "No peer and no indexed row" }
+                        "404": { "description": "Unknown to the index, tracking store, and peer" },
+                        "503": { "description": "No peer and no indexed or tracked row" }
                     }
                 }
             },

@@ -4,9 +4,10 @@
 //! stores best-effort gateway state, not indexed Qubic data.
 //!
 //! Every table is a `ReplacingMergeTree(version)` keyed by one logical row:
-//! `hash` for mempool entries, `id` for webhooks, and `id` for delivery
-//! attempts. Updates append a new millisecond version, so reads resolve the
-//! newest row with `LIMIT 1 BY` and replaying an update is idempotent.
+//! `hash` for mempool and tracked transaction entries, `id` for webhooks, and
+//! `id` for delivery attempts. Updates append a new millisecond version, so
+//! reads resolve the newest row with `LIMIT 1 BY` and replaying an update is
+//! idempotent.
 //!
 //! Optional timestamps and counters use zero sentinels instead of ClickHouse
 //! `Nullable` columns. That keeps the RowBinary shape simple and avoids a
@@ -92,6 +93,33 @@ impl MempoolEntry {
     pub fn is_open(&self) -> bool {
         self.status.is_open()
     }
+}
+
+/// Durable public projection of a transaction submitted through the API.
+///
+/// Unlike [`MempoolEntry`], this row never carries signed bytes and outlives
+/// the operational mempool. The index remains authoritative: a public read
+/// prefers an indexed row and only falls back here while the transaction is
+/// pending or terminal without inclusion.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackedTransaction {
+    pub hash: String,
+    pub source: String,
+    pub destination: String,
+    pub amount: i64,
+    pub target_tick: u32,
+    pub input_type: u16,
+    pub input_data: String,
+    pub status: MempoolStatus,
+    pub attempts: u8,
+    pub broadcast_peers: u8,
+    pub broadcast_at: Option<DateTime<Utc>>,
+    pub confirmed_at: Option<DateTime<Utc>>,
+    pub confirmed_tick: Option<u32>,
+    pub expiry_tick: u32,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// One registered webhook endpoint.
@@ -196,6 +224,79 @@ impl From<MempoolRow> for MempoolEntry {
             broadcast_at: from_millis(row.broadcast_at),
             confirmed_at: from_millis(row.confirmed_at),
             confirmed_tick: (row.confirmed_tick != 0).then_some(row.confirmed_tick),
+            error: (!row.error.is_empty()).then_some(row.error),
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
+}
+
+#[derive(Debug, Row, Serialize, Deserialize)]
+struct TrackedTransactionRow {
+    hash: String,
+    source: String,
+    destination: String,
+    amount: i64,
+    target_tick: u32,
+    input_type: u16,
+    input_data: String,
+    status: String,
+    attempts: u8,
+    broadcast_peers: u8,
+    broadcast_at: u64,
+    confirmed_at: u64,
+    confirmed_tick: u32,
+    expiry_tick: u32,
+    error: String,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    created_at: DateTime<Utc>,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    updated_at: DateTime<Utc>,
+    version: u64,
+}
+
+impl From<&TrackedTransaction> for TrackedTransactionRow {
+    fn from(transaction: &TrackedTransaction) -> Self {
+        Self {
+            hash: transaction.hash.clone(),
+            source: transaction.source.clone(),
+            destination: transaction.destination.clone(),
+            amount: transaction.amount,
+            target_tick: transaction.target_tick,
+            input_type: transaction.input_type,
+            input_data: transaction.input_data.clone(),
+            status: transaction.status.as_str().to_owned(),
+            attempts: transaction.attempts,
+            broadcast_peers: transaction.broadcast_peers,
+            broadcast_at: millis(transaction.broadcast_at),
+            confirmed_at: millis(transaction.confirmed_at),
+            confirmed_tick: transaction.confirmed_tick.unwrap_or(0),
+            expiry_tick: transaction.expiry_tick,
+            error: transaction.error.clone().unwrap_or_default(),
+            created_at: transaction.created_at,
+            updated_at: transaction.updated_at,
+            version: 0,
+        }
+    }
+}
+
+impl From<TrackedTransactionRow> for TrackedTransaction {
+    fn from(row: TrackedTransactionRow) -> Self {
+        Self {
+            hash: row.hash,
+            source: row.source,
+            destination: row.destination,
+            amount: row.amount,
+            target_tick: row.target_tick,
+            input_type: row.input_type,
+            input_data: row.input_data,
+            status: MempoolStatus::parse(&row.status).unwrap_or(MempoolStatus::Queued),
+            attempts: row.attempts,
+            broadcast_peers: row.broadcast_peers,
+            broadcast_at: from_millis(row.broadcast_at),
+            confirmed_at: from_millis(row.confirmed_at),
+            confirmed_tick: (row.confirmed_tick != 0).then_some(row.confirmed_tick),
+            expiry_tick: row.expiry_tick,
             error: (!row.error.is_empty()).then_some(row.error),
             created_at: row.created_at,
             updated_at: row.updated_at,
@@ -423,6 +524,31 @@ impl GatewayStore {
             .query("SELECT ?fields FROM mempool WHERE hash = ? ORDER BY version DESC LIMIT 1")
             .bind(hash)
             .fetch_optional::<MempoolRow>()
+            .await?;
+        Ok(row.map(Into::into))
+    }
+
+    /// Appends a durable public projection of one API transaction.
+    pub async fn put_tracked_transaction(&self, transaction: &TrackedTransaction) -> Result<()> {
+        let mut row = TrackedTransactionRow::from(transaction);
+        row.version = self.next_version();
+        let mut insert = self
+            .client
+            .insert::<TrackedTransactionRow>("tracked_transactions")?;
+        insert.write(&row).await?;
+        insert.end().await?;
+        Ok(())
+    }
+
+    pub async fn tracked_transaction(&self, hash: &str) -> Result<Option<TrackedTransaction>> {
+        let row = self
+            .client
+            .query(
+                "SELECT ?fields FROM tracked_transactions WHERE hash = ? \
+                 ORDER BY version DESC LIMIT 1",
+            )
+            .bind(hash)
+            .fetch_optional::<TrackedTransactionRow>()
             .await?;
         Ok(row.map(Into::into))
     }
@@ -694,8 +820,33 @@ fn create_statements(database: &str) -> Vec<String> {
              )\n\
              ENGINE = ReplacingMergeTree(version)\n\
              ORDER BY hash\n\
-             TTL updated_at + INTERVAL 1 DAY DELETE \
+             TTL updated_at + INTERVAL 1 HOUR DELETE \
                  WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')"
+        ),
+        format!(
+            "CREATE TABLE IF NOT EXISTS {database}.tracked_transactions\n(\n\
+                 hash String,\n\
+                 source String,\n\
+                 destination String,\n\
+                 amount Int64,\n\
+                 target_tick UInt32,\n\
+                 input_type UInt16,\n\
+                 input_data String CODEC(ZSTD(3)),\n\
+                 status LowCardinality(String),\n\
+                 attempts UInt8,\n\
+                 broadcast_peers UInt8,\n\
+                 broadcast_at UInt64,\n\
+                 confirmed_at UInt64,\n\
+                 confirmed_tick UInt32,\n\
+                 expiry_tick UInt32,\n\
+                 error String,\n\
+                 created_at DateTime64(3, 'UTC'),\n\
+                 updated_at DateTime64(3, 'UTC'),\n\
+                 version UInt64\n\
+             )\n\
+             ENGINE = ReplacingMergeTree(version)\n\
+             ORDER BY hash\n\
+             TTL updated_at + INTERVAL 30 DAY DELETE"
         ),
         format!(
             "CREATE TABLE IF NOT EXISTS {database}.webhooks\n(\n\
@@ -741,8 +892,12 @@ fn create_statements(database: &str) -> Vec<String> {
 fn retention_statements(database: &str) -> Vec<String> {
     vec![
         format!(
-            "ALTER TABLE {database}.mempool MODIFY TTL updated_at + INTERVAL 1 DAY DELETE \
+            "ALTER TABLE {database}.mempool MODIFY TTL updated_at + INTERVAL 1 HOUR DELETE \
              WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')"
+        ),
+        format!(
+            "ALTER TABLE {database}.tracked_transactions MODIFY TTL \
+             updated_at + INTERVAL 30 DAY DELETE"
         ),
         format!(
             "ALTER TABLE {database}.webhooks MODIFY TTL updated_at + INTERVAL 7 DAY DELETE \
@@ -771,23 +926,29 @@ mod tests {
     #[test]
     fn ddl_creates_all_gateway_tables_with_versions() {
         let statements = create_statements("glyph").join("\n");
-        for table in ["mempool", "webhooks", "webhook_deliveries"] {
+        for table in [
+            "mempool",
+            "tracked_transactions",
+            "webhooks",
+            "webhook_deliveries",
+        ] {
             assert!(
                 statements.contains(&format!("glyph.{table}")),
                 "missing table {table}"
             );
         }
-        assert_eq!(statements.matches("ReplacingMergeTree(version)").count(), 3);
+        assert_eq!(statements.matches("ReplacingMergeTree(version)").count(), 4);
         assert!(statements.contains("created_at DateTime64(3, 'UTC')"));
         assert!(statements.contains("ORDER BY hash"));
         assert!(statements.contains("ORDER BY id"));
-        assert_eq!(statements.matches("TTL ").count(), 3);
+        assert_eq!(statements.matches("TTL ").count(), 4);
         assert!(
             statements.contains("WHERE status IN ('confirmed', 'expired', 'cancelled', 'failed')")
         );
         assert!(statements.contains("WHERE active = 0"));
         assert!(statements.contains("WHERE status IN ('delivered', 'failed')"));
-        assert!(statements.contains("TTL updated_at + INTERVAL 1 DAY DELETE"));
+        assert!(statements.contains("TTL updated_at + INTERVAL 1 HOUR DELETE"));
+        assert!(statements.contains("TTL updated_at + INTERVAL 30 DAY DELETE"));
         assert!(statements.contains("TTL updated_at + INTERVAL 7 DAY DELETE WHERE active = 0"));
         assert!(statements.contains("TTL created_at + INTERVAL 1 DAY DELETE"));
     }
@@ -795,13 +956,22 @@ mod tests {
     #[test]
     fn retention_statements_apply_to_existing_tables() {
         let statements = retention_statements("glyph").join("\n");
-        for table in ["mempool", "webhooks", "webhook_deliveries"] {
+        for table in [
+            "mempool",
+            "tracked_transactions",
+            "webhooks",
+            "webhook_deliveries",
+        ] {
             assert!(
                 statements.contains(&format!("ALTER TABLE glyph.{table} MODIFY TTL")),
                 "missing retention for {table}"
             );
         }
-        assert!(statements.contains("mempool MODIFY TTL updated_at + INTERVAL 1 DAY DELETE"));
+        assert!(statements.contains("mempool MODIFY TTL updated_at + INTERVAL 1 HOUR DELETE"));
+        assert!(
+            statements
+                .contains("tracked_transactions MODIFY TTL updated_at + INTERVAL 30 DAY DELETE")
+        );
         assert!(statements.contains("webhooks MODIFY TTL updated_at + INTERVAL 7 DAY DELETE"));
         assert!(
             statements.contains("webhook_deliveries MODIFY TTL created_at + INTERVAL 1 DAY DELETE")
@@ -858,6 +1028,36 @@ mod tests {
         assert_eq!(back.broadcast_at, None);
         assert_eq!(back.confirmed_tick, None);
         assert_eq!(back.error, None);
+    }
+
+    #[test]
+    fn tracked_transaction_row_round_trips_without_raw_bytes() {
+        let transaction = TrackedTransaction {
+            hash: "ab".into(),
+            source: "SRC".into(),
+            destination: "DST".into(),
+            amount: 10,
+            target_tick: 42,
+            input_type: 1,
+            input_data: "deadbeef".into(),
+            status: MempoolStatus::Failed,
+            attempts: 10,
+            broadcast_peers: 0,
+            broadcast_at: None,
+            confirmed_at: None,
+            confirmed_tick: None,
+            expiry_tick: 52,
+            error: Some("no peer accepted the packet".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let row = TrackedTransactionRow::from(&transaction);
+        let back: TrackedTransaction = row.into();
+        assert_eq!(back.status, MempoolStatus::Failed);
+        assert_eq!(back.input_type, 1);
+        assert_eq!(back.input_data, "deadbeef");
+        assert_eq!(back.expiry_tick, 52);
+        assert_eq!(back.error.as_deref(), Some("no peer accepted the packet"));
     }
 
     #[test]

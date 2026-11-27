@@ -866,9 +866,13 @@ One transaction by lowercase base-26 hash.
 
 - Input is lowercased before validation.
 - A malformed hash returns `400 invalid_transaction_hash`.
-- An unindexed hash returns `404 not_found`.
-- Success responses are cacheable with
+- An indexed row is returned first and is cacheable with
   `Cache-Control: public, max-age=31536000, immutable`.
+- If the index does not have the hash, a durable row written by
+  `POST /v1/transactions` is returned with `meta.source=tracking`,
+  `meta.indexed=false`, `meta.state` set to `pending`, `failed`, `expired`, or
+  `cancelled`, and `Cache-Control: no-store`.
+- A hash that is neither indexed nor tracked returns `404 not_found`.
 
 ### `GET /v1/transactions/{hash}/effects`
 
@@ -879,7 +883,10 @@ aggregate summary. It never opens a peer connection.
 The effect list covers `qu_transfer`, `asset_ownership_change`,
 `asset_possession_change`, `burning`, contract message types, and
 `custom_message`. The summary counts each kind and sums QU transfer amounts.
-The response is immutable and cached for one year.
+An indexed response is immutable and cached for one year. A transaction that is
+tracked but not indexed returns its decoded transaction with empty `events` and
+`effects`, `meta.source=tracking`, and `no-store`, so the explorer page still
+renders while the transaction is pending or failed.
 
 ### `GET /v1/transactions/{hash}/lifecycle`
 
@@ -917,10 +924,13 @@ whether it moved money, and what it produced.
 }
 ```
 
-`state` is `queued`, `broadcast`, `confirmed`, `expired`, `failed`,
-`pending`, or `missed`. The route checks the index, the Glyph tracker, and then
-the peer. `money_flew` is `true` or `false` only when a peer tx-status add-on
-answers; otherwise it is `null`, never a misleading `false`.
+`state` is `queued`, `broadcast`, `confirmed`, `expired`, `failed`, `pending`,
+`missed`, `network_seen`, or `cancelled`. The route checks the index, the active
+tracker or durable tracking row, and then the peer. `tracking` carries the
+tracked fields, including `input_type`, `input_data`, `target_tick`,
+`expiry_tick`, attempts, and the last error; it never contains raw signed bytes.
+`money_flew` is `true` or `false` only when a peer tx-status add-on answers;
+otherwise it is `null`, never a misleading `false`.
 
 ### `GET /v1/transactions/inclusion-risk`
 
@@ -1581,8 +1591,13 @@ direct fan-out path instead.
 Qubic peers do not expose a mempool or a broadcast acknowledgement. Glyph keeps
 an internal tracker for transactions submitted through `POST /v1/transactions`.
 The tracker polls the index, expires targets that were not included, and drives
-webhook events. It is an implementation detail, not a public resource: use the
-submission response, the lifecycle route, or a webhook.
+webhook events. The operational mempool is an implementation detail, not a
+public resource: use the submission response, the lifecycle route, or a webhook.
+Glyph also writes a durable public projection without raw signed bytes, so
+`GET /v1/transactions/{hash}`, its effects route, and the lifecycle route keep
+returning a pending, failed, or expired transaction after the operational entry
+is gone. Those fallback responses set `meta.source` to `tracking`,
+`meta.indexed` to `false`, and `Cache-Control: no-store`.
 
 Status lifecycle:
 
@@ -1607,7 +1622,8 @@ accepts targets inside a rolling window of about 2,666 ticks, and tick data for
 pending window. A common wallet lead is 20 ticks.
 
 Every entry retains `raw`, the signed transaction hex, so a retry does not need
-the client to resubmit. `error` carries the last broadcast error when set.
+the client to resubmit. `error` carries the last broadcast error when set. The
+durable projection stores only decoded fields, never the raw signed bytes.
 
 `MEMPOOL_MAX_ENTRIES` bounds **open** entries only: `queued`, `broadcast`, and
 `failed` entries that still have retry attempts left. A confirmed, expired, or
@@ -1620,9 +1636,11 @@ submissions return `429 tracking_full` before any peer socket is opened.
 It prevents a single wallet or script from consuming the whole pool and returns
 `429 source_tracking_full`.
 
-Terminal rows remain queryable through the lifecycle route for one day, then
-ClickHouse TTL removes them. Physical deletion is eventual because ClickHouse
-applies TTL during merges, but it never holds a capacity slot.
+Terminal operational rows are removed by ClickHouse TTL one hour after their
+last update. Physical deletion is eventual because ClickHouse applies TTL during
+merges, but a terminal row never holds a capacity slot. The durable projection
+keeps the public transaction page readable for thirty days after its last
+update, then ClickHouse TTL removes it.
 
 ### Webhooks
 

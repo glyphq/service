@@ -175,9 +175,10 @@ bundle. The API exposes the same objects through `GET /v1/ticks/{tick}/raw`.
 The API owns the mempool and webhook loop. `POST /v1/transactions` submits to the
 mempool by default when `MEMPOOL_ENABLED=true`; add `"direct": true` to use the
 old synchronous peer fan-out. Mempool and webhook state lives in the `mempool`,
-`webhooks`, and `webhook_deliveries` ClickHouse tables, so a restart does not
-lose queued entries. Keep `ALLOW_BROADCAST=false` unless the deployment is
-trusted: without it, queued entries never reach a peer and expire.
+`tracked_transactions`, `webhooks`, and `webhook_deliveries` ClickHouse tables,
+so a restart does not lose queued entries and public transaction pages survive
+operational mempool cleanup. Keep `ALLOW_BROADCAST=false` unless the deployment
+is trusted: without it, queued entries never reach a peer and expire.
 
 ### Epoch lifecycle and retention
 

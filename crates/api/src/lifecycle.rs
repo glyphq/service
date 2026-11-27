@@ -90,8 +90,12 @@ async fn build_snapshot(
         Some(mempool) => mempool.status(hash).await.unwrap_or(None),
         None => None,
     };
+    let tracked = match (&state.gateway, mempool.is_none(), indexed.is_none()) {
+        (Some(gateway), true, true) => gateway.tracked_transaction(hash).await.unwrap_or(None),
+        _ => None,
+    };
     let mut network_error = None;
-    let network = if indexed.is_none() && mempool.is_none() {
+    let network = if indexed.is_none() && mempool.is_none() && tracked.is_none() {
         match peer::request(
             "peer transaction lookup",
             PEER_TIMEOUT,
@@ -109,7 +113,7 @@ async fn build_snapshot(
         None
     };
 
-    if indexed.is_none() && mempool.is_none() && network.is_none() {
+    if indexed.is_none() && mempool.is_none() && tracked.is_none() && network.is_none() {
         return Err(ApiError::not_found(format!(
             "transaction {hash} is not indexed, queued, or known to a peer"
         )));
@@ -119,17 +123,27 @@ async fn build_snapshot(
     let network_tick = network.as_ref().map(|transaction| transaction.tick);
     let target_tick = indexed_tick
         .or_else(|| mempool.as_ref().map(|entry| entry.tick))
+        .or_else(|| tracked.as_ref().map(|entry| entry.target_tick))
         .or(network_tick);
     // "confirmed" means the explorer index can already serve the transaction
     // and its balances. A peer that knows the hash is reported separately
     // until the writer commits the tick.
-    let included_tick = indexed_tick.or_else(|| {
-        mempool.as_ref().and_then(|entry| {
-            entry.confirmed_tick.or_else(|| {
-                (entry.status == store::gateway::MempoolStatus::Confirmed).then_some(entry.tick)
+    let included_tick = indexed_tick
+        .or_else(|| {
+            mempool.as_ref().and_then(|entry| {
+                entry.confirmed_tick.or_else(|| {
+                    (entry.status == store::gateway::MempoolStatus::Confirmed).then_some(entry.tick)
+                })
             })
         })
-    });
+        .or_else(|| {
+            tracked.as_ref().and_then(|entry| {
+                entry.confirmed_tick.or_else(|| {
+                    (entry.status == store::gateway::MempoolStatus::Confirmed)
+                        .then_some(entry.target_tick)
+                })
+            })
+        });
     let network_seen = indexed.is_none() && network_tick.is_some();
     let current = current_tick(state).await;
     if let Some(row) = &indexed {
@@ -177,7 +191,10 @@ async fn build_snapshot(
         .unwrap_or(10);
     let state_name = lifecycle_state(
         indexed.is_some(),
-        mempool.as_ref(),
+        mempool
+            .as_ref()
+            .map(|entry| entry.status)
+            .or_else(|| tracked.as_ref().map(|entry| entry.status)),
         included_tick,
         target_tick,
         current,
@@ -214,11 +231,13 @@ async fn build_snapshot(
         "errors": errors,
         "tracking": mempool
             .as_ref()
-            .map(|entry| crate::mempool::entry_json(entry, expiry_ticks)),
+            .map(|entry| crate::mempool::entry_json(entry, expiry_ticks))
+            .or_else(|| tracked.as_ref().map(tracked_json)),
         "network": network.as_ref().map(network_transaction_json),
         "timeline": timeline_json(
             indexed.as_ref(),
             mempool.as_ref(),
+            tracked.as_ref(),
             target_tick,
             included_tick,
             network_tick,
@@ -228,7 +247,13 @@ async fn build_snapshot(
     let body = json!({
         "data": data,
         "meta": {
-            "source": if indexed.is_some() { "index" } else if mempool.is_some() { "tracking" } else { "peer" },
+            "source": if indexed.is_some() {
+                "index"
+            } else if mempool.is_some() || tracked.is_some() {
+                "tracking"
+            } else {
+                "peer"
+            },
             "peer_error": network_error,
             "pending_pool_public": false,
             "note": "money_flew is only known when a peer running the tx-status add-on answers. It is null otherwise, not false."
@@ -239,7 +264,7 @@ async fn build_snapshot(
 
 fn lifecycle_state(
     indexed: bool,
-    mempool: Option<&store::gateway::MempoolEntry>,
+    status: Option<store::gateway::MempoolStatus>,
     included_tick: Option<u32>,
     target_tick: Option<u32>,
     current_tick: Option<u32>,
@@ -248,8 +273,8 @@ fn lifecycle_state(
     if indexed || included_tick.is_some() {
         return "confirmed";
     }
-    if let Some(entry) = mempool {
-        return match entry.status {
+    if let Some(status) = status {
+        return match status {
             store::gateway::MempoolStatus::Queued => "queued",
             store::gateway::MempoolStatus::Broadcast => "broadcast",
             store::gateway::MempoolStatus::Confirmed => "confirmed",
@@ -363,9 +388,32 @@ fn network_transaction_json(transaction: &qubic::messages::Transaction) -> Value
     })
 }
 
+fn tracked_json(entry: &store::gateway::TrackedTransaction) -> Value {
+    json!({
+        "hash": entry.hash,
+        "source": entry.source,
+        "destination": entry.destination,
+        "amount": entry.amount,
+        "target_tick": entry.target_tick,
+        "input_type": entry.input_type,
+        "input_data": entry.input_data,
+        "status": entry.status.as_str(),
+        "attempts": entry.attempts,
+        "broadcast_peers": entry.broadcast_peers,
+        "broadcast_at": entry.broadcast_at,
+        "confirmed_at": entry.confirmed_at,
+        "confirmed_tick": entry.confirmed_tick,
+        "expiry_tick": entry.expiry_tick,
+        "error": entry.error,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+    })
+}
+
 fn timeline_json(
     indexed: Option<&store::TransactionRow>,
     mempool: Option<&store::gateway::MempoolEntry>,
+    tracked: Option<&store::gateway::TrackedTransaction>,
     target_tick: Option<u32>,
     included_tick: Option<u32>,
     network_tick: Option<u32>,
@@ -394,6 +442,28 @@ fn timeline_json(
             }));
         }
     }
+    if let Some(entry) = tracked {
+        timeline.push(json!({
+            "stage": "queued",
+            "tick": entry.target_tick,
+            "timestamp": entry.created_at,
+        }));
+        if let Some(at) = entry.broadcast_at {
+            timeline.push(json!({
+                "stage": "broadcast",
+                "tick": entry.target_tick,
+                "timestamp": at,
+                "peers": entry.broadcast_peers,
+            }));
+        }
+        if let Some(tick) = entry.confirmed_tick {
+            timeline.push(json!({
+                "stage": "included",
+                "tick": tick,
+                "timestamp": entry.confirmed_at,
+            }));
+        }
+    }
     if let Some(row) = indexed {
         timeline.push(json!({
             "stage": "included",
@@ -401,8 +471,9 @@ fn timeline_json(
             "timestamp": row.timestamp,
         }));
     }
-    let already_included =
-        indexed.is_some() || mempool.and_then(|entry| entry.confirmed_tick).is_some();
+    let already_included = indexed.is_some()
+        || mempool.and_then(|entry| entry.confirmed_tick).is_some()
+        || tracked.and_then(|entry| entry.confirmed_tick).is_some();
     if !already_included {
         if let Some(tick) = included_tick {
             timeline.push(json!({
@@ -921,5 +992,44 @@ mod tests {
             lifecycle_state(false, None, Some(7), Some(7), Some(8), false),
             "confirmed"
         );
+        assert_eq!(
+            lifecycle_state(
+                false,
+                Some(store::gateway::MempoolStatus::Failed),
+                None,
+                Some(7),
+                Some(8),
+                false
+            ),
+            "failed"
+        );
+    }
+
+    #[test]
+    fn tracked_lifecycle_projection_exposes_decoded_fields_only() {
+        let now = chrono::Utc::now();
+        let value = tracked_json(&store::gateway::TrackedTransaction {
+            hash: "hash".into(),
+            source: "SRC".into(),
+            destination: "DST".into(),
+            amount: 1,
+            target_tick: 7,
+            input_type: 1,
+            input_data: "deadbeef".into(),
+            status: store::gateway::MempoolStatus::Failed,
+            attempts: 10,
+            broadcast_peers: 0,
+            broadcast_at: None,
+            confirmed_at: None,
+            confirmed_tick: None,
+            expiry_tick: 17,
+            error: Some("no peer accepted the packet".into()),
+            created_at: now,
+            updated_at: now,
+        });
+        assert_eq!(value["status"], "failed");
+        assert_eq!(value["input_data"], "deadbeef");
+        assert_eq!(value["expiry_tick"], 17);
+        assert!(value.get("raw").is_none());
     }
 }

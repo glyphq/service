@@ -19,7 +19,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::{TimeDelta, Utc};
 use node::NodePool;
 use serde_json::json;
-use store::gateway::{GatewayStore, MempoolEntry, MempoolStatus};
+use store::gateway::{GatewayStore, MempoolEntry, MempoolStatus, TrackedTransaction};
 use tokio_util::sync::CancellationToken;
 
 use crate::ApiError;
@@ -110,6 +110,55 @@ impl Mempool {
         &self.config
     }
 
+    /// Writes the operational entry and its durable public projection.
+    ///
+    /// The projection is best effort: the operational write is the source for
+    /// retries and webhooks, and a projection failure must not turn a
+    /// successful broadcast into an error.
+    async fn persist(&self, entry: &MempoolEntry) -> Result<(), ApiError> {
+        self.gateway.update_mempool(entry).await?;
+        if let Err(error) = self.persist_tracked(entry).await {
+            tracing::warn!(
+                hash = %entry.hash,
+                %error,
+                "durable transaction projection failed"
+            );
+        }
+        Ok(())
+    }
+
+    async fn persist_tracked(&self, entry: &MempoolEntry) -> Result<(), ApiError> {
+        let decoded = hex::decode(&entry.raw)
+            .ok()
+            .and_then(|bytes| qubic::messages::Transaction::decode(&bytes).ok());
+        let (input_type, input_data) = match decoded {
+            Some(transaction) => (transaction.input_type, hex::encode(transaction.input)),
+            None => (0, String::new()),
+        };
+        self.gateway
+            .put_tracked_transaction(&TrackedTransaction {
+                hash: entry.hash.clone(),
+                source: entry.source.clone(),
+                destination: entry.destination.clone(),
+                amount: entry.amount,
+                target_tick: entry.tick,
+                input_type,
+                input_data,
+                status: entry.status,
+                attempts: entry.attempts,
+                broadcast_peers: entry.broadcast_peers,
+                broadcast_at: entry.broadcast_at,
+                confirmed_at: entry.confirmed_at,
+                confirmed_tick: entry.confirmed_tick,
+                expiry_tick: entry.tick.saturating_add(self.config.expiry_ticks),
+                error: entry.error.clone(),
+                created_at: entry.created_at,
+                updated_at: entry.updated_at,
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Validates, deduplicates, and broadcasts a signed transaction.
     ///
     /// A duplicate hash returns the existing entry unchanged, which makes the
@@ -136,6 +185,7 @@ impl Mempool {
         let source = qubic::PublicKey(transaction.source).to_identity();
 
         if let Some(existing) = self.gateway.mempool_entry(&hash).await? {
+            self.persist(&existing).await?;
             return Ok(existing);
         }
         let (source_open, total_open) = self
@@ -188,7 +238,7 @@ impl Mempool {
             created_at: now,
             updated_at: now,
         };
-        self.gateway.insert_mempool(&entry).await?;
+        self.persist(&entry).await?;
         self.webhooks
             .dispatch_event("transaction.queued", &entry)
             .await?;
@@ -212,7 +262,7 @@ impl Mempool {
             entry.error = Some(broadcast_error(&attempts));
             None
         };
-        self.gateway.update_mempool(&entry).await?;
+        self.persist(&entry).await?;
         if let Some(event) = event {
             self.webhooks.dispatch_event(event, &entry).await?;
         }
@@ -232,9 +282,12 @@ impl Mempool {
                 entry.confirmed_tick = Some(row.tick);
                 entry.confirmed_at = Some(Utc::now());
                 entry.updated_at = Utc::now();
+                self.invalidator.invalidate(&entry.source, row.tick);
+                self.invalidator.invalidate(&entry.destination, row.tick);
+                self.invalidator.invalidate_transaction(&hash);
                 // If this write races the indexer, the background poll
                 // persists the same state on its next pass.
-                if self.gateway.update_mempool(&entry).await.is_ok() {
+                if self.persist(&entry).await.is_ok() {
                     self.webhooks
                         .dispatch_event("transaction.confirmed", &entry)
                         .await?;
@@ -294,7 +347,7 @@ impl Mempool {
                 entry.confirmed_at = Some(now);
                 entry.updated_at = now;
                 entry.error = None;
-                self.gateway.update_mempool(&entry).await?;
+                self.persist(&entry).await?;
                 self.webhooks
                     .dispatch_event("transaction.confirmed", &entry)
                     .await?;
@@ -305,7 +358,7 @@ impl Mempool {
                 if head > entry.tick.saturating_add(self.config.expiry_ticks) {
                     entry.status = MempoolStatus::Expired;
                     entry.updated_at = now;
-                    self.gateway.update_mempool(&entry).await?;
+                    self.persist(&entry).await?;
                     self.webhooks
                         .dispatch_event("transaction.expired", &entry)
                         .await?;
@@ -331,7 +384,7 @@ impl Mempool {
                     entry.status = MempoolStatus::Failed;
                     entry.error = Some(format!("stored transaction is not hex: {error}"));
                     entry.updated_at = now;
-                    self.gateway.update_mempool(&entry).await?;
+                    self.persist(&entry).await?;
                     self.webhooks
                         .dispatch_event("transaction.failed", &entry)
                         .await?;
@@ -344,7 +397,7 @@ impl Mempool {
                     entry.status = MempoolStatus::Failed;
                     entry.error = Some(format!("stored transaction is invalid: {error}"));
                     entry.updated_at = now;
-                    self.gateway.update_mempool(&entry).await?;
+                    self.persist(&entry).await?;
                     self.webhooks
                         .dispatch_event("transaction.failed", &entry)
                         .await?;
@@ -384,7 +437,7 @@ impl Mempool {
                 entry.error = Some(broadcast_error(&attempts));
                 None
             };
-            self.gateway.update_mempool(&entry).await?;
+            self.persist(&entry).await?;
             if let Some(event) = event {
                 self.webhooks.dispatch_event(event, &entry).await?;
             }
