@@ -39,6 +39,14 @@ pub enum Error {
     Verification(String),
     #[error("tick {tick} is incomplete: {detail}")]
     IncompleteTick { tick: u32, detail: String },
+    #[error(
+        "indexer made no progress for {seconds}s at tick {tick} (pending {pending}); restarting"
+    )]
+    Stalled {
+        tick: u32,
+        pending: usize,
+        seconds: u64,
+    },
     #[error("configuration: {0}")]
     Config(String),
     #[error("archive: {0}")]
@@ -54,6 +62,10 @@ const LIVE_HEAD_MARGIN: u32 = 256;
 /// previous tick is finalized and has its full vote set. Never fetch the
 /// in-progress tick.
 const LIVE_HEAD_LAG: u32 = 1;
+/// A peer fetch must never hold a worker forever. The node client has its own
+/// request deadlines; this is the outer guard for a batch that stalls across
+/// several nested fallbacks.
+const FETCH_BUNDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct IndexerConfig {
@@ -207,6 +219,7 @@ struct PipelineTuning {
     fetch_batch_max: usize,
     write_batch: usize,
     write_flush: Duration,
+    stall_restart: Duration,
     archive_concurrency: usize,
     archive_queue: usize,
     verify_concurrency: usize,
@@ -235,6 +248,9 @@ impl PipelineTuning {
             write_batch: env_usize("INDEXER_WRITE_BATCH", 128, 1, 4096),
             write_flush: Duration::from_millis(
                 env_usize("INDEXER_WRITE_FLUSH_MS", 250, 10, 10_000) as u64,
+            ),
+            stall_restart: Duration::from_secs(
+                env_usize("INDEXER_STALL_SECS", 300, 30, 3600) as u64
             ),
             archive_concurrency: env_usize("INDEXER_ARCHIVE_CONCURRENCY", 16, 1, 64),
             archive_queue: env_usize("INDEXER_ARCHIVE_QUEUE", 4096, 1, 65_536),
@@ -679,6 +695,7 @@ impl<S: Store + 'static> Indexer<S> {
             fetch_window = tuning.fetch_window,
             write_batch = tuning.write_batch,
             write_flush_ms = tuning.write_flush.as_millis() as u64,
+            stall_restart_s = tuning.stall_restart.as_secs(),
             verify_concurrency = tuning.verify_concurrency,
             "indexer started"
         );
@@ -854,9 +871,25 @@ impl<S: Store + 'static> Indexer<S> {
         let mut archive_dropped = 0u64;
         let mut stored_epochs = HashSet::new();
         let mut last_flush = Instant::now();
+        let mut last_consumed = consume_next;
+        let mut last_progress = Instant::now();
         let mut run_result = Ok(());
 
         'writer: loop {
+            if consume_next != last_consumed {
+                last_consumed = consume_next;
+                last_progress = Instant::now();
+            }
+            if last_progress.elapsed() >= tuning.stall_restart {
+                let stalled = Error::Stalled {
+                    tick: consume_next,
+                    pending: pending.load(Ordering::Acquire),
+                    seconds: last_progress.elapsed().as_secs(),
+                };
+                tracing::error!(%stalled, "indexer pipeline stalled; exiting for a clean restart");
+                run_result = Err(stalled);
+                break 'writer;
+            }
             if let Some(state) = *rollover.read().await {
                 if state.contains(consume_next) {
                     tracing::info!(
@@ -2553,11 +2586,20 @@ async fn dispatch_loop(
                 continue;
             }
         }
-        if pending.load(Ordering::Acquire) < window {
+        let pending_now = pending.load(Ordering::Acquire);
+        if pending_now < window || next_tick == next_write_tick {
             if let Some(upper) = dispatch_upper_bound(next_write_tick, head_tick, window) {
                 if next_tick >= next_write_tick && next_tick <= upper {
                     let desired = adaptive.current() as usize;
-                    let available = window.saturating_sub(pending.load(Ordering::Acquire));
+                    let available = window.saturating_sub(pending_now);
+                    // The write cursor must never wait for window capacity.
+                    // A dropped or stuck result for the next tick otherwise
+                    // leaves every future tick buffered behind a hole.
+                    let available = if next_tick == next_write_tick {
+                        available.max(1)
+                    } else {
+                        available
+                    };
                     let mut count = desired
                         .min(available)
                         .min((upper.saturating_sub(next_tick) + 1) as usize)
@@ -2714,12 +2756,18 @@ async fn fetch_worker(
             let fetch_started = Instant::now();
             let fetched = tokio::select! {
                 _ = cancel.cancelled() => return,
-                outcome = peer.as_mut().expect("worker peer").prefetch_bundles(
-                    &run.ticks,
-                    head_snapshot.clone(),
-                    cached,
-                    Some(&pool),
-                ) => outcome,
+                outcome = tokio::time::timeout(
+                    FETCH_BUNDLE_TIMEOUT,
+                    peer.as_mut().expect("worker peer").prefetch_bundles(
+                        &run.ticks,
+                        head_snapshot.clone(),
+                        cached,
+                        Some(&pool),
+                    ),
+                ) => match outcome {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(node::Error::Timeout(FETCH_BUNDLE_TIMEOUT)),
+                },
             };
             let fetched = match fetched {
                 Ok(fetched) => fetched,
@@ -3824,5 +3872,44 @@ mod tests {
         cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
         assert_eq!((item.start, item.count), (100, 8));
+    }
+
+    #[tokio::test]
+    async fn dispatcher_fetches_the_write_cursor_with_a_full_window() {
+        let head = Arc::new(AsyncRwLock::new(Head {
+            epoch: 1,
+            tick: 200,
+            initial_tick: 100,
+            tick_duration: 1_000,
+        }));
+        let next_write = Arc::new(AtomicU32::new(100));
+        let pending = Arc::new(AtomicUsize::new(4));
+        let (work_tx, mut work_rx) = mpsc::channel::<FetchWork>(4);
+        let (_retry_tx, retry_rx) = mpsc::channel::<RetryRequest>(4);
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(dispatch_loop(
+            100,
+            head,
+            Arc::new(AsyncRwLock::new(None)),
+            next_write,
+            pending,
+            work_tx,
+            retry_rx,
+            cancel.clone(),
+            4,
+            Arc::new(AdaptiveBatch::new(16)),
+        ));
+
+        let item = tokio::time::timeout(Duration::from_secs(1), work_rx.recv())
+            .await
+            .expect("dispatch timeout")
+            .expect("work item");
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+        assert_eq!(
+            (item.start, item.count),
+            (100, 1),
+            "the cursor is always retried even when every window slot is occupied"
+        );
     }
 }

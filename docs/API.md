@@ -2104,6 +2104,7 @@ current surface.
 | `WEBHOOK_ALLOW_PRIVATE` | `false` | Allow localhost and private webhook targets. |
 | `WEBHOOK_ENCRYPTION_KEY` | unset | 32-byte hex or base64 key for webhook URL encryption at rest. |
 | `STREAM_POLL_MS` | `250` | Index-head poll interval for the stream hub. |
+| `INDEXER_STALL_SECS` | `300` | Exit for a clean restart when the indexer makes no progress. |
 | `GLYPH_LABELS_FILE` | unset | JSON operator label registry; falls back to the embedded starter file. |
 | `GLYPH_WHALE_MIN_AMOUNT` | `1000000000` | Whale threshold in qu for analytics, stream, and webhook events. |
 | `S3_BUCKET`, `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, `S3_REGION`, `S3_PREFIX` | unset | Raw archive object storage. Presence of `S3_BUCKET` enables it; the `_ID`/`_SECRET_ACCESS_KEY` aliases are also accepted. |

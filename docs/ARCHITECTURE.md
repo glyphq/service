@@ -202,6 +202,7 @@ Default tuning, overridable by environment:
 | `INDEXER_FETCH_BATCH` | 32 | 1..64 |
 | `INDEXER_WRITE_BATCH` | 128 | 1..4096 |
 | `INDEXER_WRITE_FLUSH_MS` | 250 | 10..10000 |
+| `INDEXER_STALL_SECS` | 300 | 30..3600 |
 
 ### Query
 
